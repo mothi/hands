@@ -21,7 +21,7 @@ HERE, J = os.path.dirname(os.path.abspath(__file__)), os.path.join
 # THE JOBS ROOT, its one copy: every job dir hands.sh names itself (a buy without --out, a probe) lives in
 # $XDG_STATE_HOME/hands (an absolute one; XDG ignores a relative value), else ~/.local/state/hands -- state that
 # outlives a reboot, where macOS's $TMPDIR is wiped at boot and pruned after 3 days. hands.sh takes it from sweep's
-# output, quota.sh (the claude streams) imports it. KEEP: how long a dir there with no live wrapper outlives its last write
+# output, quota.py (the claude streams) imports it. KEEP: how long a dir there with no live wrapper outlives its last write
 XDG = os.environ.get('XDG_STATE_HOME', '')
 JOBS = J(XDG if os.path.isabs(XDG) else J(os.path.expanduser('~'), '.local', 'state'), 'hands')
 KEEP = 30 * 86400

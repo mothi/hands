@@ -11,7 +11,7 @@
 #   hands.sh events DIR [--follow]   a readable view of DIR/events.jsonl
 #   hands.sh stop DIR             close the seat as its deadline does (stdin EOF, TERM, KILL); the envelope still lands
 #   hands.sh --probe [claude|codex|grok|opencode|all]   a 1-token aliveness ping per provider (spends a little quota)
-#   hands.sh quota [--json] [provider ...]   the quota board (quota.sh): read-only, it never spends
+#   hands.sh quota [--json] [provider ...]   the quota board (quota.py): read-only, it never spends
 #
 # opts (all before the provider spec; the prompt is always a file):
 #   --cwd DIR           where the seat works (default: the current dir). A seat has full read and write access,
@@ -39,7 +39,7 @@ SEATPY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/seat.py"   # the wire laye
 case "${1:-}" in   # the seat verbs come first; start is the buy that returns at once
   start) VERB=start; shift ;;
   send|mail|wait|events|stop) VERB="$1"; shift; VERB_ARGS=("$@"); set -- ;;
-  quota) shift; exec bash "${SEATPY%/*}/quota.sh" "$@" ;;
+  quota) shift; exec python3 "${SEATPY%/*}/quota.py" "$@" ;;
 esac
 
 cli_path() {  # resolve a provider CLI even when it's not on PATH
@@ -71,12 +71,6 @@ done
 # classify(), which the persistent wrapper types its turns with. Statuses only ever
 # assigned on failure paths.
 classify_blob() { printf '%s' "$1" | python3 "$SEATPY" classify; }
-
-# THE GO KEY'S FILE — the ONE copy of its path, for quota.sh's Go gauge (it sources this function): opencode's own
-# data dir, resolved as the CLI resolves it, XDG_DATA_HOME first. No seat gets a key from hands: an opencode
-# seat runs on the user's normal opencode store and login, and seat.py's wrapper drops
-# OPENCODE_API_KEY from every seat.
-opencode_auth() { printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/opencode/auth.json"; }
 
 # ---------- THE SEAT BOX — the seat contract, ONE copy ----------
 # run_single prepends it to every buy's task, a probe's ping too. It names no job dir, so
@@ -226,8 +220,7 @@ run_probe() {
 }
 
 # ---------- dispatch ----------
-# SOURCE SEAM: quota.sh sources this file for opencode_auth, the Go key's one path; tests/selftest.sh for the
-# functions its rows call. A sourcing caller sets HANDS_SOURCED=1 and
+# SOURCE SEAM: tests/selftest.sh sources this file for the functions its rows call. A sourcing caller sets HANDS_SOURCED=1 and
 # `set --` first; nothing below runs.
 if [ -n "${HANDS_SOURCED:-}" ]; then return 0 2>/dev/null || exit 0; fi
 case "$VERB" in   # the seat verbs (start is the buy below)

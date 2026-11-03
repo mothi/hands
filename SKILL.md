@@ -140,12 +140,11 @@ or buy the next candidate.
 
 ## Interactive mode — when the user says just "hands"
 
-1. `bash hands.sh quota` (beside this file) — the quota board (one line per pool: used% and an advisory
-   verdict; `--json` adds each window's reset). It only reads. The claude line is the newest `rate_limit_event` a claude job stream
-   left in the jobs root (a seat's `stream.jsonl`), with its age — no credential, no endpoint; a window that
-   has reset since is dropped, and `hands.sh --probe claude` refreshes it. Only five_hour and seven_day count
-   for claude; any other window the event carries (fable's `seven_day_overage_included`) is a scoped limit,
-   shown in braces, display-only.
+1. `bash hands.sh quota` (beside this file) — the quota board: one line per pool, each window's
+   used% (longest first) and when it resets; `--json` for the same as JSON. It only reads. The claude
+   line is the newest `rate_limit_event` a claude job stream left in the jobs root, with its age — no
+   credential, no endpoint; a window that has reset since is dropped, and `hands.sh --probe claude`
+   refreshes it. A limit on one model (fable's `seven_day_overage_included`) is listed as "(one model)".
 2. Ask tiered questions (the host's question UI, else one compact message). Always: the task
    (if missing) and the seat — alive providers only, one recommended (the engine itself routes
    nothing). Only when in doubt: the `--cwd` when the task edits an ambiguous

@@ -17,8 +17,8 @@ jobs:
         run: bash tests/selftest.sh
       - name: ACP suite
         run: python3 tests/test_acp.py
-      - name: quota selftest
-        run: bash ./quota.sh --selftest
+      - name: quota suite
+        run: python3 tests/test_quota.py
 
   # Linux is untested; this job reports how far the suites get.
   ubuntu:
@@ -32,6 +32,6 @@ jobs:
       - name: ACP suite
         if: always()
         run: python3 tests/test_acp.py
-      - name: quota selftest
+      - name: quota suite
         if: always()
-        run: bash ./quota.sh --selftest
+        run: python3 tests/test_quota.py

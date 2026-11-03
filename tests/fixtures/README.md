@@ -34,24 +34,22 @@ status. When a provider changes its wording, add the new error text here the day
 | claude-events-sample | the same 3 turns on Claude (43 lines) | row 136 |
 | opencode-events-sample | the same 3 turns on OpenCode (34 lines); tool inputs arrive in a later update | row 136: a late input rides one ↳ line |
 | claude-stream-sample | `claude -p --output-format stream-json`, one turn | row 49d: the final message and the session |
-| claude-stream-ratelimit.jsonl | a claude 2.1.300 haiku probe (hook events before init) | quota.sh row 41: five_hour 12.0, seven_day 37.0; `resetsAt` shifted by one constant so the reading predates no reset |
-| claude-stream-fable-scoped.jsonl | the last `rate_limit_event` of a fable seat | quota.sh row 48: `seven_day_overage_included` 97 is a scoped limit, shown in braces; seven_day 58 heads the board |
+| claude-stream-ratelimit.jsonl | a claude 2.1.300 haiku probe (hook events before init) | test_quota.py test_41: 5h 12.0, week 37.0; `resetsAt` shifted by one constant so the reading predates no reset |
+| claude-stream-fable-scoped.jsonl | the last `rate_limit_event` of a fable seat | test_quota.py test_48: `seven_day_overage_included` 97 limits one model and is listed apart; week 58 leads the line |
 
-## Quota gauge bodies (`quota.sh --selftest`)
+## Quota gauge bodies (`tests/test_quota.py`)
 
 When a provider's usage response changes shape, add the new body here the day it is found. Codex
-identity values are fake by construction; a row asserts they never reach `quota.sh` output.
+identity values are fake by construction; a test asserts they never reach `quota.py` output.
 
 | fixture | origin | expected |
 |---|---|---|
-| quota-codex-happy.json | an app-server `account/rateLimits/read` answer (codex-cli 0.160); identities and free text faked | ok; the long window leads |
-| quota-codex-two-window.json | a 5-hour primary and weekly secondary window, in the app-server shape; identities faked | rows 43, 43b, 45: windows split by duration, never by name |
+| quota-codex-happy.json | an app-server `account/rateLimits/read` answer (codex-cli 0.160); identities and free text faked | ok; week 40 |
+| quota-codex-two-window.json | a 5-hour primary and weekly secondary window, in the app-server shape; identities faked | test_43, test_45: windows named by their length, never by the provider's key |
 | quota-codex-absent-pct.json | synthetic: a window with no used percent | unknown, never a made-up 0 |
-| quota-codex-no-login.json | an app-server answer with an empty `CODEX_HOME` (JSON-RPC error) | unknown; `why` is its message (row 13) |
+| quota-codex-no-login.json | an app-server answer with an empty `CODEX_HOME` (JSON-RPC error) | unknown; `why` is its message (test_13) |
 | quota-grok-happy.json | a live billing response | ok; weekly 71 |
-| quota-grok-hot.json | synthetic 91% | would-warn |
-| quota-grok-gated.json | synthetic 98%, re-valued from the hot body | would-warn (the hard stop is 100); a copy at 100% would-gate |
 | quota-grok-fresh-period.json | a weekly rollover: the gateway omits a zero usage field | ok; weekly used 0 |
 | quota-claude-429.json | an Anthropic error envelope (shape approximated); served by the grok stub, since the parse is the same for every pool | unknown; `why` is the provider message |
 | quota-opencode-happy.json | OpenCode Go usage shape with distinct synthetic values | rolling 0, weekly 8, monthly 22 |
-| quota-opencode-404.html | the page OpenCode's site serves for a missing endpoint | unknown; `unparseable-body` |
+| quota-opencode-404.html | the page OpenCode's site serves for a missing endpoint | unknown; the reply is not JSON |

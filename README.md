@@ -255,16 +255,16 @@ start.
 
 ## Quota gauges
 
-`hands.sh quota` prints a board with one line per provider: the used share of its pool and an
-advisory verdict; `--json` prints the same as one document, with each window's reset time. It only reads: it
-never spends quota and never starts a seat. hands never checks it before a buy: a seat bought into
+`hands.sh quota` prints one line per provider: each usage window's used share, longest window
+first, and when it resets; `--json` prints the same as one document. It only reads: it never
+spends quota and never starts a seat. hands never checks it before a buy: a seat bought into
 a spent pool ends `provider-quota-dead` with the reset time.
 
 - **Claude and Codex** need no credential and no extra endpoint: Claude's reading is the newest
   `rate_limit_event` in a Claude seat's own stream, and Codex's is its CLI's app-server answering
   `account/rateLimits/read`. The Claude line says how old its reading is; a window that has reset
   since is dropped, and `hands.sh --probe claude` writes a fresh reading.
-- **Grok and OpenCode** have no such surface, so `quota.sh` reads the token each CLI already
+- **Grok and OpenCode** have no such surface, so `quota.py` reads the token each CLI already
   keeps and calls that vendor's **undocumented** usage endpoint (`cli-chat-proxy.grok.com/v1/billing`,
   `opencode.ai/zen/go/v1/usage`, the OpenCode Go plan). The token goes to `curl` on stdin, never on
   the command line. Raw responses are never printed or stored. These endpoints can change or
@@ -313,10 +313,11 @@ hands/
 ├── hands.sh        the command line and the seat contract
 ├── seat.py         the engine: the wire table, the wrapper, the verbs, the envelope writer
 ├── acp.py          the ACP client (Grok, OpenCode) and the event vocabulary all wires share
-├── quota.sh        the quota board behind hands.sh quota (--json, --selftest)
+├── quota.py        the quota board behind hands.sh quota
 └── tests/
     ├── selftest.sh     the hermetic suite for hands.sh and seat.py
     ├── test_acp.py     the ACP suite
+    ├── test_quota.py   the quota suite
     ├── test-stub.py    a stand-in for the claude and codex CLIs, used by the suites
     └── fixtures/       recorded provider output the suites replay
 ```

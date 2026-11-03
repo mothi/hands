@@ -15,7 +15,7 @@ Run all three suites before a commit. Each must print `0 failed` and exit 0:
 ```bash
 bash tests/selftest.sh
 python3 tests/test_acp.py
-bash ./quota.sh --selftest
+python3 tests/test_quota.py
 ```
 
 They are hermetic: stub CLIs stand in for the real ones, and nothing touches the network or

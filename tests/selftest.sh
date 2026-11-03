@@ -1166,7 +1166,7 @@ STUB
   st="$(classify_blob "plain unrelated failure text")"
   t 16 "unrelated text → error"           sh -c "printf '%s' '${st%%$'\t'*}' | grep -qx error"
 
-  # 204: quota is the read-only board, quota.sh behind hands.sh's verb. Falsification: drop the verb -> the words are
+  # 204: quota is the read-only board, quota.py behind hands.sh's verb. Falsification: drop the verb -> the words are
   # read as a buy and refused
   mkdir -p "$SB/st204"
   t 204 "QUOTA: hands.sh quota --json claude prints the board's JSON for that one pool (no claude reading in an empty jobs root: unknown, naming the refresh), rc 0" \
