@@ -4,13 +4,13 @@ Thanks for helping. hands is small on purpose, and these rules keep it that way.
 
 ## The surface is frozen
 
-The flags and the six seat verbs (`start`, `send`, `mail`, `wait`, `events`, `stop`) are the whole
-interface. A new capability is a separate script that calls `hands.sh`, not another flag. A new
+The flags, the six seat verbs (`start`, `send`, `mail`, `wait`, `events`, `stop`) and `quota` are
+the whole interface. A new capability is a separate script that calls `hands.sh`, not another flag. A new
 provider is one entry in the wire table (`WIRES` in `seat.py`), not a flag.
 
 ## Every change is tested
 
-Run all four suites before a commit. Each must print `0 failed` and exit 0:
+Run all three suites before a commit. Each must print `0 failed` and exit 0:
 
 ```bash
 bash ./hands.sh --selftest
@@ -50,5 +50,5 @@ and session ids, emails, tokens, local timestamps, and anything else that is you
 
 ## Pull requests
 
-Describe what changed and why, name the selftest rows you added, and confirm all four suites
+Describe what changed and why, name the selftest rows you added, and confirm all three suites
 pass. Report security issues privately (see `SECURITY.md`), not in a public issue.

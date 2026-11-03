@@ -256,8 +256,8 @@ while True:
             out(ln)
         continue
     sid = 'sess-new' if mode == 'newsid' else 'sess-stub'   # newsid: a resume that silently started fresh
-    res = lambda text, **kw: out(dict({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': text,
-                                       'session_id': sid, 'usage': {'input_tokens': 2, 'output_tokens': 3}}, **kw))
+    res = lambda text: out({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': text,
+                            'session_id': sid, 'usage': {'input_tokens': 2, 'output_tokens': 3}})
     if mode == 'authfail':
         sys.stderr.write('Invalid API key · Please run /login\n')
         sys.exit(1)
@@ -266,7 +266,7 @@ while True:
         sys.exit(1)
     elif mode == 'park':
         park()
-    elif mode == 'deaf':   # ignores TERM: only the KILL after stop's drain ends it
+    elif mode == 'deaf':   # ignores TERM: only its wrapper's KILL ends it
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         park()
     elif mode == 'count':

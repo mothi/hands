@@ -255,8 +255,8 @@ start.
 
 ## Quota gauges
 
-`hands.sh quota` prints a board with one line per provider: the used share of its pool, an
-advisory verdict and the reset time; `--json` prints the same as one document. It only reads: it
+`hands.sh quota` prints a board with one line per provider: the used share of its pool and an
+advisory verdict; `--json` prints the same as one document, with each window's reset time. It only reads: it
 never spends quota and never starts a seat. hands never checks it before a buy: a seat bought into
 a spent pool ends `provider-quota-dead` with the reset time.
 

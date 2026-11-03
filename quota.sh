@@ -90,7 +90,7 @@ PY
 # {"error": its JSON-RPC error} (no login: -32600 "codex account authentication required to read rate limits").
 # stdin stays open until the answer: at stdin EOF the app-server drops a read still in flight (codex-cli
 # 0.160). The CLI runs in its own process group, and ONE 20 s deadline, its exit included, kills that group:
-# a CLI that hangs, or answers and never exits, never hangs a buy.
+# a CLI that hangs, or answers and never exits, never hangs the board.
 codex_body() {
   python3 - <<'PY' 2>/dev/null || printf '{"error":"codex app-server unreadable"}'
 import json, os, subprocess, threading

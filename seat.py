@@ -578,15 +578,15 @@ def lock(d):   # THE delivery lock (events.jsonl's): one record at a time, its t
 
 def deliver(d, prov, fd, text, expect, turn, **mail):   # THE delivery (send, MSG, mail): the marker first, so a delivery that
     # dies mid-write is typed. The record is framed LF + line + LF: a killed sender's torn bytes end at the next record's
-    # leading LF (whole() drops them). mail: the inbox line it delivers (inbox, sender, mail id) rides the marker
+    # leading LF (whole() drops them). mail: the inbox line it delivers (inbox=its line number) rides the marker
     append(J(d, 'events.jsonl'), event('progress', turn, expect=expect, bytes=len(text.encode()), text='input: ' + clip(' '.join(text.split()), 200), **mail))
     data = ('\n' + json.dumps(user_line(prov, text), ensure_ascii=False) + '\n').encode()
     while data:
         data = data[os.write(fd, data):]
 
 
-def label(o):   # an inbox line as its seat reads it: the sender (the driver's `hands.sh mail`), the mail id, the text
-    return 'MAIL from %s%s:\n%s' % (o.get('from') or 'driver', ' (id %s)' % o['id'] if o.get('id') else '', o.get('text'))
+def label(o):   # an inbox line (the driver's `hands.sh mail`) as its seat reads it
+    return 'MAIL from driver:\n%s' % o.get('text')
 
 
 def whole(d, lines):   # in.fifo -> the records to deliver: whole JSON-object lines only; a torn one is dropped, typed, never fused
@@ -646,7 +646,7 @@ class Seat:
                 if n <= st.mailed or not isinstance(o, dict):
                     continue
                 try:
-                    deliver(s.d, s.prov, s.wfd, label(o), st.next_turn(s.delivery, True), st.turn, inbox=n, sender=o.get('from'), mail=o.get('id'))
+                    deliver(s.d, s.prov, s.wfd, label(o), st.next_turn(s.delivery, True), st.turn, inbox=n)
                 except OSError:
                     return   # its reader died mid-write: the close-out types that turn
                 st.read()
@@ -659,7 +659,10 @@ class Seat:
 
     def acked(s, n):   # the spawn caller's ACK: the turn MSG opens, or 0 = the launch was typed before any turn
         if s.ready is not None:
-            os.write(s.ready, b'%d\n' % n)
+            try:
+                os.write(s.ready, b'%d\n' % n)
+            except OSError:   # the caller is gone (killed, or a stop during the launch): the seat runs on
+                pass
             os.close(s.ready)
             s.ready = None
 
@@ -822,6 +825,8 @@ class Seat:
             rc = rcode(seat.close(2)) if seat else 1
             status, reset = typed(status, why + '\n' + since(J(s.d, 'stderr.log'), s.eoff), rc)
             reset = reset or clip(why)
+            if s.halt:   # a stop during the launch ended it: incomplete, rc 143, as any turn a stop ends
+                status, rc, reset = 'incomplete', 143, ''
         s.put(event('error', s.first, text=clip('%s: %s' % (reason, why))))
         envelope(s.d, status, s.prov, s.h.get('model'), rc, int(time.time() - s.t_first), reset, None, s.h.get('effort'),
                  session=s.h.get('session'), delivery=s.delivery, reason=reason)
@@ -867,8 +872,8 @@ class Seat:
                 seat._request('turn/interrupt', {'threadId': s.W.session, 'turnId': s.W.tid}, timeout=5)
             except acp.AcpError:
                 pass
+        s.t.join(5)   # MSG reaches in.fifo before the wrapper lets go of it (a stop at launch skips the loop)
         s.letgo(s.rfd)
-        s.t.join(5)
         rc = s.cut(rcode(seat.close(2)))   # close() frees a prompt whose pipe an escaped child still holds
         while not s.q.empty():        # delivered, never run: the close-out types them
             s.q.get_nowait()
@@ -983,7 +988,7 @@ def spawn(d, h, msgfile):
     if pid:
         os.close(w)
         os.close(log)   # the wrapper holds the lock now
-        # the ack, or EOF at the wrapper's exit: a slow launch (a version check, ACP handshake calls: each bounded) is
+        # the ack, or EOF at the wrapper's exit: a slow launch (ACP handshake calls: each bounded) is
         # never reported undelivered while its wrapper runs; the cap only ends a wrapper stuck past every bound
         got = (os.read(r, 64) if select.select([r], [], [], 600)[0] else b'').strip()
         if got not in (b'', b'0'):
@@ -1091,8 +1096,9 @@ def wait(d, h, mode, timeout):
 
 
 def stop(d):   # TERM the seat's wrappers: each closes its CLI as at its deadline (Seat.cut types what that ends). What
-    # is left at 10 s of the seat's groups -- those under its wrappers when the stop began, never a group a wrapper starts
-    # later (its close-out's own: an abandoned turn's session delete) -- is TERMed, and KILLed at 15 s
+    # is left at 10 s of the seat's groups -- those under its wrappers when the stop first finds any (none yet: its CLI is
+    # still launching) -- is TERMed, and KILLed at 15 s. A group found then holds the turn in flight, so a group a wrapper
+    # starts later (its close-out's own: an abandoned turn's session delete) is never the stop's
     t0, groups = time.time(), None
     while time.time() - t0 < 20:
         ws = wrappers(d)

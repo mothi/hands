@@ -35,6 +35,3 @@ jobs:
       - name: quota selftest
         if: always()
         run: bash ./quota.sh --selftest
-      - name: rearm selftest
-        if: always()
-        run: bash ./rearm.sh --selftest

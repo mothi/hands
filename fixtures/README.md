@@ -23,7 +23,7 @@ status. When a provider changes its wording, add the new error text here the day
 | claude-oauth-expired | a seat that died on an expired login (its result.txt) | auth-expired |
 | opencode-missing-api-key | an OpenCode ACP seat on an empty store, never logged in: the error answering `session/prompt` | auth-expired (row 129) |
 | opencode-go-no-credential | an OpenCode 2.0.22 buy with no Go key in its store | auth-expired (row 15c) |
-| grok-acp-seat-sample | grok 1.0.41 `grok agent stdio` seat (grok-4.6, effort low), 4 turns on one process: two replies, a shell `sleep` the client cancelled, a file write; `{t,dir,msg}` lines | hands.sh rows 100-106; rows 107, 110, 111 and 202 derive from it; rearm.sh's grok stub replays it as a probe |
+| grok-acp-seat-sample | grok 1.0.41 `grok agent stdio` seat (grok-4.6, effort low), 4 turns on one process: two replies, a shell `sleep` the client cancelled, a file write; `{t,dir,msg}` lines | hands.sh rows 100-106; rows 107, 110, 111, 202 and 205 derive from it |
 | grok-acp-resume-sample | the same session reattached by a new process: initialize, session/resume, effort set again, one prompt | row 107: a send to a gone grok seat |
 | opencode-acp-seat-sample | opencode 1.18.30 `opencode acp` seat (opencode-go/deepseek-v4.1-flash, variant low), the same 4 turns | rows 101-106: usage excludes reasoning; a cancel's zeros read as unknown usage; OpenCode closes its own aborted tool |
 | opencode-acp-resume-sample | the same for OpenCode: a new process reattaching the seat's session | row 122: a send to a gone OpenCode seat |

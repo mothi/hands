@@ -289,11 +289,11 @@ run_selftest() {
   unset CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN
   # THE CALLER'S STORE SEAM: opencode resolves its store from XDG_DATA_HOME, so EVERY row -- including those that call
   # "$SELF" directly -- runs on a sandbox store, never the real one. It holds a FAKE Go key, as a real store does: a seat
-  # that seeded or swapped a store from it would show (rows 39s and 19 prove a seat and the catalog run on it unchanged).
+  # that seeded or swapped a store from it would show (row 39s proves a seat runs on it unchanged).
   mkdir -p "$SB/oc-store/opencode"; printf '{"opencode-go":{"key":"sk-test"}}' >"$SB/oc-store/opencode/auth.json"
   export XDG_DATA_HOME="$SB/oc-store"
   # THE JOBS ROOT SEAM: a buy without --out (and every probe) makes its dir in $XDG_STATE_HOME/hands, so EVERY row runs
-  # on a sandbox root, never the real one, and no buy's sweep can reach a real dir (rows 39w, 156, 165, 188, 189, 191, 192, 193 name their own)
+  # on a sandbox root, never the real one, and no buy's sweep can reach a real dir (rows 39w, 156, 188, 189, 191, 192, 193 name their own)
   export XDG_STATE_HOME="$SB/state"
   # the probe rows that run with PATH=/usr/bin:/bin skip where a provider CLI lives there (they would launch it) or jq
   # and python3 do not
@@ -723,11 +723,11 @@ def disabled(feature, *argvs):   # every codex argv disables the feature as a RO
     pre = [open(f).read().split('\n')[:-1] for f in argvs]
     pre = [a[:a.index('app-server')] if 'app-server' in a else [] for a in pre]
     return bool(pre) and all(any(a[i:i + 2] == ['--disable', feature] for i in range(len(a))) for a in pre)
-def marks(d):   # the delivery markers that carry an inbox line: [(inbox line, sender, mail id)]
-    return [(e['inbox'], e.get('sender'), e.get('mail')) for e in evs(d) if e['kind'] == 'progress' and e.get('inbox')]
+def marks(d):   # the inbox lines the delivery markers name, in order
+    return [e['inbox'] for e in evs(d) if e['kind'] == 'progress' and e.get('inbox')]
 def gone(d, *pids):   # within 5 s: no wrapper of job dir d and none of pids left running. A zombie is dead (kill -0 still
     # answers for one until it is reaped), and a process mid-exit gets the moment it needs on a loaded machine
-    mine = re.compile(r'seat\.py spawn \S*/%s ' % re.escape(os.path.basename(d)))
+    mine = re.compile(r'seat\.py spawn %s ' % re.escape(os.path.realpath(d)))
     for _ in range(50):
         ps = [r.split(None, 2) for r in subprocess.run(['ps', '-A', '-ww', '-o', 'pid=,stat=,command='], capture_output=True,
                                                        text=True).stdout.splitlines()]
@@ -742,7 +742,7 @@ def regone(b, calls0, calls, rc):   # driver mail to a gone seat: rc 1, NO launc
     b = os.path.realpath(b)            # ONCE, after the send's own message; a second restart delivers none
     want = {3: 'turn two\n', 4: 'MAIL from driver:\ndriver while out', 5: 'turn two\n'}
     return (rc == '1' and open(calls0).read().strip() == '1' and open(calls).read().strip() == '3'
-            and [x[0] for x in marks(b)] == [1, 2] and len(inbox(b)) == 2 and all(result(b, n) == t for n, t in want.items())
+            and marks(b) == [1, 2] and len(inbox(b)) == 2 and all(result(b, n) == t for n, t in want.items())
             and not os.path.exists(J(b, 'turn-6')))
 def busymail(c, calls, stdin):   # driver mail to a BUSY codex seat joins its running turn (steered in) and never cancels it
     c, es = os.path.realpath(c), evs(c)
@@ -790,6 +790,20 @@ for l in open(sys.argv[1]):
     if r["dir"] == "out" and n < 2: n += 1; out.write(json.dumps({"dir": "sleep", "msg": 35}) + "\n")' "$SB/grok-seat.jsonl" "$SB/grok-slow.jsonl"
   ACP_REPLAY="$SB/grok-slow.jsonl" ACP_REC="$SB/a202.rec" PATH="$SB/bin:$PATH" TMPDIR="$SB/tmp" XDG_CACHE_HOME="$SB/cache" "$0" start \
     --effort low --cwd "$SB/tmp" --out "$SB/a202" grok:grok-4.6 "$SB/q.md" >"$SB/a202.ack" 2>/dev/null & A202=$!
+  # 205 (checked at the end, beside 202): A STOP DURING THE LAUNCH, an ACP seat still in its handshake. One handshake ends
+  # 3 s in: the wrapper skips its loop, MSG never reaches the agent, and turn 1 closes incomplete, rc 143. One still
+  # answering at 10 s (202's): stop TERMs its agent then, the handshake fails, and the launch reads incomplete, rc 143,
+  # never a broken CLI. The stop also ends the spawn caller, so the ack finds no reader. Falsification: type early() by
+  # its error -> the slow one reads error/handshake; drop acked()'s guard -> a BrokenPipe traceback in job.log.
+  python3 -c 'import json, sys
+n, out = 0, open(sys.argv[2], "w")
+for l in open(sys.argv[1]):
+    out.write(l); r = json.loads(l)
+    if r["dir"] == "out" and n < 1: n += 1; out.write(json.dumps({"dir": "sleep", "msg": 3}) + "\n")' "$SB/grok-seat.jsonl" "$SB/grok-slow3.jsonl"
+  ( for v in 3 70; do f="$SB/grok-slow3.jsonl"; [ $v = 70 ] && f="$SB/grok-slow.jsonl"
+      ACP_REPLAY="$f" ACP_REC="$SB/a205-$v.rec" stub_run start --effort low --cwd "$SB/tmp" --out "$SB/a205-$v" grok:grok-4.6 "$SB/q.md" >/dev/null 2>&1 & S205=$!
+      for i in $(seq 1 100); do [ -s "$SB/a205-$v.rec" ] && break; sleep 0.1; done   # the wrapper is in the handshake
+      stub_run stop "$SB/a205-$v" >/dev/null 2>&1; echo $? >"$SB/a205-$v.rc"; wait $S205; done ) & A205=$!
   printf 'turn two\n' >"$SB/q81.md"
   mkdir -p "$SB/gdir"; GD="$(cd "$SB/gdir" && pwd -P)"
   # THE ACP SEATS: start + three sends = each CLI's recorded 4 turns on ONE agent (rows 100-106 read them)
@@ -844,7 +858,7 @@ for l in open(sys.argv[1]):
   ACP_REC="$SB/a108b.rec" stub_run --cwd "$SB/gdir" --out "$SB/a108b" opencode:opencode-go/deepseek-v4.1-flash "$SB/q.md" >/dev/null 2>&1; R108B=$?
   ACP_REC="$SB/a108c.rec" stub_run start --effort low --cwd "$SB/tmp" --out "$SB/a108c" grok:grok-9.9 "$SB/q.md" >/dev/null 2>&1; R108C=$?
   t 108 "typed refusals BEFORE any prompt (rc 2, refused, no turn, no session/prompt reached the agent): an effort grok-4.6 does not list (max), an opencode seat naming NO effort for a model that lists low|high|max (the engine never guesses), and grok:grok-9.9, a model the agent does not list (never substituted)" \
-    python3 "$SB/chk.py" refused "$R108A:$SB/a108a:effort-unsupported" "$R108B:$SB/a108b:effort-unsupported" "$R108C:$SB/a108c:model-mismatch"
+    sh -c "python3 '$SB/chk.py' refused '$R108A:$SB/a108a:effort-unsupported' '$R108B:$SB/a108b:effort-unsupported' '$R108C:$SB/a108c:model-mismatch' && jq -e '.reset|test(\"runs grok-4[.]6 and lists grok-4[.]7, grok-4[.]7-build-fast, grok-4[.]6, grok-4[.]5; the seat names grok-9[.]9\")' '$SB/a108c/envelope.json' >/dev/null"
   ACP_ARGV_LOG="$SB/a109a.argv" stub_run --out "$SB/a109a" opencode "$SB/q.md" >/dev/null 2>&1; R109A=$?
   ACP_ARGV_LOG="$SB/a109b.argv" stub_run --effort low --out "$SB/a109b" opencode:foo "$SB/q.md" >/dev/null 2>&1; R109B=$?
   t 109 "an opencode seat names provider/model: a model-less and a non-slash buy are refused before launch (rc 2, refused model-required, no agent argv)" \
@@ -870,13 +884,13 @@ for l in open(sys.argv[1]):
   # backstop 10 s later. Falsification: put the reaper back at the deadline (no wrapper close) -> the first end is term.
   t 172 "THE POLITE DEADLINE, every ACP wire (grok a111, opencode a111b): at the launch deadline the agent sees its stdin close (EOF) before any TERM, and the turn in flight is still typed timeout, rc 142, with its session" \
     sh -c "[ \"\$(head -1 '$SB/a111.rec.ends')\" = eof ] && [ \"\$(head -1 '$SB/a111b.rec.ends')\" = eof ] && jq -e '.status==\"timeout\" and .rc==142 and .session==\"01a0d38a-6416-74d3-82f8-80174c82f422\"' '$SB/a111/envelope.json' >/dev/null && jq -e '.status==\"timeout\" and .rc==142 and .session==\"ses_f2c74432dffeoPDAL0Eq6RHjaI\"' '$SB/a111b/envelope.json' >/dev/null"
-  # 173 (GUARD 2): AN ABANDONED TURN'S SESSION IS DELETED. An opencode agent killed mid-turn (here a stop)
+  # 173 (GUARD 2): AN ABANDONED TURN'S SESSION IS DELETED. An opencode agent ended mid-turn (here by a stop)
   # keeps the turn's execution claim, and the user's managed opencode service would resume it at its next boot; the wrapper
-  # deletes the session (session delete <sid> --standalone, in the seat's cwd) before the turn's envelope lands, while the
-  # stop keeps to the groups it found (the delete takes a moment). Nothing else deletes: an idle stop (a101), a turn the
+  # deletes the session (session delete <sid> --standalone, in the seat's cwd) before the turn's envelope lands. The stop
+  # closes the agent politely: its first end is its stdin's EOF. Nothing else deletes: an idle stop (a101), a turn the
   # agent cancelled and lived on (a101's turn 3), a grok seat (a110), the deadline's close (a111b). A later send fails typed
   # (the agent answers the resume with an error). Falsification: drop the delete; delete on the deadline close, for grok,
-  # or with the agent alive (a .del log appears).
+  # or with the agent alive (a .del log appears); stop TERMing the agent's group at once (its first end is term).
   python3 "$SB/chk.py" derive "$HERE/fixtures/opencode-acp-resume-sample.jsonl" "$SB/oc-gone.jsonl" gone
   ACP_REPLAY="$SB/oc-hang.jsonl" ACP_REC="$SB/a173.rec" OC_SESSION_LOG="$SB/a173.del" stub_run start --effort low --cwd "$SB/gdir" --out "$SB/a173" opencode:opencode-go/deepseek-v4.1-flash "$SB/q.md" >/dev/null 2>&1
   for i in $(seq 1 50); do grep -q '"kind": "turn_start"' "$SB/a173/events.jsonl" 2>/dev/null && grep -q session/prompt "$SB/a173.rec" 2>/dev/null && break; sleep 0.1; done
@@ -899,8 +913,8 @@ for l in open(sys.argv[1]):
   kill -TERM "$(head -1 "$SB/a175.pid")" 2>/dev/null; stub_run wait "$SB/a175" --for exit --timeout 30 >/dev/null 2>&1; stub_run stop "$SB/a175" >/dev/null 2>&1
   t 175 "an abandoned opencode turn whose agent is TERMed mid-turn and answers with an ERROR (server unavailable, as 2.0.22 does live) still has its session deleted: ONCE, in the seat's cwd" \
     sh -c "[ \"\$(grep -c 'session delete' '$SB/a175.del')\" = 1 ] && grep -q 'ses_f2c74432dffeoPDAL0Eq6RHjaI' '$SB/a175.del' && grep -q '$GD' '$SB/a175.del'"
-  t 173 "AN ABANDONED OPENCODE TURN'S SESSION IS DELETED: a stop mid-turn runs session delete <sid> --standalone ONCE, in the seat's cwd, before the turn's envelope (incomplete, rc 143) lands; an idle stop, a turn the agent cancelled and lived on, a grok seat and the deadline's close delete nothing; a later send ends typed (error handshake, rc 1) within 30 s" \
-    sh -c "python3 '$SB/chk.py' forgot '$SB/a173' '$SB/a173.del' ses_f2c74432dffeoPDAL0Eq6RHjaI '$GD' '$SB/a173.sent' $R173 && [ $T173 -lt 30 ] && [ ! -e '$SB/a101.del' ] && [ ! -e '$SB/a110.del' ] && [ ! -e '$SB/a111b.del' ]"
+  t 173 "AN ABANDONED OPENCODE TURN'S SESSION IS DELETED: a stop mid-turn closes the agent politely (stdin EOF first) and runs session delete <sid> --standalone ONCE, in the seat's cwd, before the turn's envelope (incomplete, rc 143) lands; an idle stop, a turn the agent cancelled and lived on, a grok seat and the deadline's close delete nothing; a later send ends typed (error handshake, rc 1) within 30 s" \
+    sh -c "[ \"\$(head -1 '$SB/a173.rec.ends')\" = eof ] && python3 '$SB/chk.py' forgot '$SB/a173' '$SB/a173.del' ses_f2c74432dffeoPDAL0Eq6RHjaI '$GD' '$SB/a173.sent' $R173 && [ $T173 -lt 30 ] && [ ! -e '$SB/a101.del' ] && [ ! -e '$SB/a110.del' ] && [ ! -e '$SB/a111b.del' ]"
   ACP_MODE=slow ACP_PIDFILE="$SB/a112.pids" ACP_REC="$SB/a112.rec" stub_run start --effort low --cwd "$SB/tmp" --out "$SB/a112" grok:grok-4.6 "$SB/q.md" >/dev/null 2>&1
   stub_run send "$SB/a112" "$SB/q81.md" >"$SB/a112.sent" 2>/dev/null; stub_run wait "$SB/a112" --timeout 30 >/dev/null 2>&1; stub_run stop "$SB/a112" >/dev/null 2>&1
   t 112 "a send WHILE an ACP turn runs queues (ACP v1 has no mid-turn input): acked sent, expect 2, delivery queue at once; its marker lands in events.jsonl before turn 1 ends; turn 2 opens only after turn 1's turn_end; both ok on ONE agent" \
@@ -1065,7 +1079,6 @@ for l in open(sys.argv[1]):
   mkdir -p "$SB/binshim"
   cat >"$SB/binshim/codex" <<'STUB'
 #!/bin/sh
-[ "$*" = --version ] && { echo 'codex-cli 0.160.0'; exit 0; }
 # npm-shim model: the real work happens in a CHILD the parent merely waits on
 sh -c 'echo $$ > "$T71_PID"; exec sleep 30' &
 cat >/dev/null
@@ -1087,16 +1100,15 @@ STUB
   t 76 "a process the seat backgrounded and forgot dies WITH the seat: the wrapper reaps the seat pgroup on every exit, not only on alarm (a log stream once outlived its seat by hours)" \
     sh -c "[ -s '$SB/g76.pid' ] && jq -e '.status==\"ok\"' '$SB/g76/envelope.json' >/dev/null && for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 \$(cat '$SB/g76.pid') 2>/dev/null || exit 0; sleep 0.3; done; exit 1"
   kill -9 "$(cat "$SB/g76.pid" 2>/dev/null)" 2>/dev/null || true
-  # 77: THE STOP RULE — a driver stops a live seat by signalling the SEAT process, never the
-  # wrapper: the wrapper survives to reap the pgroup, parse the stream, and write a typed
-  # envelope that carries the session (a stop that killed hands.sh too once lost it).
+  # 77: a CLI killed from outside (not by stop): the wrapper survives to reap the pgroup, parse the
+  # stream, and write a typed envelope that carries the session.
   : >"$SB/g77.pid"
   ( CL_STUB_MODE=park CL_STUB_PIDFILE="$SB/g77.pid" stub_run --out "$SB/g77" claude:sonnet "$SB/q.md" >/dev/null 2>&1 ) &
   T77=$!
   for i in $(seq 1 60); do [ -s "$SB/g77.pid" ] && break; sleep 0.1; done
   kill -TERM "$(cat "$SB/g77.pid" 2>/dev/null)" 2>/dev/null
   wait $T77 2>/dev/null
-  t 77 "STOP RULE: signalling the SEAT process (never the wrapper) still yields a typed envelope WITH the session — the wrapper outlives the seat and finishes its parse (the reaping itself is row 76/76b)" \
+  t 77 "A CLI KILLED FROM OUTSIDE (TERM to the seat process, not a stop) still yields a typed envelope WITH the session — the wrapper outlives the seat and finishes its parse (the reaping itself is row 76/76b)" \
     sh -c "jq -e '.status != \"ok\" and .rc==143 and .session==\"sess-stub\"' '$SB/g77/envelope.json' >/dev/null && ! kill -0 \$(cat '$SB/g77.pid') 2>/dev/null"
   # 74: the private pgroup must not orphan on ^C — INT forwards to the group (parity
   # with the old exec form, where the foreground group carried the CLI and its children;
@@ -1248,8 +1260,8 @@ PY
   t 132 "PUSH OUTCOME, aligned to the host (it sends no reply and leaves the connection open): each push records ONE progress event -- posted when the host took the bytes (p89), and no reply is read (a stub answering 'held' or an error still reads posted: p132, p132b), failed with the error on a dead socket (p90); a silent open connection never stalls the push (p132c: its event within 1 s of the turn_end)" \
     sh -c "python3 '$SB/chk.py' pushed '$SB/p89' turn_end posted '' && python3 '$SB/chk.py' pushed '$SB/p132' turn_end posted '' && python3 '$SB/chk.py' pushed '$SB/p132b' turn_end posted '' && python3 '$SB/chk.py' pushed '$SB/p90' turn_end failed 'No such file' && python3 '$SB/chk.py' pushed '$SB/p132c' turn_end posted '' && python3 '$SB/chk.py' unwaited '$SB/p132c'"
   # THE ENV SHIM (rows 153/168/169): a shim ahead of each stub CLI logs
-  # the env NAMES (never values) of EVERY process of that CLI -- its --version and the opencode catalog included --
-  # then runs the stub. PATH in the log proves names are recorded, so an absent name means something.
+  # the env NAMES (never values) of EVERY process of that CLI, then runs the stub. PATH in the log proves names are
+  # recorded, so an absent name means something.
   mkdir -p "$SB/binenv"
   cat >"$SB/envshim" <<'STUB'
 #!/bin/sh
@@ -1658,6 +1670,9 @@ PY
   wait "$A202" 2>/dev/null
   t 202 "A SLOW LAUNCH ACKS: an ACP launch whose handshake takes 70 s (past a minute, each call within its bound) acks spawned while its wrapper runs, never 'never delivered'" \
     jq -e '.status=="spawned"' "$SB/a202.ack"
+  wait "$A205" 2>/dev/null
+  t 205 "A STOP DURING THE LAUNCH: an ACP seat stopped in its handshake -- one ending 3 s in, one still answering at 10 s (stop TERMs its agent) -- reads incomplete, rc 143 (turn 1 for the first, its MSG never sent to the agent), the stop ends rc 0 with no wrapper left, and no wrapper thread dies with a traceback" \
+    sh -c "for v in 3 70; do [ \"\$(cat '$SB'/a205-\$v.rc)\" = 0 ] && jq -e '.status==\"incomplete\" and .rc==143' '$SB'/a205-\$v/envelope.json >/dev/null && ! grep -q Traceback '$SB'/a205-\$v/job.log || exit 1; done; jq -e '.turn==1' '$SB/a205-3/envelope.json' >/dev/null && ! grep -q session/prompt '$SB/a205-3.rec' && python3 '$SB/chk.py' gone '$SB/a205-3' && python3 '$SB/chk.py' gone '$SB/a205-70'"
   for d in "$SB"/*/; do [ -f "$d/session" ] && "$0" stop "$d" >/dev/null 2>&1; done   # no seat outlives the suite
   rm -rf "$SB"
   echo "selftest: $PASS passed, $FAIL failed$([ "$SKIP" -gt 0 ] && echo ", $SKIP skipped")"

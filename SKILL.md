@@ -140,8 +140,8 @@ or buy the next candidate.
 
 ## Interactive mode — when the user says just "hands"
 
-1. `bash hands.sh quota` (beside this file) — the quota board (one line per pool: used%, an advisory
-   verdict, reset). It only reads. The claude line is the newest `rate_limit_event` a claude job stream
+1. `bash hands.sh quota` (beside this file) — the quota board (one line per pool: used% and an advisory
+   verdict; `--json` adds each window's reset). It only reads. The claude line is the newest `rate_limit_event` a claude job stream
    left in the jobs root (a seat's `stream.jsonl`), with its age — no credential, no endpoint; a window that
    has reset since is dropped, and `hands.sh --probe claude` refreshes it. Only five_hour and seven_day count
    for claude; any other window the event carries (fable's `seven_day_overage_included`) is a scoped limit,
@@ -192,10 +192,12 @@ starts on the global default and takes no model from its config), then sets the 
 value that model lists (grok-4.6: xhigh|high|medium|low; deepseek-v4.1-flash: low|high|max); a model
 the agent does not list is `refused` before any prompt, never substituted. At a launch's deadline (only with `--timeout`) the
 wrapper ends an ACP agent itself, politely (stdin EOF first, TERM only after a grace; the reaper fires
-10 s later as a backstop): the turn in flight is a `timeout`, with its session. Otherwise a turn that ends
-other than ok reads the agent's exit code: a killed agent words its end `incomplete`, `cancelled` or an
-error (opencode 2.x: server unavailable). Resuming a seat killed mid-tool-call is unverified on ACP. An opencode turn whose agent goes
-mid-turn any other way (a `stop`, a crash, a kill) keeps an execution claim your opencode background
+10 s later as a backstop): the turn in flight is a `timeout`, with its session. A `stop` closes the agent the
+same way, and the turn in flight is `incomplete`, rc 143. Otherwise a turn that ends other than ok reads the
+agent's exit code: a killed agent words its end `incomplete`, `cancelled` or an error (opencode 2.x: server
+unavailable). Resuming a seat killed mid-tool-call is unverified on ACP. An opencode turn whose agent goes
+mid-turn other than by the deadline (a crash, a kill, or a `stop`, until a live check shows its polite close
+releases it) may keep an execution claim your opencode background
 service (`opencode serve --service`) would resume at its next start, so the wrapper deletes that session
 first (`opencode session delete <id> --standalone`; an idle stop deletes nothing): a later `send` ends
 typed (`error`, `handshake`) — start a fresh seat. THE ONE KNOWN GAP: if the machine restarts, or the
