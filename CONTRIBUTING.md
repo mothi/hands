@@ -16,7 +16,6 @@ Run all four suites before a commit. Each must print `0 failed` and exit 0:
 bash ./hands.sh --selftest
 python3 test_acp.py
 bash ./quota.sh --selftest
-bash ./rearm.sh --selftest
 ```
 
 They are hermetic: stub CLIs stand in for the real ones, and nothing touches the network or

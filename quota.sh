@@ -1,16 +1,12 @@
 #!/usr/bin/env bash
-# quota — subscription quota gauge for claude|codex|grok|opencode. OBSERVE-ONLY: prints
-# what WOULD gate; the gating is hands.sh's pre-flight, through rearm.sh --pre-buy.
-# Composes per hands' capability freeze (new capability = new script; hands.sh is
-# never edited). Endpoints are UNDOCUMENTED, reverse-engineered, liable to move.
+# quota — the quota board for claude|codex|grok|opencode: how much of each provider's pool is used, and when it
+# resets. READ-ONLY: it never spends quota and never starts a seat, and hands never reads it before a buy.
+# Endpoints are UNDOCUMENTED, reverse-engineered, liable to move.
 # FAILURE CONTRACT: every failure degrades to status:"unknown"
 # carrying its cause in `why`, and this script ALWAYS exits 0. No state: every run probes.
 #
-#   quota.sh [--pools "codex grok"] [--out FILE]       probe; observe lines on stdout;
-#                                                      normalized JSON to FILE (atomic)
-#   quota.sh --json [--pools ...] [--out FILE]         normalized JSON on stdout
-#   quota.sh --selftest                                hermetic: PATH stubs + fixtures,
-#                                                      zero network, zero model calls
+#   hands.sh quota [--json] [provider ...]   one line per provider (all four by default), or normalized JSON
+#   quota.sh --selftest                      hermetic: PATH stubs + fixtures, zero network, zero model calls
 #
 # Redaction by construction: raw bodies are never printed, never persisted, never sent to
 # stderr; the normalizer emits only pool/status/windows/binding/verdict. codex identity
@@ -21,103 +17,53 @@
 # app-server answers `account/rateLimits/read` from the login it refreshes itself (codex_body).
 # CLAUDE READS NO CREDENTIAL AND CALLS NO ENDPOINT: its reading
 # is the vendor's own `rate_limit_event`, the newest one in a claude job stream in the jobs
-# root, $XDG_STATE_HOME/hands (an absolute one) else ~/.local/state/hands (claude_body reads seat.py's JOBS). No fresh reading (none within the hour, or a window has
-# reset since) is `token-stale`: one claude call writes a fresh event, and rearm's claude
-# heal is that call.
-# ONE hard stop per pool for every window (100 non-claude, 90 claude); `short` labels duration only (codex 5h, opencode rolling).
+# root, $XDG_STATE_HOME/hands (an absolute one) else ~/.local/state/hands (claude_body reads seat.py's JOBS). The
+# board shows its age; a window that has reset since the reading is dropped (its number is no longer true), and
+# `hands.sh --probe claude` writes a fresh reading.
+# The verdict is ADVISORY: one hard stop per pool for every window (100 non-claude, 90 claude); `short` labels
+# duration only (codex 5h, opencode rolling).
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-POOLS="claude codex grok opencode" OUTF="" MODE=observe SELFTEST=0
+POOLS="" MODE=observe SELFTEST=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --pools) [ -n "${2:-}" ] && POOLS="$2"; shift ;;
-    # same guard as --pools: under `set -u` a bare "$2" ABORTED the script (rc 1, no observe
-    # lines, no snapshot) — a raw bash error, which is exactly what the never-nonzero
-    # contract below forbids. --pools may fall back SILENTLY because its default is complete
-    # (all four pools); --out cannot, because its default is "no snapshot", so a consumer
-    # that reads the file afterwards would find the old one or none and never learn why.
-    # Hence: typed line on STDERR (stdout stays one parseable document in --json), gauge
-    # still runs, exit 0.
-    --out) [ -n "${2:-}" ] && OUTF="$2" \
-           || echo "quota: --out needs a FILE (ignored; no snapshot written)" >&2; shift ;;
     --json) MODE=json ;;
     --selftest) SELFTEST=1 ;;
     -h|--help) sed -n '/^# quota — /,/^set -u/p' "$0" | grep '^#'; exit 0 ;;
-    *) echo "quota: unknown arg $1 (see --help)" >&2; exit 0 ;;  # contract: never nonzero
+    claude|codex|grok|opencode) POOLS="$POOLS $1" ;;
+    *) echo "quota: unknown arg $1 (ignored; see --help)" >&2 ;;  # contract: never nonzero
   esac
   shift
 done
-case " $POOLS " in *[a-z]*) :;; *) POOLS="claude codex grok opencode";; esac
+[ -n "$POOLS" ] || POOLS="claude codex grok opencode"
 
 jqp() { python3 -c 'import sys,json;d=json.load(sys.stdin);'"$1" 2>/dev/null; }
-
-# ---------- ROOT-CAUSE FIX: cached-credential staleness
-# Every curl *_body below reads a CACHED bearer token from disk and uses it BLIND. When that
-# token has expired the provider answers 401 and ITS error body reaches `why` as
-# "Invalid or expired credentials … upstream=PermissionDenied" — which reads like a broken
-# login and sends the reader hunting for an auth outage that does not exist. In one
-# measured case the gauge read grok's token at 17:50:05 and the CLI refreshed it at
-# 17:50:07, two seconds later — it had been miscounted as provider blindness nine times.
-# The provider CLIs own refresh (grok's auth.json carries refresh_token + expires_at), so
-# the true state is STALE CACHE, not bad credentials. We decode the token's OWN exp claim
-# and report that, and we do NOT attempt a refresh: minting or exchanging credentials is
-# not the gauge's job, and a measurement tool must never mutate the thing it measures.
-# A token that is not a JWT (opencode's static key) carries no exp of its own: NO claim —
-# silence, never a guess.
-tok_stale() { # stdin = token → prints a typed error body iff the token is provably expired
-  python3 -c '
-import sys, json, base64, time, datetime
-t = sys.stdin.read().strip()
-try:
-    p = t.split(".")[1]; p += "=" * (-len(p) % 4)
-    exp = json.loads(base64.urlsafe_b64decode(p)).get("exp")
-except Exception:
-    exp = None
-if not isinstance(exp, (int, float)):
-    sys.exit(0)
-if exp < time.time() + 30:
-    when = datetime.datetime.fromtimestamp(exp, datetime.timezone.utc).isoformat()
-    print(json.dumps({"error": "token-stale (cached JWT expired " + when
-                     + "; the provider CLI refreshes it on its next call — rearm.sh pings"
-                       " and re-reads the board). NOT an auth failure."}))
-' 2>/dev/null
-}
-
-export -f tok_stale 2>/dev/null || true   # selftest runs it through `sh -c`
 
 # ---------- probes: echo the raw body, or {"error":"<why>"} — nothing else, no stderr
 # claude: the vendor's OWN stream. Every claude seat's stream-json carries
 # `rate_limit_event` lines whose rate_limit_info.unifiedWindows.{five_hour,seven_day} hold
 # utilization (0-1) and resetsAt (epoch s). The reading is the NEWEST such event across the job
 # streams in the jobs root — buys, replies and probes all land there — plus its age (the
-# stream's mtime). FRESH = written within CLAUDE_FRESH_S and no window has reset since; anything
-# else is token-stale, which rearm heals with one claude call (hands.sh --probe claude).
+# stream's mtime) and the windows that have reset since it was written. No reading at all is unknown;
+# one claude call (hands.sh --probe claude) writes one.
 # An event without unifiedWindows (pre-2.1.2xx CLIs) is not a reading. Each line is parsed as JSON
 # and only its TOP-LEVEL object is read: a seat whose message quotes an event is text, never a
 # reading, and a stream with no reading (a codex job written after the last claude one) is passed over.
-CLAUDE_FRESH_S=3600
 claude_body() {
-  python3 - "$HERE" "$CLAUDE_FRESH_S" <<'PY' 2>/dev/null || printf '{"error":"claude streams unreadable"}'
+  python3 - "$HERE" <<'PY' 2>/dev/null || printf '{"error":"claude streams unreadable"}'
 import glob, json, os, sys, time
 sys.path.insert(0, sys.argv[1])
 from seat import JOBS as root   # the jobs root's one python copy
-fresh = int(sys.argv[2])
 now = time.time()
-def stale(why):
-    print(json.dumps({"error": "token-stale (" + why + "; one claude call writes a fresh one:"
-                      " rearm.sh pings). NOT an auth failure."}))
-    sys.exit(0)
-recent = []
+streams = []
 for p in glob.glob(os.path.join(root, "*", "stream.jsonl")):
     try:
-        m = os.stat(p).st_mtime
+        streams.append((os.stat(p).st_mtime, p))
     except OSError:
         continue
-    if now - m <= fresh:
-        recent.append((m, p))
-for m, p in sorted(recent, reverse=True):
+for m, p in sorted(streams, reverse=True):
     try:
         data = open(p, "rb").read()
     except OSError:
@@ -134,12 +80,9 @@ for m, p in sorted(recent, reverse=True):
             continue
         reset = sorted(k for k, w in info["unifiedWindows"].items() if isinstance(w, dict)
                        and isinstance(w.get("resetsAt"), (int, float)) and w["resetsAt"] <= now)
-        if reset:
-            stale("the newest claude reading predates a reset of " + ",".join(reset))
-        print(json.dumps({"rate_limit_info": info, "age_s": int(now - m)}))
+        print(json.dumps({"rate_limit_info": info, "age_s": int(now - m), "reset_since": reset}))
         sys.exit(0)
-stale("no claude reading within %d min: no claude job stream in the jobs root"
-      " carries a rate_limit_event" % (fresh // 60))
+print(json.dumps({"error": "no claude reading in the jobs root; refresh: hands.sh --probe claude"}))
 PY
 }
 # codex: the CLI's OWN app-server. One `account/rateLimits/read` over its stdio JSON-RPC, answered
@@ -194,7 +137,6 @@ grok_body() {
   local tok
   tok=$(jqp 'print(list(d.values())[0]["key"])' <"$HOME/.grok/auth.json" 2>/dev/null)
   [ -n "$tok" ] || { printf '{"error":"no-token"}'; return; }
-  ST=$(printf '%s' "$tok" | tok_stale); [ -n "$ST" ] && { printf '%s' "$ST"; return; }
   # the bearer rides curl's stdin (-H @-), never its argv: ps shows every process's argv to every local user
   printf 'Authorization: Bearer %s\n' "$tok" | curl -sS --max-time 20 "https://cli-chat-proxy.grok.com/v1/billing?format=credits" \
     -H @- -H "x-grok-client-mode: build" 2>/dev/null \
@@ -206,11 +148,10 @@ opencode_body() {
   # CLI resolves it) — sourced in a subshell, so none of hands.sh's globals or functions reach ours
   key=$(jqp 'print(d["opencode-go"]["key"])' <"$(HANDS_SOURCED=1; set --; . "$HERE/hands.sh"; opencode_auth)" 2>/dev/null)
   [ -n "$key" ] || { printf '{"error":"no-token"}'; return; }
-  # Opaque static Go keys carry no expiry claim; tok_stale deliberately makes no claim.
   printf 'Authorization: Bearer %s\n' "$key" | curl -sS --max-time 20 https://opencode.ai/zen/go/v1/usage -H @- 2>/dev/null \
     || printf '{"error":"http-failed"}'
 }
-# ---------- normalize + verdict, one pass; the --out snapshot is written atomically
+# ---------- normalize + verdict, one pass
 run_gauge() {
   local cl="" cx="" gk="" oc="" p
   for p in $POOLS; do
@@ -221,26 +162,12 @@ run_gauge() {
       opencode) oc=$(opencode_body) ;;
     esac
   done
-  CL="$cl" CX="$cx" GK="$gk" OC="$oc" POOLS_ENV="$POOLS" MODE_ENV="$MODE" \
-  OUTF_ENV="$OUTF" NOW_ENV="$(date +%s)" python3 <<'PY'
-import json, os, re, sys, tempfile, datetime
+  CL="$cl" CX="$cx" GK="$gk" OC="$oc" POOLS_ENV="$POOLS" MODE_ENV="$MODE" NOW_ENV="$(date +%s)" python3 <<'PY'
+import json, os, re, sys, datetime
 
-# (warn, hard) per pool — THE RULE: spend every
-# quota to 100%; a seat may fail, recover fast and move to the next seat. Hard stop 100 for every non-claude pool: the gauge gates a buy only where the
-# provider itself would refuse it. Warn (90) is ADVISORY: the board and the pre-buy mark
-# the pool hot, nothing routes away from it, and a seat that dies there is typed
-# provider-quota-dead, and the driver rebuys on the next candidate.
-# Claude keeps (80, 90): it also runs the driver; the 10 above 90 is the user's interactive
-# reserve, not seat headroom. ONE threshold per pool for every window — a short window
-# (codex 5h) gates at the same number and merely resets sooner; `short`
-# labels duration for the pre-buy line, it no longer selects a threshold.
-# HISTORY, kept because the same defect bit twice: an earlier hard stop (97) sat in
-# a config table nothing read for four days; a later warn level (90)
-# then landed while rearm/hands refused on EVERY non-proceed line, so warn gated in
-# practice and 90->97 was never spent. The consumer contract is now typed at the source:
-# would-gate => `QUOTA GATE:` (refused pre-spend), would-warn => `QUOTA WARN:` (advisory).
-# opencode is informational (but the engine's
-# preflight still gauges it, and a QUOTA GATE would refuse an opencode buy at its hard stop).
+# (warn, hard) per pool, ADVISORY: the board marks a pool hot (would-warn) or at the provider's own hard stop
+# (would-gate); nothing refuses a buy. Claude's hard stop is 90: the 10 above it is the user's interactive reserve.
+# ONE threshold per pool for every window: a short window (codex 5h) only resets sooner.
 THR = {"codex": (90, 100), "grok": (90, 100), "claude": (80, 90), "opencode": (90, 100)}
 NOW = int(os.environ["NOW_ENV"])
 
@@ -280,6 +207,7 @@ def norm(pool, raw):
         return {"pool": pool, "status": "unknown", "why": why, "windows": []}
     ws = []
     scoped = []
+    gone = sorted(d.get("reset_since") or [])   # claude: windows that reset after the reading; their numbers are not true
     if pool == "claude":
         # the newest rate_limit_event of a claude job stream (claude_body): utilization is 0-1.
         # Only the ACCOUNT windows gate: five_hour and seven_day, the two every claude stream carries.
@@ -287,7 +215,7 @@ def norm(pool, raw):
         # recorded, 0 of 64 others) — it throttles one model, so it is DISPLAY-ONLY:
         # braces on the board, never a window, so verdict() and routing never read it.
         for k, w in ((d.get("rate_limit_info") or {}).get("unifiedWindows") or {}).items():
-            if isinstance(w, dict):
+            if isinstance(w, dict) and k not in gone:
                 u, r = w.get("utilization"), w.get("resetsAt")
                 u = None if u is None else round(u * 100, 1)
                 r = iso(r) if isinstance(r, (int, float)) else None
@@ -321,8 +249,12 @@ def norm(pool, raw):
             w = u.get(k)
             if isinstance(w, dict): ws.append(win(k, w.get("percent"), w.get("resetsAt"), k == "rolling"))
     ws = [w for w in ws if w]
-    if not ws: return {"pool": pool, "status": "unknown", "why": "no-windows-in-body", "windows": []}
+    if not ws:
+        why = ("out of date: %s reset since the reading; refresh: hands.sh --probe claude" % ",".join(gone)
+               if gone else "no-windows-in-body")
+        return {"pool": pool, "status": "unknown", "why": why, "windows": []}
     e = {"pool": pool, "status": "ok", "why": None, "windows": ws}
+    if gone: e["reset_since"] = gone
     if scoped: e["scoped"] = scoped
     if isinstance(d.get("age_s"), int): e["age_s"] = d["age_s"]   # a stream reading, not a live probe
     return e
@@ -336,17 +268,16 @@ def verdict(pool, entry):
     for w in entry["windows"]:
         thr = hard
         r = (w["used_pct"] or 0) / thr
-        # binding carries short + resets_at: the pre-buy warn line renders
-        # resets-soon vs gated-for-window from them — the window NAME alone is provider
-        # jargon (codex "primary" is short; nothing in the name says so)
+        # binding carries short + resets_at: a reader tells resets-soon from spent-for-the-window by them --
+        # the window NAME alone is provider jargon (codex "primary" is short; nothing in the name says so)
         wd = {"name": w["name"], "used_pct": w["used_pct"], "threshold": thr,
               "short": w.get("short"), "resets_at": w.get("resets_at")}
         if r > brk: brk, binding = r, wd
         # routing: the LONG-window binding —
         # the number to compare across pools when picking the emptiest. Short windows
-        # are pacing (they reset within hours and still gate buys through `binding`);
+        # are pacing (they reset within hours and still set the verdict through `binding`);
         # when one fronted the board, a week-empty pool read as half-full and bulk work
-        # routed to a genuinely fuller pool. Verdict and pre-buy stay on `binding`.
+        # routed to a genuinely fuller pool. The verdict stays on `binding`.
         if not w["short"] and r > rrk: rrk, routing = r, wd
         if w["used_pct"] >= thr: gate = True
         if not w["short"] and w["used_pct"] >= warn: warned = True
@@ -361,7 +292,7 @@ for pool in pools:
     # Failure contract, enforced: a malformed body from ONE
     # provider must degrade THAT pool to unknown — it must never kill the gauge. Before
     # this, `config` as a list or string (AttributeError) or `creditUsagePercent` as a
-    # string (TypeError) died with rc 0, EMPTY stdout, and no --out snapshot: all four
+    # string (TypeError) died with rc 0, EMPTY stdout: all four
     # pools blind at once, every consumer fail-open, looking exactly like success.
     try:
         e = norm(pool, raw.get(pool, ""))
@@ -375,12 +306,6 @@ for pool in pools:
     out.append(e)
 
 doc = {"probed_at": iso(NOW), "mode": "observe-only", "pools": out}
-outf = os.environ["OUTF_ENV"]
-if outf:
-    os.makedirs(os.path.dirname(outf) or ".", exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(outf) or ".")
-    with os.fdopen(fd, "w") as f: json.dump(doc, f, indent=1)
-    os.replace(tmp, outf)                        # atomic
 
 mode = os.environ["MODE_ENV"]
 if mode == "json":
@@ -402,9 +327,12 @@ else:
             for s in e.get("scoped") or []:
                 line += f" {{{s['name']} {s['used_pct']}%}}"
             line += f" verdict={e['verdict']}"
-            a = e.get("age_s")   # a reading taken from a stream says how old it is
+            a = e.get("age_s")   # a reading taken from a stream says how old it is, and how to refresh it
             if isinstance(a, int):
-                line += f" (read {a}s ago)" if a < 120 else f" (read {a // 60}m ago)"
+                age = f"{a}s" if a < 120 else f"{a // 60}m" if a < 7200 else f"{a // 3600}h"
+                gone = e.get("reset_since")
+                line += (f" (read {age} ago" + (f", before the {'+'.join(gone)} reset" if gone else "")
+                         + "; refresh: hands.sh --probe claude)")
         elif e["status"] == "ok":
             # the same failure contract: a window whose ratio never exceeds the initial
             # -1.0 sentinel (percent <= -threshold) leaves binding None on an ok pool;
@@ -427,7 +355,7 @@ run_selftest() {
   # nothing this suite starts can capture it (heals once posted into the live session)
   unset CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN
   mkdir -p "$SB/bin" "$SB/home/.codex" "$SB/home/.grok" \
-           "$SB/home/.local/share/opencode" "$SB/out" "$SB/tmp" "$SB/state/hands/j1-claude"
+           "$SB/home/.local/share/opencode" "$SB/tmp" "$SB/state/hands/j1-claude"
   # the claude reading lives in job streams in the jobs root, $XDG_STATE_HOME/hands: EVERY row runs on the
   # sandbox's (a row that sets its own names it), so no row can read (or be fooled by) the real job dirs
   export TMPDIR="$SB/tmp" XDG_STATE_HOME="$SB/state"
@@ -529,38 +457,12 @@ STUB
     sh -c "python3 -c 'import json;p=[x for x in json.load(open(\"$SB/o1.json\"))[\"pools\"] if x[\"pool\"]==\"codex\"][0];w=p[\"windows\"];assert len(w)==1 and w[0][\"name\"]==\"primary\" and w[0][\"used_pct\"]==40 and not w[0][\"short\"] and w[0][\"resets_at\"]'"
   t 04 "REDACTION: codex identity fields never reach output" \
     sh -c "! grep -qE 'FAKEFIXTUREID|fixture-must-never-appear' '$SB/o1.json'"
-  # tok_stale (the root-cause fix above) — both directions, plus the two "make no claim"
-  # cases. A guard that flags a healthy token is worse than the bug it replaces.
-  # Tokens are precomputed to FILES: `sh -c` spawns a new shell, so a shell function
-  # defined here would not exist inside it (a known scope trap).
-  python3 -c "
-import json,base64,time,sys
-seg=lambda o: base64.urlsafe_b64encode(json.dumps(o).encode()).decode().rstrip('=')
-mk=lambda d: seg({'alg':'HS256'})+'.'+seg({'exp':int(time.time())+d})+'.sig'
-open(sys.argv[1]+'/jwt-expired','w').write(mk(-3600))
-open(sys.argv[1]+'/jwt-fresh','w').write(mk(3600))
-open(sys.argv[1]+'/jwt-noexp','w').write(seg({'alg':'HS256'})+'.'+seg({'sub':'x'})+'.sig')
-open(sys.argv[1]+'/opaque','w').write('sk-live-abcdef')
-open(sys.argv[1]+'/garbage','w').write('not.a.token')
-" "$SB"
-  t 05a "tok_stale: EXPIRED jwt is flagged token-stale" \
-    sh -c "tok_stale <'$SB/jwt-expired' | grep -q token-stale"
-  t 05b "tok_stale: the message says NOT an auth failure (the whole point of the fix)" \
-    sh -c "tok_stale <'$SB/jwt-expired' | grep -q 'NOT an auth failure'"
-  t 05c "tok_stale: FRESH jwt makes no claim" \
-    sh -c "[ -z \"\$(tok_stale <'$SB/jwt-fresh')\" ]"
-  t 05d "tok_stale: opaque non-JWT key makes no claim (claude class)" \
-    sh -c "[ -z \"\$(tok_stale <'$SB/opaque')\" ]"
-  t 05e "tok_stale: JWT without exp makes no claim" \
-    sh -c "[ -z \"\$(tok_stale <'$SB/jwt-noexp')\" ]"
-  t 05f "tok_stale: malformed token does not crash and makes no claim" \
-    sh -c "[ -z \"\$(tok_stale <'$SB/garbage')\" ]"
   t 05 "grok: unified weekly 71% with period end" \
     sh -c "python3 -c 'import json;p=[x for x in json.load(open(\"$SB/o1.json\"))[\"pools\"] if x[\"pool\"]==\"grok\"][0];assert p[\"windows\"][0][\"used_pct\"]==71.0 and p[\"windows\"][0][\"resets_at\"]'"
   t 06 "opencode: three Go-plan windows parse; rolling is short and values are discriminating" \
     sh -c "python3 -c 'import json;p=[x for x in json.load(open(\"$SB/o1.json\"))[\"pools\"] if x[\"pool\"]==\"opencode\"][0];w={x[\"name\"]:x for x in p[\"windows\"]};assert w[\"rolling\"][\"used_pct\"]==0 and w[\"rolling\"][\"short\"] and w[\"weekly\"][\"used_pct\"]==8 and w[\"monthly\"][\"used_pct\"]==22'"
   t 07 "opencode SPA 404 shell is unknown/unparseable, never a fabricated zero" \
-    sh -c "QUOTA_STUB_OPENCODE='$FX/quota-opencode-404.html' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --pools opencode --json | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];assert p[\"status\"]==\"unknown\" and p[\"why\"]==\"unparseable-body\" and not p[\"windows\"]'"
+    sh -c "QUOTA_STUB_OPENCODE='$FX/quota-opencode-404.html' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' opencode --json | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];assert p[\"status\"]==\"unknown\" and p[\"why\"]==\"unparseable-body\" and not p[\"windows\"]'"
   # THE DICT-ERROR FIX MOVED THIS ROW: it used to assert the flattened "provider-error-body"
   # stub — i.e. it pinned the defect. Same body, same unknown, but `why` now carries the
   # provider sentence, so this row is the second independent witness for that fix.
@@ -586,50 +488,43 @@ open(sys.argv[1]+'/garbage','w').write('not.a.token')
   # are not stable, so classification MUST come from windowDurationMins, never the name.
   # Under the single hard stop (100) the 5h at 92 is hot, not gated: verdict proceed (short
   # windows never set warn), binding = primary (92/100 outranks 16/100) at thr 100. Row 43b
-  # re-values the 5h to 100 -> would-gate with short=true, so the pre-buy says resets-soon.
+  # re-values the 5h to 100 -> would-gate with short=true (resets soon).
   # t 03 stays the witness for the single-window era body (both shapes must keep parsing).
   t 43 "codex 5h+weekly: primary SHORT by duration not name, 5h at 92 → proceed under thr 100 (weekly 16), binding=primary thr 100, canaries redacted" \
-    sh -c "QUOTA_STUB_CODEX='$FX/quota-codex-two-window.json' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --pools codex --json >'$SB/o43.json' && python3 -c 'import json;t=open(\"$SB/o43.json\").read();p=[x for x in json.loads(t)[\"pools\"] if x[\"pool\"]==\"codex\"][0];w={x[\"name\"]:x for x in p[\"windows\"]};assert p[\"status\"]==\"ok\" and len(w)==2 and w[\"primary\"][\"used_pct\"]==92 and w[\"primary\"][\"short\"] and w[\"primary\"][\"resets_at\"] and w[\"secondary\"][\"used_pct\"]==16 and not w[\"secondary\"][\"short\"] and w[\"secondary\"][\"resets_at\"] and p[\"verdict\"]==\"proceed\" and p[\"binding\"][\"name\"]==\"primary\" and p[\"binding\"][\"threshold\"]==100 and \"FAKEFIXTUREID\" not in t and \"fixture-must-never-appear\" not in t, p'"
+    sh -c "QUOTA_STUB_CODEX='$FX/quota-codex-two-window.json' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' codex --json >'$SB/o43.json' && python3 -c 'import json;t=open(\"$SB/o43.json\").read();p=[x for x in json.loads(t)[\"pools\"] if x[\"pool\"]==\"codex\"][0];w={x[\"name\"]:x for x in p[\"windows\"]};assert p[\"status\"]==\"ok\" and len(w)==2 and w[\"primary\"][\"used_pct\"]==92 and w[\"primary\"][\"short\"] and w[\"primary\"][\"resets_at\"] and w[\"secondary\"][\"used_pct\"]==16 and not w[\"secondary\"][\"short\"] and w[\"secondary\"][\"resets_at\"] and p[\"verdict\"]==\"proceed\" and p[\"binding\"][\"name\"]==\"primary\" and p[\"binding\"][\"threshold\"]==100 and \"FAKEFIXTUREID\" not in t and \"fixture-must-never-appear\" not in t, p'"
   sed 's/"usedPercent": 92/"usedPercent": 100/' "$FX/quota-codex-two-window.json" >"$SB/codex-5h-full.json"
   t 43b "a FULL short window gates at the same 100: codex 5h at 100 → would-gate, binding primary short=true thr 100" \
-    sh -c "QUOTA_STUB_CODEX='$SB/codex-5h-full.json' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --pools codex --json | python3 -c 'import json,sys;p=[x for x in json.load(sys.stdin)[\"pools\"] if x[\"pool\"]==\"codex\"][0];b=p[\"binding\"];assert p[\"verdict\"]==\"would-gate\" and b[\"name\"]==\"primary\" and b[\"short\"] is True and b[\"threshold\"]==100 and b[\"used_pct\"]==100, p'"
+    sh -c "QUOTA_STUB_CODEX='$SB/codex-5h-full.json' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' codex --json | python3 -c 'import json,sys;p=[x for x in json.load(sys.stdin)[\"pools\"] if x[\"pool\"]==\"codex\"][0];b=p[\"binding\"];assert p[\"verdict\"]==\"would-gate\" and b[\"name\"]==\"primary\" and b[\"short\"] is True and b[\"threshold\"]==100 and b[\"used_pct\"]==100, p'"
   # Routing/binding split: the board headline
   # is the LONG-window used% — the number to compare across
-  # pools when picking the emptiest — while `binding` (all windows) still owns the verdict and the pre-buy. Live
+  # pools when picking the emptiest — while `binding` (all windows) still owns the verdict. Live
   # failure that bought this: a pool week-empty at 8% fronted its five_hour 47 and building
   # work routed to a fuller pool. Row 44 = headline long + short bracketed + the JSON
   # contract; row 45 = the headline/bracket split is UNMOVED by the single threshold;
   # row 46 = an only-short-windows pool falls back to binding, no bracket, no crash.
   sed 's/"percent": 0,/"percent": 30,/' "$FX/quota-opencode-happy.json" >"$SB/oc-rolling-hot.json"
   t 44 "board headline is the LONG window: opencode rolling 30 binds → used=22% (monthly, the hotter long window) with rolling bracketed; JSON routing=monthly, binding=rolling" \
-    sh -c "QUOTA_STUB_OPENCODE='$SB/oc-rolling-hot.json' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --pools opencode >'$SB/o44.txt' 2>&1 && grep -qF 'opencode used=22% (monthly, thr 100) [rolling 30% thr 100] verdict=proceed' '$SB/o44.txt' && QUOTA_STUB_OPENCODE='$SB/oc-rolling-hot.json' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --pools opencode --json | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];assert p[\"routing\"][\"name\"]==\"monthly\" and p[\"routing\"][\"used_pct\"]==22 and p[\"binding\"][\"name\"]==\"rolling\", p'"
+    sh -c "QUOTA_STUB_OPENCODE='$SB/oc-rolling-hot.json' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' opencode >'$SB/o44.txt' 2>&1 && grep -qF 'opencode used=22% (monthly, thr 100) [rolling 30% thr 100] verdict=proceed' '$SB/o44.txt' && QUOTA_STUB_OPENCODE='$SB/oc-rolling-hot.json' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' opencode --json | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];assert p[\"routing\"][\"name\"]==\"monthly\" and p[\"routing\"][\"used_pct\"]==22 and p[\"binding\"][\"name\"]==\"rolling\", p'"
   t 45 "…and the split is UNMOVED: headline = the weekly 16 with the 5h 92 bracketed; verdict proceed (short heat paces, it never gates below 100)" \
-    sh -c "QUOTA_STUB_CODEX='$FX/quota-codex-two-window.json' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --pools codex >'$SB/o45.txt' 2>&1 && grep -qF 'codex used=16% (secondary, thr 100) [primary 92% thr 100] verdict=proceed' '$SB/o45.txt'"
+    sh -c "QUOTA_STUB_CODEX='$FX/quota-codex-two-window.json' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' codex >'$SB/o45.txt' 2>&1 && grep -qF 'codex used=16% (secondary, thr 100) [primary 92% thr 100] verdict=proceed' '$SB/o45.txt'"
   printf '{"result":{"rateLimits":{"primary":{"usedPercent":5,"windowDurationMins":300,"resetsAt":1794002569}}}}' >"$SB/codex-short-only.json"
   t 46 "a pool with ONLY short windows falls back to the binding headline — no bracket, no crash" \
-    sh -c "QUOTA_STUB_CODEX='$SB/codex-short-only.json' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --pools codex >'$SB/o46.txt' 2>&1 && grep -qF 'codex used=5% (primary, thr 100) verdict=proceed' '$SB/o46.txt' && ! grep -qF ' [' '$SB/o46.txt'"
-  t 13 "total failure (no auth anywhere, no claude stream) → all unknown, exit 0; claude is token-stale (healable), codex its CLI's own JSON-RPC no-login error, the rest no-token" \
-    sh -c "HOME='$SB/empty' XDG_STATE_HOME='$SB/empty' PATH='$SB/bin:$PATH' '$0' --json >'$SB/o13.json'; [ \$? -eq 0 ] && python3 -c 'import json;d={p[\"pool\"]:p for p in json.load(open(\"$SB/o13.json\"))[\"pools\"]};assert all(p[\"status\"]==\"unknown\" for p in d.values()) and d[\"claude\"][\"why\"].startswith(\"token-stale (no claude reading\") and d[\"codex\"][\"why\"]==\"codex account authentication required to read rate limits\" and all(d[k][\"why\"]==\"no-token\" for k in (\"grok\",\"opencode\"))'"
-  t 14 "--out writes valid normalized JSON (atomic path)" \
-    sh -c "HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --out '$SB/out/snap.json' >/dev/null && python3 -c 'import json;d=json.load(open(\"$SB/out/snap.json\"));assert d[\"mode\"]==\"observe-only\" and len(d[\"pools\"])==4'"
+    sh -c "QUOTA_STUB_CODEX='$SB/codex-short-only.json' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' codex >'$SB/o46.txt' 2>&1 && grep -qF 'codex used=5% (primary, thr 100) verdict=proceed' '$SB/o46.txt' && ! grep -qF ' [' '$SB/o46.txt'"
+  t 13 "total failure (no auth anywhere, no claude stream) → all unknown, exit 0; claude has no reading, codex its CLI's own JSON-RPC no-login error, the rest no-token" \
+    sh -c "HOME='$SB/empty' XDG_STATE_HOME='$SB/empty' PATH='$SB/bin:$PATH' '$0' --json >'$SB/o13.json'; [ \$? -eq 0 ] && python3 -c 'import json;d={p[\"pool\"]:p for p in json.load(open(\"$SB/o13.json\"))[\"pools\"]};assert all(p[\"status\"]==\"unknown\" for p in d.values()) and d[\"claude\"][\"why\"].startswith(\"no claude reading\") and d[\"codex\"][\"why\"]==\"codex account authentication required to read rate limits\" and all(d[k][\"why\"]==\"no-token\" for k in (\"grok\",\"opencode\"))'"
   t 15 "observe grammar: one verdict= line per pool" \
     sh -c "HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' >'$SB/o15.txt' && [ \$(grep -c 'verdict=' '$SB/o15.txt') -eq 4 ]"
-  t 16 "--pools subsets: only requested pools probed" \
-    sh -c "HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --pools 'codex grok' --json | python3 -c 'import json,sys;d=json.load(sys.stdin);assert [p[\"pool\"] for p in d[\"pools\"]]==[\"codex\",\"grok\"]'"
+  t 16 "provider arguments subset the board: only those pools probed, in order" \
+    sh -c "HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' codex grok --json | python3 -c 'import json,sys;d=json.load(sys.stdin);assert [p[\"pool\"] for p in d[\"pools\"]]==[\"codex\",\"grok\"]'"
   t 17 "unknown pool arg tolerated, exit 0 (contract)" \
     sh -c "HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --bogus-flag; [ \$? -eq 0 ]"
-  # The arg loop's OTHER half of the contract. Row 17 covers an unknown FLAG; this covers a
-  # known flag with its VALUE missing, which under `set -u` was not a typed outcome at all
-  # but a bash abort (`line 37: $2: unbound variable`, rc 1, zero observe lines).
-  t 31 "--out with NO value: typed stderr line, board still printed, exit 0 — never a bash unbound-variable abort" \
-    sh -c "HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --out >'$SB/o31.txt' 2>'$SB/e31.txt'; rc=\$?; [ \$rc -eq 0 ] && grep -q 'quota: --out needs a FILE' '$SB/e31.txt' && ! grep -q 'unbound variable' '$SB/e31.txt' && [ \$(grep -c 'verdict=' '$SB/o31.txt') -eq 4 ]"
   t 18 "grok fresh period: proto3 omits the zero scalar → used=0 ok, NOT unknown (a live drift)" \
     sh -c "QUOTA_STUB_GROK='$FX/quota-grok-fresh-period.json' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --json | python3 -c 'import json,sys;p=[x for x in json.load(sys.stdin)[\"pools\"] if x[\"pool\"]==\"grok\"][0];assert p[\"status\"]==\"ok\" and p[\"windows\"][0][\"used_pct\"]==0.0 and p[\"windows\"][0][\"resets_at\"]'"
   printf '{"config":{"somethingElse":1}}' >"$SB/grok-alien.json"
   t 19 "grok body WITHOUT the period marker stays unknown — absent is still never fabricated (the absent-field rule)" \
     sh -c "QUOTA_STUB_GROK='$SB/grok-alien.json' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --json | python3 -c 'import json,sys;p=[x for x in json.load(sys.stdin)[\"pools\"] if x[\"pool\"]==\"grok\"][0];assert p[\"status\"]==\"unknown\" and p[\"why\"]==\"no-windows-in-body\"'"
   # failure contract: a body that CRASHES the parser degrades THAT pool to
-  # unknown/malformed-body while every other pool stays live and the snapshot still writes.
+  # unknown/malformed-body while every other pool stays live and the document still prints.
   # The containment wraps the per-pool CALL SITE, so it covers all four pools and both
   # crash sites (norm and verdict) at once; the rows deliberately SPAN pools and sites
   # (three same-pool bodies would test one branch thrice).
@@ -641,8 +536,8 @@ open(sys.argv[1]+'/garbage','w').write('not.a.token')
   printf '{"config":{"creditUsagePercent":-1000,"billingPeriodEnd":"2026-08-26T00:00:00+00:00"}}' >"$SB/grok-neg-pct.json"
   t 25 "percent <= -threshold (binding None on an ok pool): all FOUR observe lines still print, rc 0" \
     sh -c "QUOTA_STUB_GROK='$SB/grok-neg-pct.json' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' >'$SB/o25.txt' 2>&1 && [ \$(grep -c 'quota(observe):' '$SB/o25.txt') -eq 4 ] && grep -q 'grok used=? (ok, no binding window)' '$SB/o25.txt'"
-  t 20 "grok config-as-list (AttributeError in norm) → ONLY grok malformed-body; others live; snapshot writes" \
-    sh -c "QUOTA_STUB_GROK='$SB/grok-cfg-list.json' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --out '$SB/out/s20.json' >/dev/null 2>&1 && python3 -c 'import json;d=json.load(open(\"$SB/out/s20.json\"));p={x[\"pool\"]:x for x in d[\"pools\"]};g=p[\"grok\"];assert g[\"status\"]==\"unknown\" and g[\"why\"]==\"malformed-body\" and p[\"claude\"][\"status\"]==\"ok\" and p[\"codex\"][\"status\"]==\"ok\"'"
+  t 20 "grok config-as-list (AttributeError in norm) → ONLY grok malformed-body; others live; the document prints" \
+    sh -c "QUOTA_STUB_GROK='$SB/grok-cfg-list.json' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --json >'$SB/s20.json' 2>/dev/null && python3 -c 'import json;d=json.load(open(\"$SB/s20.json\"));p={x[\"pool\"]:x for x in d[\"pools\"]};g=p[\"grok\"];assert g[\"status\"]==\"unknown\" and g[\"why\"]==\"malformed-body\" and p[\"claude\"][\"status\"]==\"ok\" and p[\"codex\"][\"status\"]==\"ok\"'"
   t 21 "claude utilization-as-string (TypeError in norm) degrades to malformed-body, exit 0" \
     sh -c "XDG_STATE_HOME='$SB/tmp21' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --json | python3 -c 'import json,sys;p=[x for x in json.load(sys.stdin)[\"pools\"] if x[\"pool\"]==\"claude\"][0];assert p[\"status\"]==\"unknown\" and p[\"why\"]==\"malformed-body\"'"
   t 22 "codex windowDurationMins-as-string (TypeError in norm, the fourth crash site) degrades on the observe line" \
@@ -652,10 +547,10 @@ open(sys.argv[1]+'/garbage','w').write('not.a.token')
   # (NOT a captured stream, so it lives in the sandbox, not fixtures/): an sk-ant token, a 44-char run.
   printf '{"type":"error","error":{"type":"auth_error","message":"Bad token sk-ant-oat01-LEAKLEAKLEAKLEAK and id 0123456789012345678901234567890123456789ABCD were rejected. Re-authenticate."}}' >"$SB/leak-body.json"
   t 29 "provider error message with token material → why is MASKED (no sk-, no 40+ run) and capped, prose kept" \
-    sh -c "QUOTA_STUB_GROK='$SB/leak-body.json' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --json --pools grok | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];w=p[\"why\"];assert p[\"status\"]==\"unknown\" and \"sk-ant\" not in w and \"LEAK\" not in w and \"0123456789\" not in w and \"Re-authenticate\" in w and len(w)<=200, p'"
+    sh -c "QUOTA_STUB_GROK='$SB/leak-body.json' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --json grok | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];w=p[\"why\"];assert p[\"status\"]==\"unknown\" and \"sk-ant\" not in w and \"LEAK\" not in w and \"0123456789\" not in w and \"Re-authenticate\" in w and len(w)<=200, p'"
 
   # THE CLAUDE READING: the newest top-level rate_limit_event across claude job
-  # streams, fresh within the hour. Each row is falsified by reverting one rule of claude_body.
+  # streams, at any age; a window that reset after it is dropped. Each row is falsified by reverting one rule of claude_body.
   mk() { # $1 dir  $2 age-seconds (mtime)  $3.. json lines
     local d="$1" a="$2"; shift 2; mkdir -p "$d"; printf '%s\n' "$@" >"$d/stream.jsonl"
     python3 -c 'import os,sys,time;t=time.time()-int(sys.argv[2]);os.utime(sys.argv[1],(t,t))' "$d/stream.jsonl" "$a"
@@ -664,24 +559,24 @@ open(sys.argv[1]+'/garbage','w').write('not.a.token')
   R() { printf '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":%s,"resetsAt":%s},"seven_day":{"utilization":%s,"resetsAt":%s}}}}' "$1" "${3:-$F5}" "$2" "$F7"; }
   T=$SB/t34; mk "$T/hands/old" 600 "$(R 0.90 0.90)"; mk "$T/hands/new" 30 "$(R 0.11 0.12)" '{"type":"assistant"}' "$(R 0.15 0.16)"
   t 34 "the NEWEST reading wins: the most recently written stream (a 10-minute-older one reads 90), and in it the LAST event (15, not 11)" \
-    sh -c "XDG_STATE_HOME='$T' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --json --pools claude | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];w={x[\"name\"]:x[\"used_pct\"] for x in p[\"windows\"]};assert w==dict(five_hour=15.0,seven_day=16.0), p'"
+    sh -c "XDG_STATE_HOME='$T' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --json claude | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];w={x[\"name\"]:x[\"used_pct\"] for x in p[\"windows\"]};assert w==dict(five_hour=15.0,seven_day=16.0), p'"
   T=$SB/t35; mk "$T/hands/claude" 300 "$(R 0.21 0.22)"
   mk "$T/hands/codex" 5 "$(printf '{"type":"item.completed","item":{"type":"agent_message","text":"%s"}}' "$(R 0.99 0.99 | sed 's/"/\\"/g')")"
   t 35 "a stream that only QUOTES a rate_limit_event (a codex seat discussing one) is text, never a reading: the older real claude stream wins (21, not 99)" \
-    sh -c "XDG_STATE_HOME='$T' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --json --pools claude | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];w={x[\"name\"]:x[\"used_pct\"] for x in p[\"windows\"]};assert w[\"five_hour\"]==21.0, p'"
+    sh -c "XDG_STATE_HOME='$T' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --json claude | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];w={x[\"name\"]:x[\"used_pct\"] for x in p[\"windows\"]};assert w[\"five_hour\"]==21.0, p'"
   T=$SB/t36; mk "$T/hands/claude" 7200 "$(R 0.30 0.40)"
-  t 36 "a reading older than the hour is STALE: unknown, why token-stale (rearm heals it), the observe line says so" \
-    sh -c "XDG_STATE_HOME='$T' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --pools claude >'$SB/o36.txt' && grep -q '^quota(observe): claude UNKNOWN (why: token-stale (no claude reading within 60 min' '$SB/o36.txt'"
+  t 36 "an OLD reading is still shown, with its age in hours and how to refresh it -- never hidden" \
+    sh -c "XDG_STATE_HOME='$T' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' claude >'$SB/o36.txt' && grep -qxF 'quota(observe): claude used=40.0% (seven_day, thr 90) verdict=proceed (read 2h ago; refresh: hands.sh --probe claude)' '$SB/o36.txt'"
   T=$SB/t37; mk "$T/hands/claude" 60 "$(R 0.95 0.40 $(( $(date +%s) - 10 )))"
-  t 37 "a reading that PREDATES a window reset is stale (a 95% five_hour that has since reset must not gate claude buys for the rest of the hour)" \
-    sh -c "XDG_STATE_HOME='$T' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --json --pools claude | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];assert p[\"status\"]==\"unknown\" and p[\"why\"].startswith(\"token-stale (the newest claude reading predates a reset of five_hour\"), p'"
+  t 37 "a reading that PREDATES a window reset drops that window (a 95% five_hour that has since reset is no longer true) and keeps the rest, the line marked out of date" \
+    sh -c "XDG_STATE_HOME='$T' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --json claude | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];assert p[\"status\"]==\"ok\" and [w[\"name\"] for w in p[\"windows\"]]==[\"seven_day\"] and p[\"reset_since\"]==[\"five_hour\"], p' && XDG_STATE_HOME='$T' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' claude | grep -qF 's ago, before the five_hour reset; refresh: hands.sh --probe claude)'"
   T=$SB/t38; mk "$T/hands/b" 300 "$(R 0.31 0.32)"; mk "$T/hands/a" 10 '{"type":"assistant","message":{"content":[{"type":"text","text":"the gauge reads unifiedWindows"}]}}' '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1788303000,"rateLimitType":"five_hour"}}'
   t 38 "an event WITHOUT unifiedWindows (the pre-2.1.2xx shape, fixtures/claude-stream-sample.jsonl) is not a reading, even in a stream whose text mentions the field: the next stream that has one is read" \
-    sh -c "XDG_STATE_HOME='$T' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --json --pools claude | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];w={x[\"name\"]:x[\"used_pct\"] for x in p[\"windows\"]};assert w[\"five_hour\"]==31.0, p'"
-  t 39 "the board line carries the reading's AGE after the verdict (a stream reading is not a live probe)" \
-    sh -c "q() { HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' \"\$@\"; }; q --pools claude | grep -qE '^quota\\(observe\\): claude used=43.0% \\(seven_day, thr 90\\) verdict=proceed \\(read [0-9]+s ago\\)\$'"
+    sh -c "XDG_STATE_HOME='$T' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --json claude | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];w={x[\"name\"]:x[\"used_pct\"] for x in p[\"windows\"]};assert w[\"five_hour\"]==31.0, p'"
+  t 39 "the board line carries the reading's AGE and its refresh after the verdict (a stream reading is not a live probe)" \
+    sh -c "q() { HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' \"\$@\"; }; q claude | grep -qE '^quota\\(observe\\): claude used=43.0% \\(seven_day, thr 90\\) verdict=proceed \\(read [0-9]+s ago; refresh: hands.sh --probe claude\\)\$'"
   : >"$SB/calls.log"
-  QUOTA_CALL_LOG="$SB/calls.log" HOME="$SB/home" PATH="$SB/bin:$PATH" "$0" --json --pools claude >"$SB/o40.json" 2>/dev/null
+  QUOTA_CALL_LOG="$SB/calls.log" HOME="$SB/home" PATH="$SB/bin:$PATH" "$0" --json claude >"$SB/o40.json" 2>/dev/null
   t 40 "the claude reading reads NO credential and calls NO endpoint: no keychain (security), no curl, no claude --version — and it is still ok" \
     sh -c "[ ! -s '$SB/calls.log' ] && python3 -c 'import json;p=json.load(open(\"$SB/o40.json\"))[\"pools\"][0];assert p[\"status\"]==\"ok\", p'"
   # THE WIRE, NOT THE STUB: replay() copies a RECORDED claude stream into a sandbox job dir. Only the
@@ -708,35 +603,35 @@ PY
   # before init, thinking, the rate_limit_event, a post-turn summary)
   replay "$FX/claude-stream-ratelimit.jsonl" "$SB/t41"
   t 41 "the claude reading off a REAL recorded stream (fixtures/claude-stream-ratelimit.jsonl): five_hour 12.0 short, seven_day 37.0, verdict proceed" \
-    sh -c "XDG_STATE_HOME='$SB/t41' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --json --pools claude | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];w={x[\"name\"]:(x[\"used_pct\"],x[\"short\"]) for x in p[\"windows\"]};assert p[\"status\"]==\"ok\" and w==dict(five_hour=(12.0,True),seven_day=(37.0,False)) and p[\"verdict\"]==\"proceed\", p'"
+    sh -c "XDG_STATE_HOME='$SB/t41' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --json claude | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];w={x[\"name\"]:(x[\"used_pct\"],x[\"short\"]) for x in p[\"windows\"]};assert p[\"status\"]==\"ok\" and w==dict(five_hour=(12.0,True),seven_day=(37.0,False)) and p[\"verdict\"]==\"proceed\", p'"
   # 47: the opencode key file has ONE resolver, hands.sh's opencode_auth: XDG_DATA_HOME first,
   # as opencode resolves it — opencode's own auth.json, the store every opencode seat runs on. Falsification: read
   # $HOME/.local/share again (the gauge's old private copy of the path) → the bearer is the HOME key.
   mkdir -p "$SB/xdg47/opencode"; printf '{"opencode-go":{"key":"sk-xdg47"}}' >"$SB/xdg47/opencode/auth.json"; : >"$SB/auth47.log"
   t 47 "the opencode gauge reads the key file through hands.sh's resolver: XDG_DATA_HOME wins over HOME (the bearer is the XDG store's key)" \
-    sh -c "QUOTA_AUTH_LOG='$SB/auth47.log' XDG_DATA_HOME='$SB/xdg47' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --pools opencode >/dev/null 2>&1 && [ \"\$(cat '$SB/auth47.log')\" = 'Authorization: Bearer sk-xdg47' ]"
+    sh -c "QUOTA_AUTH_LOG='$SB/auth47.log' XDG_DATA_HOME='$SB/xdg47' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' opencode >/dev/null 2>&1 && [ \"\$(cat '$SB/auth47.log')\" = 'Authorization: Bearer sk-xdg47' ]"
   # 48: THE SCOPED LIMIT NEVER GATES (pinned on the stream wire). The recorded
   # fable event (fixtures/claude-stream-fable-scoped.jsonl) carries seven_day_overage_included
   # at 97 beside the account windows five_hour 15 and seven_day 58. Falsification: gate on every
   # unifiedWindows key again → would-gate at 97, no braces.
   replay "$FX/claude-stream-fable-scoped.jsonl" "$SB/t48"
   t 48 "a scoped limit is DISPLAY-ONLY: the recorded fable wire (seven_day_overage_included 97, seven_day 58) reads verdict proceed, headline seven_day, the scoped 97 in braces and in JSON scoped, never a window" \
-    sh -c "XDG_STATE_HOME='$SB/t48' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --pools claude >'$SB/o48.txt' 2>&1 && grep -qE '^quota\\(observe\\): claude used=58.0% \\(seven_day, thr 90\\) \\{seven_day_overage_included 97.0%\\} verdict=proceed \\(read ' '$SB/o48.txt' && XDG_STATE_HOME='$SB/t48' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --json --pools claude | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];assert p[\"verdict\"]==\"proceed\" and sorted(x[\"name\"] for x in p[\"windows\"])==[\"five_hour\",\"seven_day\"] and p[\"scoped\"]==[dict(name=\"seven_day_overage_included\",used_pct=97.0,resets_at=p[\"scoped\"][0][\"resets_at\"])] and p[\"scoped\"][0][\"resets_at\"], p'"
+    sh -c "XDG_STATE_HOME='$SB/t48' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' claude >'$SB/o48.txt' 2>&1 && grep -qE '^quota\\(observe\\): claude used=58.0% \\(seven_day, thr 90\\) \\{seven_day_overage_included 97.0%\\} verdict=proceed \\(read ' '$SB/o48.txt' && XDG_STATE_HOME='$SB/t48' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --json claude | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];assert p[\"verdict\"]==\"proceed\" and sorted(x[\"name\"] for x in p[\"windows\"])==[\"five_hour\",\"seven_day\"] and p[\"scoped\"]==[dict(name=\"seven_day_overage_included\",used_pct=97.0,resets_at=p[\"scoped\"][0][\"resets_at\"])] and p[\"scoped\"][0][\"resets_at\"], p'"
   # 50: THE CODEX READING: its CLI's own app-server answers, so the gauge calls no endpoint and reads no
   # credential. Falsification: restore the auth.json read + curl to chatgpt.com -> curl in the log, the unreadable login no-token.
   mkdir -p "$SB/home50/.codex"; cp "$SB/home/.codex/auth.json" "$SB/home50/.codex/"; chmod 000 "$SB/home50/.codex/auth.json"; : >"$SB/calls50.log"
   t 50 "the codex reading calls NO endpoint and reads NO credential: one codex --no-daemon app-server answers, no curl, and an unreadable auth.json still reads ok" \
-    sh -c "QUOTA_CALL_LOG='$SB/calls50.log' HOME='$SB/home50' PATH='$SB/bin:$PATH' '$0' --json --pools codex | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];assert p[\"status\"]==\"ok\" and p[\"windows\"][0][\"used_pct\"]==40, p' && [ \"\$(cat '$SB/calls50.log')\" = 'codex --no-daemon app-server' ]"
+    sh -c "QUOTA_CALL_LOG='$SB/calls50.log' HOME='$SB/home50' PATH='$SB/bin:$PATH' '$0' --json codex | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];assert p[\"status\"]==\"ok\" and p[\"windows\"][0][\"used_pct\"]==40, p' && [ \"\$(cat '$SB/calls50.log')\" = 'codex --no-daemon app-server' ]"
   # 51: the failure contract on the codex wire: a CLI that exits unanswered is unknown carrying its rc; one that never
   # answers, or answers and never exits (LINGER, run beside HANG), is ended by the one 20 s deadline (its group killed);
   # the gauge exits 0 and no CLI process is left. Falsification: drop the deadline's start, or start_new_session (killpg
   # then finds no group) -> HANG runs into the 40 s alarm; cancel the deadline before the exit wait -> LINGER does.
   t 51 "a codex app-server that exits unanswered (rc 6), never answers, or answers and never exits is bounded by the one 20 s deadline (its group killed): unknown or ok, exit 0, no process left" \
-    sh -c "QUOTA_STUB_CODEX=FAIL HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --json --pools codex | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];assert p[\"status\"]==\"unknown\" and p[\"why\"]==\"codex app-server gave no answer (rc 6)\", p' || exit 1; s=\$(date +%s); QUOTA_STUB_CODEX=LINGER HOME='$SB/home' PATH='$SB/bin:$PATH' perl -e 'alarm shift; exec @ARGV' 40 '$0' --json --pools codex >'$SB/o51l.json' & l=\$!; QUOTA_STUB_CODEX=HANG HOME='$SB/home' PATH='$SB/bin:$PATH' perl -e 'alarm shift; exec @ARGV' 40 '$0' --json --pools codex >'$SB/o51.json' && wait \$l && e=\$((\$(date +%s)-s)) && [ \$e -ge 19 ] && [ \$e -le 30 ] && python3 -c 'import json;p=json.load(open(\"$SB/o51.json\"))[\"pools\"][0];assert p[\"status\"]==\"unknown\" and p[\"why\"]==\"codex app-server gave no answer (killed at the 20 s deadline)\", p' && python3 -c 'import json;p=json.load(open(\"$SB/o51l.json\"))[\"pools\"][0];assert p[\"status\"]==\"ok\" and p[\"windows\"][0][\"used_pct\"]==40, p' && ! pgrep -f '$SB/bin/[c]odex'"
+    sh -c "QUOTA_STUB_CODEX=FAIL HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --json codex | python3 -c 'import json,sys;p=json.load(sys.stdin)[\"pools\"][0];assert p[\"status\"]==\"unknown\" and p[\"why\"]==\"codex app-server gave no answer (rc 6)\", p' || exit 1; s=\$(date +%s); QUOTA_STUB_CODEX=LINGER HOME='$SB/home' PATH='$SB/bin:$PATH' perl -e 'alarm shift; exec @ARGV' 40 '$0' --json codex >'$SB/o51l.json' & l=\$!; QUOTA_STUB_CODEX=HANG HOME='$SB/home' PATH='$SB/bin:$PATH' perl -e 'alarm shift; exec @ARGV' 40 '$0' --json codex >'$SB/o51.json' && wait \$l && e=\$((\$(date +%s)-s)) && [ \$e -ge 19 ] && [ \$e -le 30 ] && python3 -c 'import json;p=json.load(open(\"$SB/o51.json\"))[\"pools\"][0];assert p[\"status\"]==\"unknown\" and p[\"why\"]==\"codex app-server gave no answer (killed at the 20 s deadline)\", p' && python3 -c 'import json;p=json.load(open(\"$SB/o51l.json\"))[\"pools\"][0];assert p[\"status\"]==\"ok\" and p[\"windows\"][0][\"used_pct\"]==40, p' && ! pgrep -f '$SB/bin/[c]odex'"
   # 52: the grok and opencode bearers reach curl on its stdin (-H @-), never in its argv, which ps shows every local
   # user. Falsification: pass either as -H "Authorization: Bearer ..." -> it is in the argv log
   t 52 "THE BEARER NEVER RIDES ARGV: the grok and opencode gauges hand their token to curl on stdin -- both reach the header, neither is in curl's argv" \
-    sh -c "QUOTA_ARGV_LOG='$SB/argv52' QUOTA_AUTH_LOG='$SB/auth52' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' --pools 'grok opencode' >/dev/null 2>&1 && grep -qx 'Authorization: Bearer tok-test' '$SB/auth52' && grep -qx 'Authorization: Bearer sk-test' '$SB/auth52' && [ -s '$SB/argv52' ] && ! grep -q 'Bearer' '$SB/argv52'"
+    sh -c "QUOTA_ARGV_LOG='$SB/argv52' QUOTA_AUTH_LOG='$SB/auth52' HOME='$SB/home' PATH='$SB/bin:$PATH' '$0' grok opencode >/dev/null 2>&1 && grep -qx 'Authorization: Bearer tok-test' '$SB/auth52' && grep -qx 'Authorization: Bearer sk-test' '$SB/auth52' && [ -s '$SB/argv52' ] && ! grep -q 'Bearer' '$SB/argv52'"
   # 49: falsification: drop a suite-wide unset and run the suite with that name exported -> red.
   t 49 "HERMETIC SUITE: the suite's env carries neither driver-inbox name nor CODEX_HOME, whatever env the suite was started in" \
     sh -c "[ -z \"\${CLAUDE_CODE_MESSAGING_SOCKET+x}\${CLAUDE_CODE_MESSAGING_TOKEN+x}\${CODEX_HOME+x}\" ]"

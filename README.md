@@ -85,6 +85,7 @@ H=~/src/hands/hands.sh
 mkdir -p /tmp/hands-try && cd /tmp/hands-try
 
 $H --probe all        # which providers answer (a 1-token ping each; it spends a little quota)
+$H quota              # how much of each provider's quota is used (read-only, never spends)
 
 echo "List the files here and say what each one is for." > task.md
 $H start --cwd /tmp/hands-try codex task.md   # prints {"status":"spawned","dir":"DIR",...}
@@ -156,6 +157,7 @@ to keep.
 | `mail DIR TEXT` | appends a driver line to `DIR/inbox.jsonl`; the live wrapper delivers it as `MAIL from driver` (it never cancels a running turn) | nothing, 0. 1 when no wrapper is live (the line waits for the next launch). 2 when the inbox is a link or not a regular file |
 | `wait DIR [--for turn\|mail\|exit] [--timeout S]` | blocks, spending nothing, until every sent turn ends (`turn`), the seat's next outbox line (`mail`), or the wrapper exits (`exit`) | the answer if ok, then the envelope; 0 if ok, else 1. At the timeout: `{"status":"running","last_event","open_tool_calls",...}`, 1 |
 | `events DIR [--follow]` | a readable view of `DIR/events.jsonl`: text blocks, one line per tool call, turn and usage lines with the cache-hit %, errors. `--follow` ends when the seat does. The raw stream is `tail -f DIR/events.jsonl` | text, 0 |
+| `quota [--json] [provider ...]` | the quota board: one line per provider (§ Quota gauges). Read-only: it never spends | the board, 0 |
 | `stop DIR` | TERMs the seat's process groups, KILLs what's left after 5 s; the wrapper types the open turn and every queued one `incomplete` | the envelope, 0 (1 if a wrapper survived) |
 
 A bare buy (no verb) is `start` + `wait` + `stop`: nothing outlives the call, and a later `send`
@@ -254,14 +256,15 @@ start.
 
 ## Quota gauges
 
-`rearm.sh` prints a board with one line per provider: the used share of its pool, a verdict and
-the reset time. hands never checks it before a buy: a seat bought into a spent pool ends
-`provider-quota-dead` with the reset time.
+`hands.sh quota` prints a board with one line per provider: the used share of its pool, an
+advisory verdict and the reset time; `--json` prints the same as one document. It only reads: it
+never spends quota and never starts a seat. hands never checks it before a buy: a seat bought into
+a spent pool ends `provider-quota-dead` with the reset time.
 
 - **Claude and Codex** need no credential and no extra endpoint: Claude's reading is the newest
   `rate_limit_event` in a Claude seat's own stream, and Codex's is its CLI's app-server answering
-  `account/rateLimits/read`. When the Claude reading is stale, `rearm.sh` heals it with one
-  `--probe claude`.
+  `account/rateLimits/read`. The Claude line says how old its reading is; a window that has reset
+  since is dropped, and `hands.sh --probe claude` writes a fresh reading.
 - **Grok and OpenCode** have no such surface, so `quota.sh` reads the token each CLI already
   keeps and calls that vendor's **undocumented** usage endpoint (`cli-chat-proxy.grok.com/v1/billing`,
   `opencode.ai/zen/go/v1/usage`, the OpenCode Go plan). The token goes to `curl` on stdin, never on
@@ -311,8 +314,7 @@ hands/
 ├── hands.sh        the command line, the seat contract, --selftest
 ├── seat.py         the engine: the wire table, the wrapper, the verbs, the envelope writer
 ├── acp.py          the ACP client (Grok, OpenCode) and the event vocabulary all wires share
-├── quota.sh        the quota gauges (--json, --selftest)
-├── rearm.sh        the quota board; heals a stale Claude reading with one probe
+├── quota.sh        the quota board behind hands.sh quota (--json, --selftest)
 ├── test_acp.py     the ACP suite
 ├── test-stub.py    a stand-in for the claude and codex CLIs, used by the suites
 └── fixtures/       recorded provider output the suites replay

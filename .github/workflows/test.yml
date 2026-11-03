@@ -19,8 +19,6 @@ jobs:
         run: python3 test_acp.py
       - name: quota selftest
         run: bash ./quota.sh --selftest
-      - name: rearm selftest
-        run: bash ./rearm.sh --selftest
 
   # Linux is untested; this job reports how far the suites get.
   ubuntu:

@@ -11,6 +11,7 @@
 #   hands.sh events DIR [--follow]   a readable view of DIR/events.jsonl
 #   hands.sh stop DIR             TERM the seat, KILL after a 5 s drain; the envelope still lands
 #   hands.sh --probe [claude|codex|grok|opencode|all]   a 1-token aliveness ping per provider (spends a little quota)
+#   hands.sh quota [--json] [provider ...]   the quota board (quota.sh): read-only, it never spends
 #   hands.sh --selftest           hermetic tests: stub CLIs, no network, no spend
 #
 # opts (all before the provider spec; the prompt is always a file):
@@ -39,6 +40,7 @@ SEATPY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/seat.py"   # the wire laye
 case "${1:-}" in   # the seat verbs come first; start is the buy that returns at once
   start) VERB=start; shift ;;
   send|mail|wait|events|stop) VERB="$1"; shift; VERB_ARGS=("$@"); set -- ;;
+  quota) shift; exec bash "${SEATPY%/*}/quota.sh" "$@" ;;
 esac
 
 cli_path() {  # resolve a provider CLI even when it's not on PATH
@@ -237,7 +239,7 @@ seat_send() { # $1 dir  $2 file — a live seat takes the turn now; a gone one r
 
 # ---------- probe ----------
 run_probe() {
-  # a probe is INTERNAL (an aliveness ping, rearm's heal): it never captures the driver's inbox socket, so it never pushes
+  # a probe is INTERNAL (an aliveness ping): it never captures the driver's inbox socket, so it never pushes
   unset CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN
   local list="$1" p pf rc=0 lines jobs
   jobs="$(python3 "$SEATPY" sweep 2>/dev/null)"   # the jobs root (seat.py JOBS), where every probe's dir goes
@@ -250,8 +252,8 @@ run_probe() {
       printf '{"status":"not-installed","provider":"%s","model":null,"rc":0,"seconds":0,"reset":null,"dir":null,"usage":null}\n' "$p" | tee -a "$lines"; continue
     fi
     local pspec="$p" peff=""
-    # the smallest model wins: a ping proves the CLI and its auth, not a model. claude's probe is also
-    # rearm's claude heal — its stream's rate_limit_event IS the claude gauge reading, and the windows
+    # the smallest model wins: a ping proves the CLI and its auth, not a model. claude's probe also
+    # refreshes the quota board — its stream's rate_limit_event IS the claude reading, and the windows
     # are the account's, whatever model wrote them. opencode: 2.x lists no working free model (on
     # 2.0.22 one hung 4 min, one "unavailable"), so the cheapest Go model at low. An ACP seat always
     # names an effort its model lists.
@@ -1005,7 +1007,7 @@ for l in open(sys.argv[1]):
   # Falsified per flag.
   t 49e "claude seats run LEAN: --strict-mcp-config + --exclude-dynamic-system-prompt-sections in argv, CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 in env" \
     sh -c "grep -qx -- --strict-mcp-config '$SB/g49.argv' && grep -qx -- --exclude-dynamic-system-prompt-sections '$SB/g49.argv' && grep -q 'mem=1' '$SB/g49/result.txt'"
-  # 39w: the claude PROBE is rearm's claude heal (its stream's rate_limit_event is the gauge reading), so it pings the
+  # 39w: the claude PROBE refreshes the quota board (its stream's rate_limit_event is the claude reading), so it pings the
   # smallest model in a neutral cwd, and its job dir lands in the jobs root, where the gauge reads.
   # Falsification: drop the haiku spec -> the CLI default (sonnet); drop the neutral cwd -> the caller's directory.
   TD="$(cd "$SB/tmp" && pwd -P)"
@@ -1261,8 +1263,7 @@ STUB
   # 153: THE PUSH SURVIVES THE STRIP. Falsification: put main's top-of-file unset back in this file -> no capture, no push
   t 153 "THE DRIVER'S INBOX STAYS THE WRAPPER'S: with the socket and token exported to the buy, every wire's wrapper -- stdin (claude), rpc (codex), ACP (grok, opencode) -- captures both (driver.sock = the exported socket) and its turn_end push reaches the socket (the seat sees neither name: row 168)" \
     sh -c "for c in claude codex grok opencode; do [ \"\$(cat '$SB'/e153-\$c/driver.sock)\" = '$SB/d.sock' ] || exit 1; done && python3 '$SB/chk.py' push '$SB/push.log' '$SB/e153-claude' ok 1 'claude:sonnet t1 ok: bg=1 mem=1 turn=1' 'bg=1 mem=1 turn=1' && python3 '$SB/chk.py' push '$SB/push.log' '$SB/e153-codex' ok 1 'codex:gpt-5.6-terra t1 ok: stub ok' 'stub ok' && python3 '$SB/chk.py' push '$SB/push.log' '$SB/e153-grok' ok 1 'grok:grok-4.6 t1 ok: PONG' 'PONG' && python3 '$SB/chk.py' push '$SB/push.log' '$SB/e153-opencode' ok 1 'opencode:opencode-go/deepseek-v4.1-flash t1 ok: PONG' 'PONG'"
-  # 156: PROBES NEVER PUSH (rearm selftest heals once posted stub completions into the live
-  # driver session). A probe is internal: with the stub socket exported, its job dir captures no socket and the socket
+  # 156: PROBES NEVER PUSH. A probe is internal: with the stub socket exported, its job dir captures no socket and the socket
   # receives nothing from it. Falsification: drop run_probe's unset -> driver.sock captured, a 'probe-' push logged.
   ( export CLAUDE_CODE_MESSAGING_SOCKET="$SB/d.sock" CLAUDE_CODE_MESSAGING_TOKEN=tok-stub; mkdir -p "$SB/tmp156"
     PATH="$SB/bin:$PATH" TMPDIR="$SB/tmp156" XDG_STATE_HOME="$SB/tmp156" XDG_CACHE_HOME="$SB/cache" "$0" --probe claude >"$SB/p156.out" 2>&1
@@ -1424,6 +1425,11 @@ STUB
   st="$(classify_blob "plain unrelated failure text")"
   t 16 "unrelated text → error"           sh -c "printf '%s' '${st%%$'\t'*}' | grep -qx error"
 
+  # 204: quota is the read-only board, quota.sh behind hands.sh's verb. Falsification: drop the verb -> the words are
+  # read as a buy and refused
+  mkdir -p "$SB/st204"
+  t 204 "QUOTA: hands.sh quota --json claude prints the board's JSON for that one pool (no claude reading in an empty jobs root: unknown, naming the refresh), rc 0" \
+    sh -c "XDG_STATE_HOME='$SB/st204' '$0' quota --json claude | jq -e '.pools | length==1 and .[0].pool==\"claude\" and .[0].status==\"unknown\" and (.[0].why|test(\"--probe claude\"))' >/dev/null"
   # the not-installed probe shape (PATH stripped of all provider CLIs; system tools kept)
   t 20 "probe(all) four not-installed lines full-schema" sh -c "PATH=/usr/bin:/bin HOME='$SB' TMPDIR='$SB/tmp' XDG_CACHE_HOME='$SB/cache' '$0' --probe all | jq -e -s 'length==4 and all(.[]; .status==\"not-installed\" and has(\"dir\") and has(\"usage\"))'"
   # 20b: the probe's temp files are made fresh (mktemp): links planted at the names an older probe used ($TMPDIR/
