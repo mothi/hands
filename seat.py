@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """seat.py -- hands' engine: a seat is a job dir with a live CLI process in it. python3 stdlib only.
 
-hands.sh keeps the grammar and the SEAT BOX; seat.py runs everything after launch. WIRES names each provider's family and delivery; each wire translates its stream into
+hands.py keeps the grammar and the SEAT BOX; seat.py runs everything after launch. WIRES names each provider's family and delivery; each wire translates its stream into
 DIR/events.jsonl, and everything downstream of the events is one rule (Seat.finish).
   spawn DIR MSG   detach the wrapper: it delivers MSG as the next turn and runs the seat until the CLI exits
-  send DIR FILE   the next turn to the LIVE seat (rc 3: none is live -- hands.sh relaunches it)
+  send DIR FILE   the next turn to the LIVE seat (rc 3: none is live -- hands.py relaunches it)
   mail DIR TEXT   append a driver line to DIR/inbox.jsonl
   wait DIR [--for turn|mail|exit] [--timeout S]  |  events DIR [--follow]  |  stop DIR
-  emit | classify   the envelope writer and the failure classifier, for hands.sh
-  sweep           delete the jobs root's stale dirs, then print the root (every buy runs it and makes its dir there)
   reap SECS ARGV  run ARGV in its own process group, limited to SECS seconds (0: no limit); every seat CLI runs under it
 Job dir: session (the handle) prompt.txt in.fifo stream.jsonl stderr.log events.jsonl inbox.jsonl outbox.jsonl
 turn-N/{result.txt,envelope.json} envelope.json result.txt driver job.log
@@ -18,14 +16,14 @@ import acp
 from acp import Turn, clip, event, now, small, usage   # the vocabulary every wire shares: one copy, in acp.py
 
 HERE, J = os.path.dirname(os.path.abspath(__file__)), os.path.join
-# THE JOBS ROOT, its one copy: every job dir hands.sh names itself (a buy without --out, a probe) lives in
+# THE JOBS ROOT, its one copy: every job dir hands.py names itself (a buy without --out, a probe) lives in
 # $XDG_STATE_HOME/hands (an absolute one; XDG ignores a relative value), else ~/.local/state/hands -- state that
-# outlives a reboot, where macOS's $TMPDIR is wiped at boot and pruned after 3 days. hands.sh takes it from sweep's
-# output, quota.py (the claude streams) imports it. KEEP: how long a dir there with no live wrapper outlives its last write
+# outlives a reboot, where macOS's $TMPDIR is wiped at boot and pruned after 3 days. hands.py makes its dirs there,
+# quota.py reads the claude streams there. KEEP: how long a dir there with no live wrapper outlives its last write
 XDG = os.environ.get('XDG_STATE_HOME', '')
 JOBS = J(XDG if os.path.isabs(XDG) else J(os.path.expanduser('~'), '.local', 'state'), 'hands')
 KEEP = 30 * 86400
-NAMED = re.compile(r'\d{8}-\d{6}-[a-z]+-\d+|probe-\d+-[a-z]+')   # the names hands.sh gives there (run_single, run_probe)
+NAMED = re.compile(r'\d{8}-\d{6}-[a-z]+-\d+|probe-\d+-[a-z]+')   # the names hands.py gives there (buy, probe)
 # THE WIRE TABLE: provider -> (family, delivery). The wrapper reads DIR/in.fifo for every family: stdin feeds the CLI's
 # stdin, acp (acp.py) runs a turn per line, rpc (codex's app-server on acp.Rpc) starts or steers a turn per line. steer:
 # a send joins the running turn; queue: it waits (ACP v1 has no mid-turn input)
@@ -142,7 +140,7 @@ def shown(env):   # THE envelope line a verb prints: the on-disk envelope, its u
 
 
 def envelope(d, status, prov, model, rc, secs, reset, use, effort, **more):
-    """THE envelope writer (hands.sh's emit too): DIR/envelope.json, and turn-N/envelope.json for a turn."""
+    """THE envelope writer (hands.py's too): DIR/envelope.json, and turn-N/envelope.json for a turn."""
     env = {'status': status, 'provider': prov, 'model': model or None, 'effort': effort or None, 'rc': rc,
            'seconds': secs, 'reset': reset or None, 'dir': d, 'usage': use}
     env.update((k, v) for k, v in more.items() if v is not None)
@@ -395,8 +393,8 @@ def wrappers(d, rows=None):
     return [r for r in (rows or procs()) if 'seat.py' in r[3] and key in r[3] + ' ' and r[0] != os.getpid()]
 
 
-def sweep():   # THE RETENTION, at every buy (hands.sh run_single, which makes its dir in the root this prints): a dir
-    # directly in JOBS that hands.sh named (an --out dir outside JOBS is never swept), with nothing in it written
+def sweep():   # THE RETENTION, at every buy (hands.py, which then makes its dir in JOBS): a dir
+    # directly in JOBS that hands.py named (an --out dir outside JOBS is never swept), with nothing in it written
     # within KEEP and no repository in it, goes (a link there never, nor its target: job.log is never made) --
     # under its job.log lock, the lock a wrapper holds for its whole life (no job.log: no wrapper ever ran there, a buy
     # refused before its launch, with no session to resume). Under the lock it is judged again (a resume touches its dir
@@ -433,8 +431,6 @@ def sweep():   # THE RETENTION, at every buy (hands.sh run_single, which makes i
         finally:
             if fd is not None:
                 os.close(fd)
-    print(JOBS)
-    return 0
 
 
 def stale(p, cut):   # nothing under p (p included, by lstat: a link's own time) written at or after cut, no .git in it
@@ -1084,7 +1080,7 @@ def send(d, h, path):
                     os.utime(d)
                 except OSError:
                     pass
-                return 3                         # the seat is gone: hands.sh relaunches it
+                return 3                         # the seat is gone: hands.py relaunches it
             try:
                 fd = os.open(J(d, 'in.fifo'), os.O_WRONLY | os.O_NONBLOCK)
             except OSError:                      # ENXIO: no reader yet, or none any more
@@ -1239,15 +1235,6 @@ def events(d, follow):   # THE view, one-shot or followed; --follow ends with th
 
 def main(a):
     cmd = a[0] if a else ''
-    if cmd == 'emit':   # hands.sh's envelopes: emit DIR STATUS PROV MODEL RC RESET [REASON]; env EFFORT
-        envelope(a[1], a[2], a[3], a[4], int(a[5]), 0, a[6], None, os.environ.get('EFFORT', ''),
-                 reason=a[7] if len(a) > 7 and a[7] else None)
-        return 0
-    if cmd == 'classify':
-        sys.stdout.write('%s\t%s' % classify(sys.stdin.read()))
-        return 0
-    if cmd == 'sweep':
-        return sweep()
     if cmd == 'reap' and len(a) > 2:
         return reap(int(a[1]), a[2:])
     if cmd not in ('spawn', 'send', 'mail', 'wait', 'events', 'stop') or len(a) < 2 or not os.path.isdir(a[1]):

@@ -19,14 +19,14 @@ python3 tests/test_quota.py
 ```
 
 They are hermetic: stub CLIs stand in for the real ones, and nothing touches the network or
-spends quota. The hands suite takes a few minutes. A row that cannot run on this machine prints
-`skip`.
+spends quota. The hands suite takes a few minutes and needs `bash` and `jq`. A row that cannot
+run on this machine prints `skip`.
 
 A new behavior lands with a selftest row, and the row must be able to fail: revert the fix alone,
 run the suite, and see that row go red. A row nobody has seen fail proves nothing.
 
-Don't edit `hands.sh` or `seat.py` in the checkout your live seats run from. bash reads a
-script by file offset while it runs, so an edit can corrupt a running call. Work in a separate
+Don't edit the checkout your live seats run from: a running wrapper starts new `seat.py`
+processes from the files on disk, so a half-made edit can break a live seat. Work in a separate
 clone or a `git worktree`.
 
 ## Fixtures

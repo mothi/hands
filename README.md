@@ -6,7 +6,7 @@ subagents: you start one on a task, send it more turns, mail it notes, wait for 
 read what it's doing, and stop it. Every turn ends in a typed JSON envelope, so a script or
 another agent can act on the outcome without parsing prose.
 
-It's a few hundred lines of bash and Python with no daemon and no database. It stores no
+It's plain Python (the standard library only) with no daemon and no database. It stores no
 credentials: each CLI uses its own login.
 
 > **Read § Security model first.** A seat is a coding agent with full access to your machine,
@@ -54,7 +54,7 @@ Report vulnerabilities privately: see [SECURITY.md](SECURITY.md).
 
 ## Prerequisites
 
-- macOS (tested) with bash 3.2 or later, `python3` 3.7 or later, `jq`, `curl`, and `ps`
+- macOS (tested) with `python3` 3.7 or later, `curl` (the Grok and OpenCode gauges), and `ps`
 - at least one provider CLI, logged in with its own login:
   [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`),
   [Codex](https://github.com/openai/codex) (`codex`), Grok (`grok`), or
@@ -310,12 +310,13 @@ seat), and the exact command is shown before it runs.
 ```
 hands/
 ├── SKILL.md        the short guide agent hosts read
-├── hands.sh        the command line and the seat contract
+├── hands.sh        the launcher: runs hands.py
+├── hands.py        the command line: flags, the job dir and its handle, the seat box, the probe
 ├── seat.py         the engine: the wire table, the wrapper, the verbs, the envelope writer
 ├── acp.py          the ACP client (Grok, OpenCode) and the event vocabulary all wires share
 ├── quota.py        the quota board behind hands.sh quota
 └── tests/
-    ├── selftest.sh     the hermetic suite for hands.sh and seat.py
+    ├── selftest.sh     the hermetic suite for hands.py and seat.py
     ├── test_acp.py     the ACP suite
     ├── test_quota.py   the quota suite
     ├── test-stub.py    a stand-in for the claude and codex CLIs, used by the suites

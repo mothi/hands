@@ -3,11 +3,17 @@
 # its id; the last line is "selftest: N passed, M failed", and the exit status is 0 only when none failed.
 # Run it from anywhere: bash tests/selftest.sh
 HANDS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/hands.sh"
-HANDS_SOURCED=1; set --; . "$HANDS"   # the functions some rows call: classify_blob, seat_box
+# what some rows compare against, taken from the code itself: the failure classifier and the seat box
+classify_blob() { printf '%s' "$1" | python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import seat
+sys.stdout.write("%s\t%s" % seat.classify(sys.stdin.read()))' "${HANDS%/*}"; }
+seat_box() { python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import hands
+sys.stdout.write(hands.SEAT_BOX)' "${HANDS%/*}"; }
+seat_dir() { python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import hands
+sys.stdout.write(hands.seat_line(sys.argv[2]))' "${HANDS%/*}" "$1"; }
 
 run_selftest() {
   local HERE PASS=0 FAIL=0 SB SBP
-  HERE="${HANDS%/*}"   # the repo root: hands.sh, seat.py, acp.py
+  HERE="${HANDS%/*}"   # the repo root: hands.py, seat.py, acp.py, quota.py
   SB="$(mktemp -d "${TMPDIR:-/tmp}/hands-selftest.XXXXXX")"
   SBP="$(cd "$SB" && pwd -P)"   # as a wrapper's argv names its dir: a row looks up its own seat, never another suite's
   unset CODEX_ARGV_LOG  # externally-exported sentinels must not reach stub calls
@@ -22,7 +28,7 @@ run_selftest() {
   mkdir -p "$SB/oc-store/opencode"; printf '{"opencode-go":{"key":"sk-test"}}' >"$SB/oc-store/opencode/auth.json"
   export XDG_DATA_HOME="$SB/oc-store"
   # THE JOBS ROOT SEAM: a buy without --out (and every probe) makes its dir in $XDG_STATE_HOME/hands, so EVERY row runs
-  # on a sandbox root, never the real one, and no buy's sweep can reach a real dir (rows 39w, 156, 188, 189, 191, 192, 193 name their own)
+  # on a sandbox root, never the real one, and no buy's sweep can reach a real dir (rows 39w, 156, 188, 189, 191, 192 name their own)
   export XDG_STATE_HOME="$SB/state"
   # the probe rows that run with PATH=/usr/bin:/bin skip where a provider CLI lives there (they would launch it) or jq
   # and python3 do not
@@ -45,7 +51,7 @@ run_selftest() {
   seat_box >"$SB/box.txt"; local BOXN; BOXN="$(wc -l <"$SB/box.txt" | tr -d ' ')"
 
   # arg surface
-  t 00 "help prints full usage (marker-based, immune to header growth)" sh -c "'$HANDS' --help | grep -q -- '--effort <tier>' && '$HANDS' --help | grep -q '^# envelope:'"
+  t 00 "help prints full usage (marker-based, immune to header growth)" sh -c "'$HANDS' --help | grep -q -- '--effort <tier>' && '$HANDS' --help | grep -q '^envelope:'"
   t 01 "unknown flag exits 2"            rc_is 2 env_run --bogus x "$SB/q.md"
   t 02 "no args exits 2"                 rc_is 2 env_run
   t 03 "unknown provider exits 2"        rc_is 2 env_run --out "$SB/o3" badprov "$SB/q.md"
@@ -879,6 +885,22 @@ STUB
   t 75 "an INT the caller ALREADY ignored (nohup) never reaches the seat: no handler is installed over SIG_IGN, so the seat dies only at its own alarm" \
     sh -c "[ '$T75ALIVE' = yes ] && [ \"\$(cat '$SB/t75.rc' 2>/dev/null)\" = 142 ]"
 
+  # 206: a sync buy that is signalled stops its seat before it exits (128 + N), so no seat outlives the call. TERM, not
+  # INT: bash starts a background job with INT ignored, and a buy leaves an ignored signal ignored.
+  # Falsification: drop the buy's signal handler -> the call dies at once and its wrapper and CLI live on
+  : >"$SB/s206.pid"
+  ( CL_STUB_MODE=park CL_STUB_PIDFILE="$SB/s206.pid" stub_run --out "$SB/s206" claude:sonnet "$SB/q.md" >/dev/null 2>&1; echo $? >"$SB/s206.rc" ) &
+  T206=$!
+  for i in $(seq 1 60); do [ -s "$SB/s206.pid" ] && break; sleep 0.1; done
+  H206="$(pgrep -f "hands.py --out $SB/s206 " | head -1)"
+  [ -n "$H206" ] && kill -TERM "$H206"
+  wait $T206 2>/dev/null
+  W206=no; pgrep -f "seat.py spawn $SBP/s206 " >/dev/null && W206=yes
+  C206=no; kill -0 "$(cat "$SB/s206.pid")" 2>/dev/null && C206=yes
+  stub_run stop "$SB/s206" >/dev/null 2>&1
+  t 206 "a signalled sync buy stops its seat first: TERM to the call exits 143 with no wrapper and no CLI left, the turn typed incomplete" \
+    sh -c "[ \"\$(cat '$SB/s206.rc')\" = 143 ] && [ $W206 = no ] && [ $C206 = no ] && jq -e '.status==\"incomplete\"' '$SB/s206/envelope.json' >/dev/null"
+
   # 78: THE SEAT BOX is engine-injected, not driver-remembered: the seat
   # contract heads every buy's prompt, and the file the CLI receives IS prompt.txt.
   { cat "$SB/box.txt"; echo; echo task; echo; seat_dir "$(cd "$SB/a100" && pwd -P)"; } >"$SB/a100.prompt"   # the job dir, canonical
@@ -1172,7 +1194,7 @@ STUB
   t 204 "QUOTA: hands.sh quota --json claude prints the board's JSON for that one pool (no claude reading in an empty jobs root: unknown, naming the refresh), rc 0" \
     sh -c "XDG_STATE_HOME='$SB/st204' '$HANDS' quota --json claude | jq -e '.pools | length==1 and .[0].pool==\"claude\" and .[0].status==\"unknown\" and (.[0].why|test(\"--probe claude\"))' >/dev/null"
   # the not-installed probe shape (PATH stripped of all provider CLIs; system tools kept)
-  t 20 "probe(all) four not-installed lines full-schema" sh -c "PATH=/usr/bin:/bin HOME='$SB' TMPDIR='$SB/tmp' XDG_CACHE_HOME='$SB/cache' '$HANDS' --probe all | jq -e -s 'length==4 and all(.[]; .status==\"not-installed\" and has(\"dir\") and has(\"usage\"))'"
+  t 20 "probe(all) four not-installed lines full-schema, none with a job dir" sh -c "PATH=/usr/bin:/bin HOME='$SB' TMPDIR='$SB/tmp' XDG_CACHE_HOME='$SB/cache' '$HANDS' --probe all | jq -e -s 'length==4 and all(.[]; .status==\"not-installed\" and .dir==null and has(\"usage\"))'"
   # 20b: the probe's temp files are made fresh (mktemp): links planted at the names an older probe used ($TMPDIR/
   # hands-probe-lines-<pid> and hands-probe-<pid>.txt, the pid known because sh exec keeps it) are never written through.
   # Falsification: the fixed names -> the victim is truncated and rewritten
@@ -1223,7 +1245,7 @@ assert not seat.stale(p, cut)' "$HERE" "$SB/t201/20250101-000000-codex-9"
   # else HOME/.local/state/hands (unset, or relative: XDG ignores a relative value) -- never in $TMPDIR, which macOS
   # wipes at boot and prunes after 3 days -- named <date>-<time>-<provider>-<pid>, root and dir 0700 (XDG; prompts live
   # there); an --out dir is 0700 too, its parents keep the caller's umask; no buy anywhere in this suite landed in $TMPDIR/hands. The root is
-  # seat.py's JOBS, its one copy (hands.sh takes sweep's output). Falsification: the old ${TMPDIR}/hands root -> all
+  # seat.py's JOBS, its one copy (hands.py makes its dirs there). Falsification: the old ${TMPDIR}/hands root -> all
   # land in $SB/tmp; drop the umask -> 0755; drop the --out umask -> the caller's; honor a relative value -> it lands in the cwd;
   # another fallback in seat.py -> the HOME buys land elsewhere
   mkdir -p "$SB/h188" "$SB/h188r"
@@ -1306,7 +1328,7 @@ PY
   XDG_STATE_HOME="$SB/st191" stub_run --cwd "$SB/tmp" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
   D191="$(ls -d "$SB"/st191/hands/*-codex-* 2>/dev/null | head -1)"; python3 "$SB/age.py" 31 "$D191"
   XDG_STATE_HOME="$SB/st191" python3 "$HERE/seat.py" send "$D191" "$SB/q81.md" >/dev/null 2>&1; R191=$?
-  XDG_STATE_HOME="$SB/st191" python3 "$HERE/seat.py" sweep >/dev/null 2>&1
+  XDG_STATE_HOME="$SB/st191" python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import seat; seat.sweep()' "$HERE"
   XDG_STATE_HOME="$SB/st191" stub_run send "$D191" "$SB/q81.md" >/dev/null 2>&1
   stub_run wait "$D191" --timeout 30 >/dev/null 2>&1; stub_run stop "$D191" >/dev/null 2>&1
   t 191 "A RESUME IS USE: a send to a stopped seat whose files are all 31 days old touches it (rc 3: no live seat), a sweep right after keeps it, and the relaunch answers turn 2 ok" \
@@ -1316,7 +1338,7 @@ PY
   # again under the lock); (b) a relaunch opening job.log by the dir's path while the delete runs finds no dir (renamed out
   # of every address first); (c) a delete that stops part way (a read-only subdir) is left as .<name>, and the next sweep
   # that finds it stale finishes it; (d) a dir with no job.log (a buy refused before its launch) goes, with no job.log made
-  # in it. And the sweep prints the root. Falsification: no second judgment -> (a) goes; no rename -> (b) opens job.log;
+  # in it. Falsification: no second judgment -> (a) goes; no rename -> (b) opens job.log;
   # no .<name> handling -> (c) stays forever; make job.log to lock it -> (d) is judged fresh and stays
   cat >"$SB/sw192.py" <<'PY'
 import errno, fcntl, io, os, shutil, sys, time
@@ -1355,10 +1377,8 @@ def rmtree(path, *x, **k):   # (b): a relaunch opens b's job.log by b's own path
         except OSError as e:
             got['b'] = e.errno
     return real_rmtree(path, *x, **k)
-seat.fcntl.flock, seat.shutil.rmtree, out = flock, rmtree, io.StringIO()
-sys.stdout, real_out = out, sys.stdout
+seat.fcntl.flock, seat.shutil.rmtree = flock, rmtree
 seat.sweep()
-sys.stdout = real_out
 cdot = os.path.join(R, '.20250101-000000-codex-3')
 hidden = os.path.isdir(cdot) and not os.path.lexists(c)
 for q in (os.path.join(c, 'ro'), os.path.join(cdot, 'ro')):
@@ -1369,26 +1389,16 @@ if os.path.isdir(cdot):   # 31 days on, the next sweep finishes it in place
         for n in ds + fs:
             os.utime(os.path.join(top, n), (old, old))
     os.utime(cdot, (old, old))
-sys.stdout = io.StringIO()
 seat.sweep()
-sys.stdout = real_out
 checks = {'a kept': os.path.isdir(a), 'b no dir': got.get('b') == errno.ENOENT and not os.path.lexists(b),
           'c finished later': hidden and not os.path.lexists(cdot),
-          'd gone': not os.path.lexists(d), 'prints root': out.getvalue() == R + '\n'}
+          'd gone': not os.path.lexists(d)}
 print(checks)
 sys.exit(0 if all(checks.values()) else 1)
 PY
   XDG_STATE_HOME="$SB/st192" python3 "$SB/sw192.py" "$HERE" >"$SB/sw192.out" 2>&1
-  t 192 "THE SWEEP UNDER THE LOCK: a write between the first judgment and the lock keeps the dir; a relaunch opening job.log while the dir goes finds no dir; a part-way delete is left as .<name> and the next stale sweep finishes it; a dir with no job.log goes, none made; the sweep prints the root" \
-    sh -c "grep -q \"'a kept': True, 'b no dir': True, 'c finished later': True, 'd gone': True, 'prints root': True\" '$SB/sw192.out'"
-  # 193: NO ROOT, NO BUY: a buy or a probe whose seat.py sweep prints no jobs root
-  # (a broken seat.py) is refused -- rc 2 naming why, rc 1 for a probe -- and no dir is made anywhere (never /<name>).
-  # Falsification: build the dir from the empty root -> the buy dies elsewhere, without the reason
-  mkdir -p "$SB/b193"; cp "$HANDS" "$SB/b193/hands.sh"; printf 'import sys\nsys.exit(1)\n' >"$SB/b193/seat.py"
-  XDG_STATE_HOME="$SB/st193" PATH="$SB/bin:$PATH" "$SB/b193/hands.sh" --cwd "$SB/tmp" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>"$SB/b193.err"; R193=$?
-  XDG_STATE_HOME="$SB/st193" PATH="$SB/bin:$PATH" "$SB/b193/hands.sh" --probe claude >/dev/null 2>"$SB/b193p.err"; P193=$?
-  t 193 "NO ROOT, NO BUY: with a seat.py whose sweep prints no jobs root, a buy is refused rc 2 naming why, a probe rc 1, and no dir is made" \
-    sh -c "[ $R193 = 2 ] && [ $P193 = 1 ] && grep -q 'sweep printed no jobs root' '$SB/b193.err' && grep -q 'sweep printed no jobs root' '$SB/b193p.err' && [ ! -e '$SB/st193' ]"
+  t 192 "THE SWEEP UNDER THE LOCK: a write between the first judgment and the lock keeps the dir; a relaunch opening job.log while the dir goes finds no dir; a part-way delete is left as .<name> and the next stale sweep finishes it; a dir with no job.log goes, none made" \
+    sh -c "grep -q \"'a kept': True, 'b no dir': True, 'c finished later': True, 'd gone': True\" '$SB/sw192.out'"
   # 157: HERMETIC SUITE. The suite unsets the driver-inbox names at its top, so a seat
   # captures a socket only where its row exported a STUB one (under $SB). Falsification: drop the top unset and run the
   # suite with a fake socket exported -> job dirs capture the outer path.
