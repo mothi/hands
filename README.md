@@ -158,7 +158,7 @@ to keep.
 | `wait DIR [--for turn\|mail\|exit] [--timeout S]` | blocks, spending nothing, until every sent turn ends (`turn`), the seat's next outbox line (`mail`), or the wrapper exits (`exit`) | the answer if ok, then the envelope; 0 if ok, else 1. At the timeout: `{"status":"running","last_event","open_tool_calls",...}`, 1 |
 | `events DIR [--follow]` | a readable view of `DIR/events.jsonl`: text blocks, one line per tool call, turn and usage lines with the cache-hit %, errors. `--follow` ends when the seat does. The raw stream is `tail -f DIR/events.jsonl` | text, 0 |
 | `quota [--json] [provider ...]` | the quota board: one line per provider (§ Quota gauges). Read-only: it never spends | the board, 0 |
-| `stop DIR` | TERMs the seat's process groups, KILLs what's left after 5 s; the wrapper types the open turn and every queued one `incomplete` | the envelope, 0 (1 if a wrapper survived) |
+| `stop DIR` | the wrapper closes its CLI as at its deadline (stdin EOF, then TERM at 2 s, KILL at 4 s) and types the open turn and every queued one `incomplete`, rc 143; what is left at 10 s is TERMed, then KILLed | the envelope, 0 (1 if a wrapper survived) |
 
 A bare buy (no verb) is `start` + `wait` + `stop`: nothing outlives the call, and a later `send`
 resumes the session. Use it only for short tasks. For real work, `start` and keep working.

@@ -9,7 +9,7 @@
 #   hands.sh mail DIR TEXT        a driver line the seat's live wrapper delivers
 #   hands.sh wait DIR [--for turn|mail|exit] [--timeout S]   blocks until the turn ends: the answer, then the envelope
 #   hands.sh events DIR [--follow]   a readable view of DIR/events.jsonl
-#   hands.sh stop DIR             TERM the seat, KILL after a 5 s drain; the envelope still lands
+#   hands.sh stop DIR             close the seat as its deadline does (stdin EOF, TERM, KILL); the envelope still lands
 #   hands.sh --probe [claude|codex|grok|opencode|all]   a 1-token aliveness ping per provider (spends a little quota)
 #   hands.sh quota [--json] [provider ...]   the quota board (quota.sh): read-only, it never spends
 #   hands.sh --selftest           hermetic tests: stub CLIs, no network, no spend
@@ -520,9 +520,9 @@ def codexseat(d, cwd, sendfile):   # ONE app-server for both turns: initialize, 
     k1, k2 = json.load(open(d + '.ack')), json.load(open(d + '.ack2'))
     turn = lambda f: {'threadId': 'th_stub123', 'input': [{'type': 'text', 'text': open(f).read()}], 'effort': 'high'}
     use = {'in': 6, 'out': 3, 'cache_read': 4, 'reasoning': 1}   # the stub's two model calls, summed, the cache out of in
-    return (a == CXARGV and calls == ['1'] and len(runs) == 1 and [m for m, _ in runs[0]] == ['initialize', 'initialized', 'thread/start', 'turn/start', 'turn/start']
+    return (a == CXARGV and calls == ['1'] and len(runs) == 1 and [m for m, _ in runs[0]] == ['initialize', 'initialized', 'thread/start', 'turn/start', 'turn/start', '<EOF>']
             and runs[0][2][1] == {'cwd': cwd, 'sandbox': 'danger-full-access', 'approvalPolicy': 'never', 'model': 'gpt-5.6-terra', 'ephemeral': False}
-            and [p for _, p in runs[0][3:]] == [turn(J(d, 'prompt.txt')), turn(sendfile)]
+            and [p for _, p in runs[0][3:5]] == [turn(J(d, 'prompt.txt')), turn(sendfile)]
             and open(d + '.cwd').read().split() == [cwd] and os.path.exists(d + '.idle')
             and (k1['status'], k1['expect'], k1['delivery'], k2['status'], k2['expect']) == ('spawned', 1, 'steer', 'sent', 2)
             and (e1['status'], e1['session'], e2['status'], e2['session'], e2['turn']) == ('ok', 'th_stub123', 'ok', 'th_stub123', 2)
@@ -554,7 +554,7 @@ def steered(d, sendfile):   # a send to a busy codex seat JOINS its turn: a turn
     runs, sent, ends = rpcin(d + '.stdin'), json.load(open(d + '.sent')), [(e['turn'], e['status']) for e in evs(d) if e['kind'] == 'turn_end']
     said = [open(J(d, 'prompt.txt')).read(), open(sendfile).read()]
     return ((sent['status'], sent['expect'], sent['delivery']) == ('sent', 1, 'steer') and len(runs) == 1
-            and [m for m, _ in runs[0]] == ['initialize', 'initialized', 'thread/start', 'turn/start', 'turn/start']
+            and [m for m, _ in runs[0]] == ['initialize', 'initialized', 'thread/start', 'turn/start', 'turn/start', '<EOF>']
             and runs[0][4][1] == {'threadId': 'th_stub123', 'input': [{'type': 'text', 'text': said[1]}]}
             and ends == [(1, 'ok')] and result(d, 1).split(': ', 1)[1] == ' | '.join(said) and not os.path.exists(J(d, 'turn-2')))
 def staled(d, sendfile, waited):   # a send its turn outran opens the next turn, and wait follows the input there; the
@@ -562,7 +562,7 @@ def staled(d, sendfile, waited):   # a send its turn outran opens the next turn,
     runs, sent, w, es = rpcin(d + '.stdin'), json.load(open(d + '.sent')), json.loads(open(waited).read().strip().split('\n')[-1]), evs(d)
     said = open(sendfile).read()
     strays = [e['text'].split(' belongs')[0] for e in es if e['kind'] == 'progress' and 'belongs to no open turn' in e.get('text', '')]
-    return ((sent['status'], sent['expect']) == ('sent', 1) and [m for m, _ in runs[0]][3:] == ['turn/start', 'turn/start']
+    return ((sent['status'], sent['expect']) == ('sent', 1) and [m for m, _ in runs[0]][3:] == ['turn/start', 'turn/start', '<EOF>']
             and runs[0][4][1]['input'] == [{'type': 'text', 'text': said}] and result(d, 1) == 'turn 1: ' + open(J(d, 'prompt.txt')).read()
             and result(d, 2) == 'turn 2: ' + said and (w['turn'], w['status']) == (2, 'ok')
             and [e['turn'] for e in es if e.get('call') == 'exec-late-1'] == [1] and strays == ['item/completed commandExecution', 'thread/tokenUsage/updated']
@@ -577,15 +577,16 @@ def collab(d):   # a collaborator codex spawned reports on its own thread: one s
             == [(1, 'collaborator turn/started'), (1, 'collaborator item/completed reasoning'), (1, 'collaborator item/completed commandExecution'),
                 (1, 'collaborator item/completed agentMessage'), (1, 'collaborator turn/completed')]
             and json.load(open(J(d, 'turn-1', 'envelope.json')))['usage'] == CXCOLLAB)
-def interrupted(d, pids):   # the deadline's polite close of an rpc seat: turn/interrupt naming the open turn, then stdin EOF
+def interrupted(d, pids, status, rc):   # the polite close of an rpc seat mid-turn (its deadline, a stop): turn/interrupt
+    # naming the open turn, then stdin EOF; the turn typed by the close, and no process left
     runs, e = rpcin(d + '.stdin'), json.load(open(J(d, 'turn-1', 'envelope.json')))
     alive = [p for p in open(pids).read().split() if subprocess.run(['kill', '-0', p], capture_output=True).returncode == 0]
     return ([(m, p) for m, p in runs[0][-2:]] == [('turn/interrupt', {'threadId': 'th_stub123', 'turnId': 'turn-1'}), ('<EOF>', {})]
-            and (e['status'], e['rc'], e['session']) == ('timeout', 142, 'th_stub123') and not alive)
+            and (e['status'], e['rc'], e['session']) == (status, int(rc), 'th_stub123') and not alive)
 def cxresumed(d, ack, cwd, bad, badout):   # a relaunch resumes the handle's thread (never a new one); a resume refused is a typed launch failure
     runs, k, e = rpcin(d + '.stdin'), json.load(open(ack)), json.load(open(J(d, 'turn-2', 'envelope.json')))
     b = json.loads(open(badout).read().strip().split('\n')[-1])
-    return (len(runs) == 2 and [m for m, _ in runs[1]] == ['initialize', 'initialized', 'thread/resume', 'turn/start']
+    return (len(runs) == 2 and [m for m, _ in runs[1]] == ['initialize', 'initialized', 'thread/resume', 'turn/start', '<EOF>']
             and runs[1][2][1] == {'threadId': 'th_stub123', 'cwd': cwd, 'sandbox': 'danger-full-access', 'approvalPolicy': 'never', 'model': 'gpt-5.6-terra'}
             and runs[1][3][1] == {'threadId': 'th_stub123', 'input': [{'type': 'text', 'text': 'turn two\n'}], 'effort': 'high'}
             and (k['status'], k['expect']) == ('spawned', 2) and (e['status'], e['session'], e['turn']) == ('ok', 'th_stub123', 2)
@@ -631,8 +632,8 @@ def nocancel(d, launches, rec):   # a send to a BUSY seat never cancels its turn
     ok = ok and sent['status'] == 'sent' and sent['expect'] == (1 if sent['delivery'] == 'steer' else 2)
     if rec.endswith('.rec'):     # ACP: the client lines the agent received -- prompts only, never session/cancel
         ok = ok and [c for c, _ in rpc(rec) if c.startswith('session/') and c != 'session/set_config_option'] == ['session/new', 'session/prompt', 'session/prompt']
-    else:                        # stdin: every line the CLI read is a user message, never a control request
-        ok = ok and [json.loads(ln).get('type') for ln in open(rec)] == ['user', 'user']
+    else:                        # stdin: every line the CLI read is a user message, never a control request; then the stop's EOF
+        ok = ok and [ln if ln == '<EOF>\n' else json.loads(ln).get('type') for ln in open(rec)] == ['user', 'user', '<EOF>\n']
     return ok
 def grokview(out):   # the grok 228-line recorded stream (fixtures/grok-events-sample.jsonl) as the readable view
     ls = open(out, encoding='utf-8').read().split('\n')[:-1]
@@ -685,7 +686,7 @@ def tear(fifo):   # the bytes a send killed mid-write leaves in in.fifo: a recor
     os.close(fd)
     return True
 def torn(d, stdin, sent):   # the next record reaches the CLI whole: every line it read is a user message, the last one
-    ls = [json.loads(l) for l in open(stdin)]   # exactly the sent file; the torn bytes are dropped as one typed progress event
+    ls = [json.loads(l) for l in open(stdin) if l != '<EOF>\n']   # exactly the sent file; the torn bytes are dropped as one typed progress event
     want, end = open(sent).read(), json.load(open(J(d, 'turn-2', 'envelope.json')))
     drops = [e for e in evs(d) if e['kind'] == 'progress' and str(e.get('text', '')).startswith('torn input dropped: ')]
     return (all(isinstance(x, dict) and x.get('type') == 'user' for x in ls) and len(ls) == 2
@@ -874,7 +875,7 @@ for l in open(sys.argv[1]):
   # stop keeps to the groups it found (the delete takes a moment). Nothing else deletes: an idle stop (a101), a turn the
   # agent cancelled and lived on (a101's turn 3), a grok seat (a110), the deadline's close (a111b). A later send fails typed
   # (the agent answers the resume with an error). Falsification: drop the delete; delete on the deadline close, for grok,
-  # or with the agent alive (a .del log appears); let stop re-scan for new groups (the delete is killed: no log).
+  # or with the agent alive (a .del log appears).
   python3 "$SB/chk.py" derive "$HERE/fixtures/opencode-acp-resume-sample.jsonl" "$SB/oc-gone.jsonl" gone
   ACP_REPLAY="$SB/oc-hang.jsonl" ACP_REC="$SB/a173.rec" OC_SESSION_LOG="$SB/a173.del" stub_run start --effort low --cwd "$SB/gdir" --out "$SB/a173" opencode:opencode-go/deepseek-v4.1-flash "$SB/q.md" >/dev/null 2>&1
   for i in $(seq 1 50); do grep -q '"kind": "turn_start"' "$SB/a173/events.jsonl" 2>/dev/null && grep -q session/prompt "$SB/a173.rec" 2>/dev/null && break; sleep 0.1; done
@@ -889,13 +890,13 @@ for l in open(sys.argv[1]):
   stub_run stop "$SB/a177" >/dev/null 2>&1
   t 177 "NO LIMIT BY DEFAULT: a seat bought without --timeout records timeout null and runs its agent under a reaper armed with 0 (no alarm): no wall clock cuts its work" \
     sh -c "jq -e '.timeout==null' '$SB/a177/session' >/dev/null && grep -q 'wt_alarm.* seat [^ ]*/hands.sh 0 ' '$SB/a177.ps'"
-  # 175: the same stop, with the agent answering the TERM as opencode 2.0.22 does: its server died first, so
-  # the open prompt gets a JSON-RPC error (-32603 ServerUnavailable), not cancelled. Falsification: delete only on
-  # incomplete/cancelled (the old guard) -> no .del log.
-  ACP_REPLAY="$SB/oc-hang.jsonl" ACP_MODE=termerror ACP_REC="$SB/a175.rec" OC_SESSION_LOG="$SB/a175.del" stub_run start --effort low --cwd "$SB/gdir" --out "$SB/a175" opencode:opencode-go/deepseek-v4.1-flash "$SB/q.md" >/dev/null 2>&1
+  # 175: an agent TERMed mid-turn from outside (a stop closes politely: it sends no TERM), answering as opencode 2.0.22
+  # does: its server died first, so the open prompt gets a JSON-RPC error (-32603 ServerUnavailable), not cancelled.
+  # Falsification: delete only on incomplete/cancelled (the old guard) -> no .del log.
+  ACP_REPLAY="$SB/oc-hang.jsonl" ACP_MODE=termerror ACP_REC="$SB/a175.rec" ACP_PIDFILE="$SB/a175.pid" OC_SESSION_LOG="$SB/a175.del" stub_run start --effort low --cwd "$SB/gdir" --out "$SB/a175" opencode:opencode-go/deepseek-v4.1-flash "$SB/q.md" >/dev/null 2>&1
   for i in $(seq 1 50); do grep -q '"kind": "turn_start"' "$SB/a175/events.jsonl" 2>/dev/null && grep -q session/prompt "$SB/a175.rec" 2>/dev/null && break; sleep 0.1; done
-  stub_run stop "$SB/a175" >/dev/null 2>&1
-  t 175 "an abandoned opencode turn whose agent answers the stop with an ERROR (server unavailable, as 2.0.22 does live) still has its session deleted: ONCE, in the seat's cwd" \
+  kill -TERM "$(head -1 "$SB/a175.pid")" 2>/dev/null; stub_run wait "$SB/a175" --for exit --timeout 30 >/dev/null 2>&1; stub_run stop "$SB/a175" >/dev/null 2>&1
+  t 175 "an abandoned opencode turn whose agent is TERMed mid-turn and answers with an ERROR (server unavailable, as 2.0.22 does live) still has its session deleted: ONCE, in the seat's cwd" \
     sh -c "[ \"\$(grep -c 'session delete' '$SB/a175.del')\" = 1 ] && grep -q 'ses_f2c74432dffeoPDAL0Eq6RHjaI' '$SB/a175.del' && grep -q '$GD' '$SB/a175.del'"
   t 173 "AN ABANDONED OPENCODE TURN'S SESSION IS DELETED: a stop mid-turn runs session delete <sid> --standalone ONCE, in the seat's cwd, before the turn's envelope (incomplete, rc 143) lands; an idle stop, a turn the agent cancelled and lived on, a grok seat and the deadline's close delete nothing; a later send ends typed (error handshake, rc 1) within 30 s" \
     sh -c "python3 '$SB/chk.py' forgot '$SB/a173' '$SB/a173.del' ses_f2c74432dffeoPDAL0Eq6RHjaI '$GD' '$SB/a173.sent' $R173 && [ $T173 -lt 30 ] && [ ! -e '$SB/a101.del' ] && [ ! -e '$SB/a110.del' ] && [ ! -e '$SB/a111b.del' ]"
@@ -915,7 +916,7 @@ for l in open(sys.argv[1]):
   stub_run send "$SB/c113" "$SB/q81.md" >"$SB/c113.ack2" 2>/dev/null
   stub_run wait "$SB/c113" --timeout 30 >/dev/null 2>&1
   stub_run stop "$SB/c113" >/dev/null 2>&1; echo $? >"$SB/c113.stoprc"
-  t 113 "CODEX SEAT: start acks (spawned, expect 1, steer); ONE app-server (--no-daemon, memories and hooks off, live web search) serves both turns: initialize, initialized, thread/start (the canonical cwd, sandbox danger-full-access, approval never, the model, a persisted thread), then a turn/start per turn (its text, the effort); the wrapper stays, so a send is taken live (sent, expect 2); both turns answer on the one thread; usage = the turn's model calls summed, in excluding the cached input; stop closes the idle seat (rc 0, no wrapper left)" \
+  t 113 "CODEX SEAT: start acks (spawned, expect 1, steer); ONE app-server (--no-daemon, memories and hooks off, live web search) serves both turns: initialize, initialized, thread/start (the canonical cwd, sandbox danger-full-access, approval never, the model, a persisted thread), then a turn/start per turn (its text, the effort); the wrapper stays, so a send is taken live (sent, expect 2); both turns answer on the one thread; usage = the turn's model calls summed, in excluding the cached input; stop closes the idle seat politely: its stdin's EOF, no interrupt (rc 0, no wrapper left)" \
     sh -c "python3 '$SB/chk.py' codexseat '$SB/c113' '$CXW' '$SB/q81.md' && [ \"\$(cat '$SB/c113.stoprc')\" = 0 ] && python3 '$SB/chk.py' gone '$SB/c113'"
   # 114/158: the recorded wire's turns, one per opening turn/start -- three on one app-server,
   # the fourth after a stop, on the relaunch's resumed thread
@@ -946,11 +947,11 @@ for l in open(sys.argv[1]):
   stub_run send "$SB/c181" "$SB/q81.md" >"$SB/c181.sent" 2>/dev/null; stub_run wait "$SB/c181" --timeout 30 >"$SB/c181.wait" 2>/dev/null; stub_run stop "$SB/c181" >/dev/null 2>&1
   t 181 "a send its turn OUTRAN (acked expect 1 while turn 1 ran, but turn 1 ended before the app-server took it) opens turn 2, and wait follows the input there: it returns turn 2's answer, never turn 1's; the command turn 1 left running completes during turn 2, and it and its usage are strays (turn 2 carries only its own tokens)" \
     python3 "$SB/chk.py" staled "$SB/c181" "$SB/q81.md" "$SB/c181.wait"
-  CX_STUB_MODE=park CX_STUB_PIDFILE="$SB/c118.pid" CX_STUB_CALLS="$SB/c118.calls" stub_run start --cwd "$SB/cxw" --out "$SB/c118" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
+  CX_STUB_MODE=park CX_STUB_PIDFILE="$SB/c118.pid" CX_STUB_CALLS="$SB/c118.calls" CX_STDIN_LOG="$SB/c118.stdin" stub_run start --cwd "$SB/cxw" --out "$SB/c118" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
   for i in $(seq 1 50); do [ -s "$SB/c118.pid" ] && break; sleep 0.1; done
   stub_run send "$SB/c118" "$SB/q81.md" >/dev/null 2>&1; stub_run stop "$SB/c118" >/dev/null 2>&1; echo $? >"$SB/c118.rc"
-  t 118 "STOP reaps a codex seat mid-turn: the app-server and the command it runs in a session of its own die, no wrapper remains, and turn 1 (the send steered into it) is incomplete (rc 143) on its thread, carrying the usage its first call reported in the envelope's fields (in uncached), never codex's raw ones" \
-    sh -c "[ \"\$(cat '$SB/c118.rc')\" = 0 ] && python3 '$SB/chk.py' gone '$SB/c118' \$(cat '$SB/c118.pid') && [ \"\$(cat '$SB/c118.calls')\" = 1 ] && jq -e '.status==\"incomplete\" and .rc==143 and .session==\"th_stub123\" and .usage=={\"in\":200,\"out\":100,\"cache_read\":800,\"reasoning\":40}' '$SB/c118/turn-1/envelope.json' >/dev/null && [ ! -e '$SB/c118/turn-2' ]"
+  t 118 "STOP closes a codex seat mid-turn as its deadline does -- a turn/interrupt naming the open turn, then its stdin's EOF --: the app-server and the command it runs in a session of its own die, no wrapper remains, and turn 1 (the send steered into it) is incomplete (rc 143) on its thread, carrying the usage its first call reported in the envelope's fields (in uncached), never codex's raw ones" \
+    sh -c "[ \"\$(cat '$SB/c118.rc')\" = 0 ] && python3 '$SB/chk.py' gone '$SB/c118' \$(cat '$SB/c118.pid') && [ \"\$(cat '$SB/c118.calls')\" = 1 ] && jq -e '.status==\"incomplete\" and .rc==143 and .session==\"th_stub123\" and .usage=={\"in\":200,\"out\":100,\"cache_read\":800,\"reasoning\":40}' '$SB/c118/turn-1/envelope.json' >/dev/null && [ ! -e '$SB/c118/turn-2' ] && python3 '$SB/chk.py' interrupted '$SB/c118' '$SB/c118.pid' incomplete 143"
   # 178-180: codex 0.160 answers a TERM by exiting 0, so a wrapper that read
   # its halt off the CLI's rc ran on; a wrapper SIGKILLed before its close-out left markers past its turns
   CX_STUB_MODE=parkexit CX_STUB_PIDFILE="$SB/c178.pid" CX_STUB_CALLS="$SB/c178.calls" stub_run start --cwd "$SB/cxw" --out "$SB/c178" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
@@ -973,7 +974,7 @@ for l in open(sys.argv[1]):
     sh -c "jq -e '.status==\"spawned\" and .expect==2' '$SB/c180.a1' >/dev/null && jq -e '.status==\"sent\" and .expect==3' '$SB/c180.a2' >/dev/null && [ \"\$(cat '$SB/c180.wrc')\" = 0 ] && jq -e '.status==\"incomplete\"' '$SB/c180/turn-1/envelope.json' >/dev/null && jq -e '.status==\"ok\" and .turn==3' '$SB/c180/envelope.json' >/dev/null && [ ! -e '$SB/c180/turn-4' ]"
   CX_STUB_MODE=park CX_STUB_PIDFILE="$SB/c123.pid" CX_STDIN_LOG="$SB/c123.stdin" stub_run --effort high --timeout 3 --cwd "$SB/cxw" --out "$SB/c123" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
   t 182 "a codex seat's DEADLINE closes it politely: a turn/interrupt naming the open turn, then its stdin closed (the app-server reaps the command it ran); turn 1 is timeout (rc 142) on its thread and no process is left" \
-    python3 "$SB/chk.py" interrupted "$SB/c123" "$SB/c123.pid"
+    python3 "$SB/chk.py" interrupted "$SB/c123" "$SB/c123.pid" timeout 142
   CX_ARGV_LOG="$SB/c123.argv" CX_STDIN_LOG="$SB/c123.stdin" stub_run send "$SB/c123" "$SB/q81.md" >"$SB/c123.ack" 2>/dev/null
   stub_run wait "$SB/c123" --timeout 30 >/dev/null 2>&1; stub_run stop "$SB/c123" >/dev/null 2>&1
   CX_STUB_MODE=badresume stub_run send "$SB/c123" "$SB/q81.md" >"$SB/c123.bad" 2>/dev/null; echo $? >"$SB/c123.badrc"
@@ -1316,7 +1317,7 @@ STUB
   stub_run send "$SB/p137" "$SB/q81.md" >"$SB/p137.sent" 2>/dev/null
   for i in $(seq 1 80); do [ -e "$SB/p137/turn-2/envelope.json" ] && break; sleep 0.1; done
   stub_run stop "$SB/p137" >/dev/null 2>&1
-  t 137 "A SEND TO A BUSY SEAT NEVER CANCELS ITS TURN -- stdin (claude, steer), acp (grok, queue); rpc (codex, steer) is row 117: turn 1 ends ok (rc 0) with its own answer, the busy send's message is answered after it as turn 2, on no extra launch (one CLI process), and no cancel reaches the CLI (only user lines on claude's stdin; no session/cancel on the ACP wire)" \
+  t 137 "A SEND TO A BUSY SEAT NEVER CANCELS ITS TURN -- stdin (claude, steer), acp (grok, queue); rpc (codex, steer) is row 117: turn 1 ends ok (rc 0) with its own answer, the busy send's message is answered after it as turn 2, on no extra launch (one CLI process), and no cancel reaches the CLI (only user lines on claude's stdin, then the stop's EOF; no session/cancel on the ACP wire)" \
     sh -c "python3 '$SB/chk.py' nocancel '$SB/p137' 1 '$SB/p137.stdin' && python3 '$SB/chk.py' nocancel '$SB/a112' 1 '$SB/a112.rec'"
   t 131 "events --follow ENDS WITH THE SEAT: following a live seat, it exits (rc 0) within 2 s of stop, after draining the file (the stopped turn's incomplete turn_end is its last news) -- no wrapper alive is the one signal, no new state" \
     python3 "$SB/chk.py" follows "$0" "$SB/p131"
@@ -1402,8 +1403,8 @@ STUB
   CL_STUB_MODE=deaf CL_STUB_PIDFILE="$SB/p96.pid" stub_run start --cwd "$SB/tmp" --out "$SB/p96" claude:sonnet "$SB/q.md" >/dev/null 2>&1
   for i in $(seq 1 50); do [ -s "$SB/p96.pid" ] && break; sleep 0.1; done
   stub_run stop "$SB/p96" >/dev/null 2>&1; echo $? >"$SB/p96.rc"
-  t 96 "STOP in the reaper's order: a seat that ignores TERM is KILLed after the 5 s drain — no process remains, and its wrapper still types the turn in flight (incomplete, rc 137)" \
-    sh -c "[ \"\$(cat '$SB/p96.rc')\" = 0 ] && python3 '$SB/chk.py' gone '$SB/p96' \$(cat '$SB/p96.pid') && jq -e '.status==\"incomplete\" and .rc==137 and .turn==1' '$SB/p96/envelope.json' >/dev/null"
+  t 96 "STOP in the close's order: a claude seat that ignores its stdin's EOF and the TERM is KILLed by its wrapper — no process remains, and the turn in flight is typed by the stop (incomplete, rc 143)" \
+    sh -c "[ \"\$(cat '$SB/p96.rc')\" = 0 ] && python3 '$SB/chk.py' gone '$SB/p96' \$(cat '$SB/p96.pid') && jq -e '.status==\"incomplete\" and .rc==143 and .turn==1' '$SB/p96/envelope.json' >/dev/null"
 
   # classification corpus
   local fx st

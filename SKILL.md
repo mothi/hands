@@ -16,7 +16,7 @@ $D send DIR /tmp/followup.md       # the next turn; a gone seat resumes its sess
 $D mail DIR "run the lint first"   # a driver line in DIR/inbox.jsonl
 $D wait DIR                        # blocks: the answer (on ok), then the envelope -- see BACKGROUND below
 $D events DIR --follow             # the readable view, live; ends with the seat (raw: tail -f DIR/events.jsonl)
-$D stop DIR                        # TERM, KILL after a 5 s drain; the envelope still lands
+$D stop DIR                        # stdin EOF, TERM, KILL; the envelope still lands
 $D --cwd /path/repo claude:opus /tmp/task.md   # sync = start + wait + stop (sub-minute probes ONLY)
 $D --probe all                     # 1-token aliveness ping per provider (internal: it never pushes)
 $D quota                           # the quota board: read-only, it never spends

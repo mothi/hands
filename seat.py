@@ -604,7 +604,7 @@ class Seat:
     def __init__(s, d, h, msg, ready):
         s.d, s.h, s.msg, s.ready, s.prov, (s.fam, s.delivery) = d, h, msg, ready, h['provider'], WIRES[h['provider']]
         s.errs, s.mail_off, s.wfd, s.mlock, s.tlock, s.W = [], size(J(d, 'outbox.jsonl')), None, threading.Lock(), threading.Lock(), None
-        s.seen, s.poster, s.done, s.halt = -1, None, False, False
+        s.seen, s.poster, s.done, s.halt, s.late = -1, None, False, False, False   # halt: a stop; late: the deadline
 
     def put(s, e):
         append(J(s.d, 'events.jsonl'), e)
@@ -693,7 +693,7 @@ class Seat:
 
     def run(s):
         d, h = s.d, s.h
-        signal.signal(signal.SIGTERM, lambda *a: setattr(s, 'halt', True))   # stop TERMs a wrapper that has no seat process
+        signal.signal(signal.SIGTERM, lambda *a: setattr(s, 'halt', True))   # a stop: the wrapper closes its CLI
         s.first, s.t_first, s.eoff, st = 0, time.time(), size(J(d, 'stderr.log')), State(d).read()
         # a wrapper killed before its close-out left turns delivered and never answered: they close first, as its close-out
         # would have, so this launch numbers its turns past every marker already written (else a wait counts to the wrong turn)
@@ -712,15 +712,20 @@ class Seat:
         rc = s.pump(p, W, rfd)
         s.letgo(rfd)
         s.t.join(5)
-        return s.close_out(rc, W)
+        return s.close_out(s.cut(rc), W)
 
-    def pump(s, p, W, rfd):   # the CLI's stdout -> events; in.fifo's whole records -> its stdin
-        fd, buf, gone = p.stdout.fileno(), b'', None
+    def pump(s, p, W, rfd):   # the CLI's stdout -> events; in.fifo's whole records -> its stdin, until a stop closes it
+        fd, buf, gone, closed = p.stdout.fileno(), b'', None, None
         ibuf, obuf, cin = b'', b'', p.stdin.fileno()
         os.set_blocking(cin, False)   # a CLI that is not reading never stalls its own stdout
         with open(J(s.d, 'stream.jsonl'), 'ab') as raw:
             while True:
-                r, w, _ = select.select([fd, rfd], [cin] if obuf else [], [], 1.0)
+                if s.halt and closed is None:   # a stop: the close Rpc.close makes -- stdin EOF, then TERM at 2 s and KILL
+                    closed, obuf = time.time(), b''   # at 4 s for the seat's groups (the reaper sits in the wrapper's own)
+                    p.stdin.close()
+                if closed and time.time() - closed > 2:
+                    term(seat_groups([os.getpid()]), signal.SIGTERM if time.time() - closed < 4 else signal.SIGKILL)
+                r, w, _ = select.select([fd] if closed else [fd, rfd], [cin] if obuf else [], [], 1.0)
                 if rfd in r:
                     *done, ibuf = (ibuf + os.read(rfd, 65536)).split(b'\n')
                     obuf += b''.join(ln + b'\n' for ln in whole(s.d, done))
@@ -778,8 +783,10 @@ class Seat:
                 status, reason, text = 'error', 'session-changed', ''   # conversation (a resume that started fresh)
             elif status == 'ok' and not text.strip():
                 status, reason, text = 'error', 'empty', ''
-            elif status != 'ok':   # typed from provider error fields and the CLI's stderr, never from prose
-                status, reset = typed(status, r['errtext'] + ('\n' + since(J(d, 'stderr.log'), s.eoff) if rc is not None else ''), rc)
+            elif status != 'ok':   # typed from provider error fields and the CLI's stderr, never from prose; a turn a stop
+                # ended is incomplete, whatever its agent said as it went (codex: interrupted; opencode: cancelled)
+                status, reset = ('incomplete', '') if s.halt else typed(
+                    status, r['errtext'] + ('\n' + since(J(d, 'stderr.log'), s.eoff) if rc is not None else ''), rc)
                 text = ''
             rc_ = rc if rc not in (None, 0) else (0 if status == 'ok' else 1)
             n, session, use = r['turn'], h.get('session') or r['session'], r['usage']
@@ -828,13 +835,16 @@ class Seat:
     def limit(s):   # the launch's deadline: its --timeout from the first turn's start; none given = no deadline (INF)
         return s.t_first + int(s.h['timeout']) if s.h.get('timeout') else INF
 
+    def cut(s, rc):   # the rc of what the wrapper's own close ended: the deadline's reads 142 (typed timeout) and a stop's
+        return 142 if s.late else 143 if s.halt else rc   # 143, as the reaper's alarm and a TERM would; else the CLI's own
+
     def queued(s):
-        s.buf, s.late, deadline = b'', False, s.limit()
-        # THE POLITE DEADLINE (every JSON-RPC wire): the wrapper ends the agent itself at the deadline, with Rpc.close (stdin
-        # EOF first, TERM only after its grace) -- opencode keeps a turn's execution claim on a TERM and releases it on a
-        # polite close (opencode 2.0.22); codex's app-server reaps its commands on EOF, which an interrupt alone does not
-        # (codex-cli 0.160), so an rpc turn in flight is interrupted first. The reaper is a backstop 10 s later (a close takes
-        # <= 4 x 2 s)
+        s.buf, deadline = b'', s.limit()
+        # THE POLITE CLOSE (every JSON-RPC wire), at the deadline and at a stop alike: the wrapper ends the agent itself, with
+        # Rpc.close (stdin EOF first, TERM only after its grace) -- opencode keeps a turn's execution claim on a TERM and
+        # releases it on a polite close (opencode 2.0.22); codex's app-server reaps its commands on EOF, which an interrupt
+        # alone does not (codex-cli 0.160), so an rpc turn in flight is interrupted first. The reaper is a backstop 10 s past
+        # the deadline (a close takes <= 4 x 2 s)
         wrap = lambda argv: reaped_argv(deadline + 10 - time.time(), argv)
         log = lambda line, way: append(J(s.d, 'stream.jsonl'), {'t': now(), 'dir': way, 'msg': jparse(line)})
         seat, why = acp.launch(s.prov, s.h, wrap, log, J(s.d, 'stderr.log')) if s.fam == 'acp' else s.codex(wrap, log)
@@ -852,15 +862,14 @@ class Seat:
                 for ln in whole(s.d, done):
                     s.q.put(ln) if s.fam == 'acp' else s.rpc_turn(seat, ln)
         s.late = seat.proc.poll() is None and time.time() >= deadline   # set BEFORE the close the turn reads it in
-        if s.late and s.W and s.W.tid:
+        if seat.proc.poll() is None and s.W and s.W.tid:   # the agent outlived the loop: the deadline or a stop ends it
             try:
                 seat._request('turn/interrupt', {'threadId': s.W.session, 'turnId': s.W.tid}, timeout=5)
             except acp.AcpError:
                 pass
         s.letgo(s.rfd)
         s.t.join(5)
-        rc = rcode(seat.close(2))   # close() frees a prompt whose pipe an escaped child still holds
-        rc = 142 if s.late else rc   # the deadline's close: what it leaves is typed timeout, as the reaper's was
+        rc = s.cut(rcode(seat.close(2)))   # close() frees a prompt whose pipe an escaped child still holds
         while not s.q.empty():        # delivered, never run: the close-out types them
             s.q.get_nowait()
         s.q.put(None)
@@ -881,7 +890,7 @@ class Seat:
         # why); its notifications reach the translator on the reader thread, a deadline's typed timeout with them
         s.W = Wire(s.prov, s.first - 1, s.h.get('session'), s.put, s.pending)
         rpc = acp.Rpc(wrap(codex_argv(s.h)), s.h['cwd'], None, log, J(s.d, 'stderr.log'),
-                      lambda m, p: s.feed({'method': m, 'params': p}, s.W, 142 if s.late else None))
+                      lambda m, p: s.feed({'method': m, 'params': p}, s.W, s.cut(None)))
         try:
             s.W.session = codex_open(s.h, rpc)
         except acp.AcpError as x:
@@ -907,7 +916,8 @@ class Seat:
                 s.finish(recs + [s.W.end('error', '', None, 'none', why)], None)
 
     def forget(s, sid, n):   # GUARD 2, ABANDONED TURNS: a turn whose agent went mid-turn other than by the
-        # deadline's close (a stop, a crash, a kill) may keep its execution claim, which opencode's managed background service
+        # deadline's close (a stop -- a polite close too, kept here until a live opencode check shows it releases the claim
+        # --, a crash, a kill) may keep its execution claim, which opencode's managed background service
         # resumes at its next boot; its session is deleted -- the wire's own command (acp.forget; None = nothing to delete), in
         # the seat's cwd, under the reaper, its output to stderr.log (no provider error: failures are typed from
         # past it) -- before the turn's envelope lands, so a sync buy's stop never races it
@@ -938,14 +948,14 @@ class Seat:
         if end['status'] != 'ok':   # typed from the wire's error fields and this turn's stderr, never from prose
             try:   # did its agent go with it? A killed agent words its end three ways: incomplete, cancelled (opencode on
                 # a TERM, sometimes), or an error (opencode 2.0.22 when its server died first); an error from
-                # an agent that lives on (a provider refusal) leaves rc None. The deadline's close is a timeout, else the reaper's rc
+                # an agent that lives on (a provider refusal) leaves rc None. The wrapper's own close reads its cut, else the reaper's rc
                 rc = rcode(seat.proc.wait(10 if end['status'] in ('incomplete', 'cancelled') else 3))
             except subprocess.TimeoutExpired:
                 pass
-            rc = 142 if s.late else rc
             err = json.dumps(res.get('error') or res.get('incomplete') or '', ensure_ascii=False) + '\n' + since(J(s.d, 'stderr.log'), off)
             if rc is not None and not s.late:   # its agent gone mid-turn, not by the deadline: the turn is abandoned
                 s.forget(seat.session_id, n)
+            rc = s.cut(rc)
         s.finish([rec(n, end['status'], end.get('text'), use.get('usage'), end.get('final'), err, end.get('session'), t0,
                       {k: use[k] for k in ('usage_unknown', 'cost_usd') if k in use})], rc)
 
@@ -1080,25 +1090,22 @@ def wait(d, h, mode, timeout):
         time.sleep(0.25)
 
 
-def stop(d):   # the reaper's order: TERM the seat's groups -- those under its wrappers when the stop began -- and KILL what is
-    # left of them after a 5 s drain; a wrapper with no seat process is TERMed itself (the group it leads: it calls
-    # setsid), and closes out. A match that leads no group -- the spawn parent, still waiting on its wrapper's ack, in the
-    # CALLER's group -- is signalled alone, never its group. A group its wrapper starts later is the close-out's own (an
-    # abandoned turn's session delete): never the stop's
+def stop(d):   # TERM the seat's wrappers: each closes its CLI as at its deadline (Seat.cut types what that ends). What
+    # is left at 10 s of the seat's groups -- those under its wrappers when the stop began, never a group a wrapper starts
+    # later (its close-out's own: an abandoned turn's session delete) -- is TERMed, and KILLed at 15 s
     t0, groups = time.time(), None
     while time.time() - t0 < 20:
         ws = wrappers(d)
         if not ws:
             break
-        sig = signal.SIGTERM if time.time() - t0 < 5 else signal.SIGKILL
-        groups = groups or seat_groups([w[0] for w in ws]) or {w[2] for w in ws if w[0] == w[2]}
-        term(groups, sig)
+        groups = groups or seat_groups([w[0] for w in ws])
         for w in ws:
-            if w[0] != w[2]:
-                try:
-                    os.kill(w[0], sig)
-                except OSError:
-                    pass
+            try:
+                os.kill(w[0], signal.SIGTERM)
+            except OSError:
+                pass
+        if time.time() - t0 >= 10:
+            term(groups, signal.SIGTERM if time.time() - t0 < 15 else signal.SIGKILL)
         time.sleep(0.2)
     env = jload(J(d, 'envelope.json'))
     if env:

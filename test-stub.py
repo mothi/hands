@@ -244,7 +244,9 @@ if mode == 'replay':   # one recorded turn per message line: split before each t
 t = 0
 while True:
     line = sys.stdin.readline()
-    if not line:
+    if not line:   # stdin EOF, logged as <EOF> (as the codex stub logs it): the CLI ends
+        if env('STDIN_LOG'):
+            open(env('STDIN_LOG'), 'a').write('<EOF>\n')
         break
     t += 1
     if env('STDIN_LOG'):
