@@ -22,7 +22,7 @@ jobs:
       - name: rearm selftest
         run: bash ./rearm.sh --selftest
 
-  # Linux is untested by design (--sandbox is macOS-only); this job reports how far the suites get.
+  # Linux is untested; this job reports how far the suites get.
   ubuntu:
     runs-on: ubuntu-latest
     timeout-minutes: 30

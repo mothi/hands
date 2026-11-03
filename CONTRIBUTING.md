@@ -20,8 +20,8 @@ bash ./rearm.sh --selftest
 ```
 
 They are hermetic: stub CLIs stand in for the real ones, and nothing touches the network or
-spends quota. The hands suite takes a few minutes. Rows that need macOS `sandbox-exec` print
-`skip` where it is missing.
+spends quota. The hands suite takes a few minutes. A row that cannot run on this machine prints
+`skip`.
 
 A new behavior lands with a selftest row, and the row must be able to fail: revert the fix alone,
 run the suite, and see that row go red. A row nobody has seen fail proves nothing.

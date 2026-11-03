@@ -8,10 +8,7 @@
 # each opening turn/start plays its recorded turn), CX_FAIL_TEXT (the provider error text its failures carry);
 # P_VERSION: what --version prints (answered before any log or counter; default a version at its floor or above);
 # P_VERSION_SLEEP: seconds --version takes first (a launch caught in its version check).
-# P_STUB_MODE=probe: the answer is what this process may touch (probe()): P_PROBE_READ / P_PROBE_WRITE (paths joined by
-# ':') each read / appended to, ok or the errno name; P_PROBE_GIT: an empty commit in the cwd's repo (its rc); P_PROBE_SH: a
-# shell command run first, as the seat, its $1 the job dir the turn's prompt names (its rc); sandboxed.
-import ctypes, errno, json, os, re, signal, subprocess, sys, time
+import json, os, signal, subprocess, sys, time
 prov = os.path.basename(sys.argv[0])
 P = {'claude': 'CL', 'codex': 'CX'}[prov]
 env = lambda k, d=None: os.environ.get(P + '_' + k) or d
@@ -30,26 +27,6 @@ if env('STUB_CALLS'):
     launch = n + 1
 if env('CWD_LOG'):
     open(env('CWD_LOG'), 'a').write(os.getcwd() + '\n')
-
-
-def probe(text):
-    def tried(f):
-        try:
-            f()
-            return 'ok'
-        except OSError as e:
-            return errno.errorcode.get(e.errno, str(e.errno))
-    paths = lambda k: [p for p in env(k, '').split(':') if p]
-    sbx = ctypes.CDLL(None).sandbox_check
-    sbx.argtypes, sbx.restype = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int], ctypes.c_int
-    job = re.search(r'YOUR JOB DIR: (\S+) ', text)
-    sh = subprocess.run(['sh', '-c', env('PROBE_SH'), 'sh', job.group(1) if job else ''], stdin=subprocess.DEVNULL,
-                        capture_output=True).returncode if env('PROBE_SH') else None
-    git = subprocess.run(['git', '-c', 'user.name=stub', '-c', 'user.email=stub@stub', 'commit', '-q', '--allow-empty', '-m', 'probe'],
-                         stdin=subprocess.DEVNULL, capture_output=True).returncode if env('PROBE_GIT') else None
-    return json.dumps({'sandboxed': sbx(os.getpid(), None, 0), 'git': git, 'sh': sh,
-                       'read': {p: tried(lambda p=p: open(p, 'rb').read(1)) for p in paths('PROBE_READ')},
-                       'write': {p: tried(lambda p=p: open(p, 'a').write('x')) for p in paths('PROBE_WRITE')}})
 
 
 def out(o):
@@ -166,7 +143,6 @@ def codex_server():   # the app-server (codex-cli 0.160 v2): one thread, th_stub
                 'nofinal': [msg('{"status":"ok","summary":"voided"}', 'msg_1'), cmd()],      # a tool after the only message voids it
                 'files': [edit('fc-7', '/w/file-1.txt'), cmd('exec-8', 2), edit('fc-11', '/w/file-2.txt', '/w/file-1.txt'), msg('FINAL-3: the audit')],
                 'slow': [msg('turn %d pid %d: %s' % (st['n'], os.getpid(), said))], 'stale': [msg('turn %d: %s' % (st['n'], said))],
-                'probe': [msg(probe(said))] if mode == 'probe' else [],   # probe() reads a macOS-only call: only when asked
                 'subagent': [], 'latesub': [], 'nomain': [], 'unauthorized': []}.get(mode, [msg('stub ok')])
         for it in body:
             if it['type'] != 'agentMessage':
@@ -304,8 +280,6 @@ while True:
     elif mode == 'slow':   # a turn still running when the next line arrives
         time.sleep(float(env('STUB_SLEEP', 2)))
         res('turn %d pid %d' % (t, os.getpid()))
-    elif mode == 'probe':
-        res(probe(json.loads(line)['message']['content'][0]['text']))
     elif mode == 'echo':   # the answer is the message itself: the row chooses its bytes
         res(json.loads(line)['message']['content'][0]['text'])
     elif mode == 'schema':

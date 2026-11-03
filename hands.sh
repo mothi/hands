@@ -20,11 +20,9 @@
 #   --out DIR           the job dir, new or empty, made 0700 (default: a fresh dir in $XDG_STATE_HOME/hands, else
 #                       ~/.local/state/hands, where every buy sweeps dirs idle for 30 days)
 #   --timeout SECS      a wall clock per launch (default: none; the seat runs until its work ends or a stop)
-#   --sandbox           macOS only: the CLI runs under sandbox-exec (README § Security model)
 #   --effort <tier>     claude, codex: low|medium|high|xhigh|max, passed through (codex adds ultra where it lists it);
 #                       grok, opencode: required, a value the model lists (grok-4.6: low|medium|high|xhigh)
 #   --json-schema FILE  claude, codex: the final message follows the schema, whose status is the envelope's
-# env: HANDS_REPOS (default ~/dev, colon-separated) names the trees whose other repos --sandbox hides
 #
 # envelope: {"status":"ok|blocked|error|incomplete|cancelled|truncated|timeout|auth-expired|provider-quota-dead|not-installed|refused",
 #   "provider","model","effort","rc","seconds","reset","dir","usage","session","turn","delivery",...}
@@ -38,7 +36,7 @@ set -u
 # outside a wrapper drops them where it starts: run_probe (a probe never pushes) and run_list.
 
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-BG=0 CWD="$PWD" TIMEOUT="" OUT="" EFFORT="" PROBE="" LIST=0 SELFTEST=0 SCHEMA="" VERB="" SANDBOX=0
+BG=0 CWD="$PWD" TIMEOUT="" OUT="" EFFORT="" PROBE="" LIST=0 SELFTEST=0 SCHEMA="" VERB=""
 SEATPY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/seat.py"   # the wire layer
 case "${1:-}" in   # the seat verbs come first; start is the buy with --bg as its default
   start) VERB=start BG=1; shift ;;
@@ -56,7 +54,6 @@ cli_path() {  # resolve a provider CLI even when it's not on PATH
 need() { [ $# -ge 2 ] || { echo "hands: $1 needs a value" >&2; exit 2; }; }
 while [ $# -gt 0 ]; do
   case "$1" in
-    --sandbox) SANDBOX=1 ;;
     --bg) BG=1 ;;
     --cwd) need "$@"; CWD="$2"; shift ;;
     --timeout) need "$@"; TIMEOUT="$2"; shift ;;
@@ -204,7 +201,7 @@ refuse() { emit "$1" refused "$2" "$3" 2 "" "$4"; return 2; }   # dir prov model
 
 # ---------- seats: the handle, then seat.py ----------
 # The CLI runs in ONE canonical physical cwd (a relative --cwd would resolve twice). DIR/session is the
-# handle every later send resumes with: provider, model, effort, sandbox, cwd, timeout, schema, the
+# handle every later send resumes with: provider, model, effort, cwd, timeout, schema, the
 # CLI path, and the session id seat.py records at first sight.
 seat_launch() { # $1 prov  $2 model  $3 dir
   local prov="$1" model="$2" dir="$3" bin acwd rc ack
@@ -215,8 +212,8 @@ seat_launch() { # $1 prov  $2 model  $3 dir
     emit "$dir" error "$prov" "$model" 2; return 2
   fi
   jq -n -c --arg p "$prov" --arg m "$model" --arg e "$EFFORT" --arg c "$acwd" --arg t "$TIMEOUT" \
-     --arg s "${SCHEMA:+$dir/schema.json}" --arg b "$bin" --arg x "$SANDBOX" '{provider:$p, model:(if $m=="" then null else $m end),
-     effort:(if $e=="" then null else $e end), sandbox:($x=="1"), cwd:$c, timeout:(if $t=="" then null else ($t|tonumber) end),
+     --arg s "${SCHEMA:+$dir/schema.json}" --arg b "$bin" '{provider:$p, model:(if $m=="" then null else $m end),
+     effort:(if $e=="" then null else $e end), cwd:$c, timeout:(if $t=="" then null else ($t|tonumber) end),
      schema:(if $s=="" then null else $s end), cli:$b, session:null}' >"$dir/session" 2>/dev/null \
     || { echo "hands: --timeout takes seconds" >&2; emit "$dir" error "$prov" "$model" 2; return 2; }
   if [ "$BG" = 1 ]; then python3 "$SEATPY" spawn "$dir" "$dir/prompt.txt"; return $?; fi
@@ -308,7 +305,7 @@ run_selftest() {
   HERE="$(cd "$(dirname "$0")" && pwd)"
   SB="$(mktemp -d "${TMPDIR:-/tmp}/hands-selftest.XXXXXX")"
   unset CODEX_ARGV_LOG  # externally-exported sentinels must not reach stub calls
-  unset ACP_REPLAY ACP_MODE ACP_REC ACP_ARGV_LOG ACP_ENV_LOG ACP_PIDFILE OC_SESSION_LOG ACP_PROBE_READ
+  unset ACP_REPLAY ACP_MODE ACP_REC ACP_ARGV_LOG ACP_ENV_LOG ACP_PIDFILE OC_SESSION_LOG
   unset CL_ARGV_LOG CL_STUB_MODE CL_STDIN_LOG
   # PUSH SEAM: a suite run inside a Claude Code session inherits the host's inbox socket — unset,
   # so no hermetic seat ever posts to it (the push rows arm a throwaway socket of their own)
@@ -321,15 +318,14 @@ run_selftest() {
   # THE JOBS ROOT SEAM: a buy without --out (and every probe) makes its dir in $XDG_STATE_HOME/hands, so EVERY row runs
   # on a sandbox root, never the real one, and no buy's sweep can reach a real dir (rows 39w, 156, 165, 188, 189, 191, 192, 193 name their own)
   export XDG_STATE_HOME="$SB/state"
-  # rows that need macOS sandbox-exec skip where it is missing; the probe rows that run with PATH=/usr/bin:/bin skip where
-  # a provider CLI lives there (they would launch it) or jq and python3 do not
-  SKIP=0 SBX_ROWS=" 149 150 151 152 159 160 165 166 167 170 174 176 190 194 195 197 " SYS_ROWS=""
-  [ -x /usr/bin/sandbox-exec ] && SBX_ROWS=""
+  # the probe rows that run with PATH=/usr/bin:/bin skip where a provider CLI lives there (they would launch it) or jq
+  # and python3 do not
+  SKIP=0 SYS_ROWS=""
   for c in claude codex grok opencode; do [ -n "$(PATH=/usr/bin:/bin command -v "$c")" ] && SYS_ROWS=" 04b 20 20b "; done
   for c in jq python3; do [ -n "$(PATH=/usr/bin:/bin command -v "$c")" ] || SYS_ROWS=" 04b 20 20b "; done
   t() { # t <num> <desc> <cmd...> — passes when cmd exits 0
     local n="$1" d="$2"; shift 2
-    case "$SBX_ROWS$SYS_ROWS" in *" $n "*) SKIP=$((SKIP+1)); echo "skip $n $d"; return 0 ;; esac
+    case "$SYS_ROWS" in *" $n "*) SKIP=$((SKIP+1)); echo "skip $n $d"; return 0 ;; esac
     if "$@" >/dev/null 2>&1; then PASS=$((PASS+1)); echo "ok  $n $d"
     else FAIL=$((FAIL+1)); echo "FAIL $n $d"; fi
   }
@@ -384,7 +380,7 @@ run_selftest() {
   # replays a recorded transcript request by request (a method out of order exits 3). Seams: ACP_REPLAY
   # (default: that CLI's recorded 4-turn seat, fixtures/*-acp-seat-sample.jsonl, minus the client's
   # cancel, so its turn 3 ends cancelled by itself), ACP_MODE, ACP_REC (the client lines it received),
-  # ACP_ARGV_LOG, ACP_ENV_LOG (+ ACP_PROBE_READ: r:<path>=ok|denied per path), ACP_PIDFILE (one line per launch),
+  # ACP_ARGV_LOG, ACP_ENV_LOG, ACP_PIDFILE (one line per launch),
   # OC_SESSION_LOG (the session branch). chk.py holds the multi-line checks.
   mkdir -p "$SB/bin"
   cat >"$SB/chk.py" <<'PY'
@@ -498,15 +494,15 @@ def ocresumed(d, ack, rec, argv, envf, sid):   # resumed()'s opencode twin (its 
 def callerstore(d, store, *runs):   # an opencode seat on its CALLER's store: per launch, ONE run of the CLI (argv acp, no
     for argv, envf in zip(runs[::2], runs[1::2]):   # auth import before it), XDG_DATA_HOME as the caller's, no key in its env
         env = open(envf).read().split('\n')[:-1]
-        if not (open(argv).read().split('\n')[:-1] == ['acp'] and env[0] == store and env[5] == 'key='):
+        if not (open(argv).read().split('\n')[:-1] == ['acp'] and env[0] == store and env[4] == 'key='):
             return False
     return len(open(d + '.pids').read().split()) == len(runs) // 2 and not os.path.exists(J(d, 'xdg'))
-def forgot(d, log, sid, cwd, sbx, sent, rc):   # an abandoned opencode turn: its session deleted ONCE (session delete <sid>
-    es, h = evs(d), [l for l in open(log).read().split('\n') if l]   # --standalone, in the seat's cwd, sandboxed sbx) BEFORE its
+def forgot(d, log, sid, cwd, sent, rc):   # an abandoned opencode turn: its session deleted ONCE (session delete <sid>
+    es, h = evs(d), [l for l in open(log).read().split('\n') if l]   # --standalone, in the seat's cwd) BEFORE its
     at = lambda f: next((i for i, e in enumerate(es) if f(e)), -1)   # turn_end; a later send fails typed (error handshake, rc 1)
     gone = at(lambda e: e['kind'] == 'progress' and str(e.get('text', '')).startswith('session %s deleted (rc 0)' % sid))
     env, last = json.load(open(J(d, 'turn-1', 'envelope.json'))), json.loads(open(sent).read().strip().split('\n')[-1])
-    return (h == ['session delete %s --standalone' % sid, cwd, 'sandboxed=%s' % sbx] and -1 < gone < at(lambda e: e['kind'] == 'turn_end')
+    return (h == ['session delete %s --standalone' % sid, cwd] and -1 < gone < at(lambda e: e['kind'] == 'turn_end')
             and (env['status'], env['rc'], env['session']) == ('incomplete', 143, sid)
             and rc == '1' and (last['status'], last['reason'], last['session']) == ('error', 'handshake', sid))
 def refused(*specs):   # rc:dir:reason -- typed before any prompt reached the agent it asked
@@ -761,10 +757,6 @@ def disabled(feature, *argvs):   # every codex argv disables the feature as a RO
     pre = [open(f).read().split('\n')[:-1] for f in argvs]
     pre = [a[:a.index('app-server')] if 'app-server' in a else [] for a in pre]
     return bool(pre) and all(any(a[i:i + 2] == ['--disable', feature] for i in range(len(a))) for a in pre)
-def probe(d, n, sbx, *want):   # the probe stub's answer for turn n: sandboxed (0|1), then each r:<path>|w:<path>|git = ok|<errno>|<rc>
-    p = json.loads(open(J(d, 'turn-%s' % n, 'result.txt')).read())
-    got = lambda k: p[k] if k in ('git', 'sh') else p[{'r': 'read', 'w': 'write'}[k[0]]].get(k[2:])
-    return p['sandboxed'] == int(sbx) and all(str(got(w.rsplit('=', 1)[0])) == w.rsplit('=', 1)[1] for w in want)
 def marks(d):   # the delivery markers that carry an inbox line: [(inbox line, sender, mail id)]
     return [(e['inbox'], e.get('sender'), e.get('mail')) for e in evs(d) if e['kind'] == 'progress' and e.get('inbox')]
 def trapped(d, n, to, *gone):   # d's mail line n, to `to`, was refused and typed back to the sender -- ONE unknown-seat error
@@ -785,12 +777,6 @@ def gone(d, *pids):   # within 5 s: no wrapper of job dir d and none of pids lef
             return True
         time.sleep(0.1)
     return False
-def unfenced(d, n, to, ib):   # d's mail line n to an UNSANDBOXED seat was refused (unfenced-peer), typed back once; ib stays empty
-    d = os.path.realpath(d)
-    mid = '%s:%s' % (d, n)
-    err = [e for e in evs(d) if e['kind'] == 'error' and e.get('mail') == mid]
-    return (len(err) == 1 and (err[0]['reason'], err[0]['to']) == ('unfenced-peer', to) and os.path.getsize(ib) == 0
-            and len([x for x in inbox(d) if (x.get('from'), x.get('id')) == ('hands', mid)]) == 1)
 def aliased(a, b, addr):   # A mailed B by an ALIAS of B's dir (not its realpath): delivered once to B, no error back to A
     a, b = os.path.realpath(a), os.path.realpath(b)
     ib = inbox(b)
@@ -843,17 +829,14 @@ PY
   cat >"$SB/acp-stub" <<'STUB'
 #!/bin/sh
 [ "$*" = --version ] && { echo "${ACP_VERSION:-@VERSION@}"; exit 0; }
-SBX="import ctypes, os; f = ctypes.CDLL(None).sandbox_check; f.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]; print('sandboxed=%d' % f(os.getpid(), None, 0))"
-# `session ...` (opencode: the wrapper deletes an abandoned turn's session): OC_SESSION_LOG appends argv, the cwd and the
-# sandbox state per call -- after a second, as a real delete takes a moment (its standalone server) that nothing may cut
+# `session ...` (opencode: the wrapper deletes an abandoned turn's session): OC_SESSION_LOG appends argv and the cwd per
+# call -- after a second, as a real delete takes a moment (its standalone server) that nothing may cut
 if [ "${1:-}" = session ]; then
-  sleep 1; [ -n "${OC_SESSION_LOG:-}" ] && { echo "$*"; pwd -P; python3 -c "$SBX"; } >>"$OC_SESSION_LOG"; exit 0
+  sleep 1; [ -n "${OC_SESSION_LOG:-}" ] && { echo "$*"; pwd -P; } >>"$OC_SESSION_LOG"; exit 0
 fi
 [ -n "${ACP_ARGV_LOG:-}" ] && printf '%s\n' "$@" >"$ACP_ARGV_LOG"
 [ -n "${ACP_ENV_LOG:-}" ] && { printf '%s\n%s\n%s\n' "${XDG_DATA_HOME:-UNSET}" "${OPENCODE_CONFIG_CONTENT:-UNSET}" "${GROK_DISABLE_AUTOUPDATER:-UNSET}"; pwd -P
-  python3 -c "$SBX"
-  echo "key=${OPENCODE_API_KEY+SET}"; echo "hooks=${GROK_CLAUDE_HOOKS_ENABLED:-UNSET},${GROK_CURSOR_HOOKS_ENABLED:-UNSET}"
-  for p in $(printf '%s' "${ACP_PROBE_READ:-}" | tr ':' ' '); do if { [ -d "$p" ] && ls "$p"; } >/dev/null 2>&1 || head -c 1 "$p" >/dev/null 2>&1; then echo "r:$p=ok"; else echo "r:$p=denied"; fi; done; } >"$ACP_ENV_LOG"
+  echo "key=${OPENCODE_API_KEY+SET}"; echo "hooks=${GROK_CLAUDE_HOOKS_ENABLED:-UNSET},${GROK_CURSOR_HOOKS_ENABLED:-UNSET}"; } >"$ACP_ENV_LOG"
 [ -n "${ACP_PIDFILE:-}" ] && echo $$ >>"$ACP_PIDFILE"
 exec python3 @TEST@ --fake "${ACP_REPLAY:-@SEAT@}" "${ACP_MODE:-eof}" "${ACP_REC:-/dev/null}"
 STUB
@@ -995,7 +978,7 @@ for l in open(sys.argv[1]):
   t 175 "an abandoned opencode turn whose agent answers the stop with an ERROR (server unavailable, as 2.0.22 does live) still has its session deleted: ONCE, in the seat's cwd" \
     sh -c "[ \"\$(grep -c 'session delete' '$SB/a175.del')\" = 1 ] && grep -q 'ses_f2c74432dffeoPDAL0Eq6RHjaI' '$SB/a175.del' && grep -q '$GD' '$SB/a175.del'"
   t 173 "AN ABANDONED OPENCODE TURN'S SESSION IS DELETED: a stop mid-turn runs session delete <sid> --standalone ONCE, in the seat's cwd, before the turn's envelope (incomplete, rc 143) lands; an idle stop, a turn the agent cancelled and lived on, a grok seat and the deadline's close delete nothing; a later send ends typed (error handshake, rc 1) within 30 s" \
-    sh -c "python3 '$SB/chk.py' forgot '$SB/a173' '$SB/a173.del' ses_f2c74432dffeoPDAL0Eq6RHjaI '$GD' 0 '$SB/a173.sent' $R173 && [ $T173 -lt 30 ] && [ ! -e '$SB/a101.del' ] && [ ! -e '$SB/a110.del' ] && [ ! -e '$SB/a111b.del' ]"
+    sh -c "python3 '$SB/chk.py' forgot '$SB/a173' '$SB/a173.del' ses_f2c74432dffeoPDAL0Eq6RHjaI '$GD' '$SB/a173.sent' $R173 && [ $T173 -lt 30 ] && [ ! -e '$SB/a101.del' ] && [ ! -e '$SB/a110.del' ] && [ ! -e '$SB/a111b.del' ]"
   ACP_MODE=slow ACP_PIDFILE="$SB/a112.pids" ACP_REC="$SB/a112.rec" stub_run start --effort low --cwd "$SB/tmp" --out "$SB/a112" grok:grok-4.6 "$SB/q.md" >/dev/null 2>&1
   stub_run send "$SB/a112" "$SB/q81.md" >"$SB/a112.sent" 2>/dev/null; stub_run wait "$SB/a112" --timeout 30 >/dev/null 2>&1; stub_run stop "$SB/a112" >/dev/null 2>&1
   t 112 "a send WHILE an ACP turn runs queues (ACP v1 has no mid-turn input): acked sent, expect 2, delivery queue at once; its marker lands in events.jsonl before turn 1 ends; turn 2 opens only after turn 1's turn_end; both ok on ONE agent" \
@@ -1506,165 +1489,18 @@ STUB
   CL_STUB_CALLS="$SB/v148.calls" stub_run send "$SB/v148" "$SB/q81.md" >/dev/null 2>&1; stub_run wait "$SB/v148" --timeout 30 >/dev/null 2>&1; stub_run stop "$SB/v148" >/dev/null 2>&1
   t 148 "VERSION FLOOR at relaunch: a send to a gone seat whose CLI is now below its floor is refused (rc 2, cli-too-old) and launches nothing; the seat stays resumable -- the next send on a good CLI relaunches it and turn 2 answers ok on the same session" \
     python3 "$SB/chk.py" refloored "$SB/v148" 2.1.283
-  # THE SANDBOX (149-152): a FAKE HOME under the suite sandbox is the profile's HOME (the real ~ is never touched). The
-  # seat works in a worktree outside $FH/dev of a repo inside it, so its git common dir sits in dev beside another repo
-  FH="$SB/fh"; mkdir -p "$FH/.ssh" "$FH/.codex" "$FH/.grok" "$FH/dev/other" "$FH/dev/own"; FH="$(cd "$FH" && pwd -P)"
-  echo key >"$FH/.ssh/id_fake"; echo c >"$FH/.claude.json"; echo g >"$FH/.grok/auth.json"; echo o >"$FH/.codex/auth.json"; echo s >"$FH/dev/other/secret.txt"
-  git -C "$FH/dev/own" init -q && git -C "$FH/dev/own" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init && git -C "$FH/dev/own" worktree add -q "$SB/wt" -b wt >/dev/null 2>&1
-  WT="$(cd "$SB/wt" && pwd -P)"; echo w >"$WT/f.txt"
-  HOME="$FH" CX_STUB_MODE=probe CX_PROBE_GIT=1 CX_PROBE_READ="$FH/.ssh/id_fake:$FH/.claude.json:$FH/.grok/auth.json:$FH/dev/other/secret.txt:$FH/.codex/auth.json:$FH/dev/own/.git/HEAD:$WT/f.txt" \
-    CX_PROBE_WRITE="$FH/out.txt:$FH/dev/other/w.txt:$FH/dev/own/w.txt:$SB/s149/w.txt:$SB/s149/outbox.jsonl:$WT/w.txt:$SB/tmp/w.txt:$FH/.codex/w.txt" CX_ARGV_LOG="$SB/tmp/s149.argv" \
-    stub_run start --sandbox --cwd "$WT" --out "$SB/s149" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
-  stub_run wait "$SB/s149" --timeout 30 >/dev/null 2>&1; stub_run stop "$SB/s149" >/dev/null 2>&1
-  t 149 "SANDBOX READS (start --sandbox, a fake HOME): the seat CLI runs sandboxed and cannot read an ssh key, another provider's credential store (HOME/.claude.json, HOME/.grok) or another repo under HOME/dev; it reads its own CLI's state (HOME/.codex), its cwd and its repo's git common dir (in HOME/dev: worktrees work)" \
-    python3 "$SB/chk.py" probe "$SB/s149" 1 1 "r:$FH/.ssh/id_fake=EPERM" "r:$FH/.claude.json=EPERM" "r:$FH/.grok/auth.json=EPERM" "r:$FH/dev/other/secret.txt=EPERM" \
-      "r:$FH/.codex/auth.json=ok" "r:$FH/dev/own/.git/HEAD=ok" "r:$WT/f.txt=ok"
-  t 150 "SANDBOX WRITES: nothing outside the allowed paths (the fake HOME, another repo, its own repo's main checkout) nor in its job dir (a job dir outside the jobs root here) but its outbox; the cwd, \$TMPDIR and the CLI's own state are writable, and a commit in the worktree lands (its git common dir)" \
-    python3 "$SB/chk.py" probe "$SB/s149" 1 1 "w:$FH/out.txt=EPERM" "w:$FH/dev/other/w.txt=EPERM" "w:$FH/dev/own/w.txt=EPERM" \
-      "w:$SB/s149/w.txt=EPERM" "w:$SB/s149/outbox.jsonl=ok" "w:$WT/w.txt=ok" "w:$SB/tmp/w.txt=ok" "w:$FH/.codex/w.txt=ok" "git=0"
-  HOME="$FH" CX_STUB_MODE=probe CX_PROBE_READ="$FH/.ssh/id_fake" CX_ARGV_LOG="$SB/tmp/s149r.argv" stub_run send "$SB/s149" "$SB/q81.md" >/dev/null 2>&1
-  stub_run wait "$SB/s149" --timeout 30 >/dev/null 2>&1; stub_run stop "$SB/s149" >/dev/null 2>&1
-  HOME="$FH" CL_STUB_MODE=probe CL_PROBE_READ="$FH/.ssh/id_fake" CL_ARGV_LOG="$SB/tmp/s151a.argv" stub_run --sandbox --cwd "$WT" --out "$SB/s151a" claude:sonnet "$SB/q.md" >/dev/null 2>&1
-  # the stubs log only where a fenced process may write ($TMPDIR = $SB/tmp)
-  HOME="$FH" ACP_ENV_LOG="$SB/tmp/s151b.env" stub_run --sandbox --effort low --cwd "$WT" --out "$SB/s151b" grok:grok-4.6 "$SB/q.md" >/dev/null 2>&1
-  t 151 "SANDBOX, every launch: the handle records sandbox true, so a RELAUNCH (stop, then send) runs fenced too (turn 2 cannot read the key); the stdin wire (claude) and an ACP agent (grok) launch fenced as the rpc wire (codex) does" \
-    sh -c "jq -e '.sandbox==true' '$SB/s149/session' >/dev/null && python3 '$SB/chk.py' probe '$SB/s149' 2 1 'r:$FH/.ssh/id_fake=EPERM' && python3 '$SB/chk.py' probe '$SB/s151a' 1 1 'r:$FH/.ssh/id_fake=EPERM' && sed -n 5p '$SB/tmp/s151b.env' | grep -qx sandboxed=1 && jq -e '.status==\"ok\"' '$SB/s151b/envelope.json' >/dev/null"
-  HOME="$FH" CX_STUB_MODE=probe CX_PROBE_READ="$FH/.ssh/id_fake" CX_PROBE_WRITE="$FH/out.txt" CX_ARGV_LOG="$SB/s152.argv" stub_run --cwd "$WT" --out "$SB/s152" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
-  t 152 "NO SANDBOX BY DEFAULT: without --sandbox the handle says false and nothing is wrapped -- the same probe runs unsandboxed, reads the key and writes outside" \
-    sh -c "jq -e '.sandbox==false' '$SB/s152/session' >/dev/null && python3 '$SB/chk.py' probe '$SB/s152' 1 0 'r:$FH/.ssh/id_fake=ok' 'w:$FH/out.txt=ok'"
-  # 159 (a user codex hook -- a script in another repo under HOME/dev -- was once denied its read
-  # under the sandbox and blocked every prompt). NO PERSONAL HOOKS: every seat, sandboxed or not, runs
-  # its CLI with the user's hooks off, each by its own switch. Falsification: drop any one switch -> its half here.
-  t 159 "NO SEAT RUNS THE USER'S HOOKS, sandboxed or not: codex disables hooks as a root option on every app-server launch and relaunch (s149, s149r fenced; s152 not); claude's ONE --settings carries disableAllHooks (s151a fenced; p82 not); grok's agent runs with its claude- and cursor-hook scanners off (s151b fenced; a100 not)" \
-    sh -c "python3 '$SB/chk.py' disabled hooks '$SB/tmp/s149.argv' '$SB/tmp/s149r.argv' '$SB/s152.argv' && for f in '$SB/tmp/s151a.argv' '$SB/p82.argv'; do [ \"\$(grep -c -- --settings \"\$f\")\" = 1 ] && awk 'p==\"--settings\"{print;exit}{p=\$0}' \"\$f\" | jq -e '.disableAllHooks==true' >/dev/null || exit 1; done && sed -n 7p '$SB/tmp/s151b.env' | grep -qx hooks=0,0 && sed -n 7p '$SB/a100.env' | grep -qx hooks=0,0"
-  # 174: a FENCED opencode seat owns opencode's data dir, as every provider owns its own state (OWN):
-  # it runs on the user's store, HOME/.local/share/opencode (still in SECRETS: every other provider's fence denies it), and its
-  # abandoned turn's session delete runs fenced too. Falsification: drop it from OWN['opencode'] -> its read is denied;
-  # run the delete unfenced -> sandboxed=0.
-  mkdir -p "$FH/.local/share/opencode"; echo s >"$FH/.local/share/opencode/auth.json"
-  # 176: opencode 2.x loads HOME/.claude's skills, agents, commands and CLAUDE.md, so
-  # a fenced opencode seat READS those (READ), its parent folder's own entry, and a linked skill's real folder in another
-  # repo under dev -- and still not Claude's login, its transcripts, or the linked repo's other files. Falsification: drop
-  # the READ rule -> the skill reads are denied; drop the parent literal -> the folder listing is denied; drop the link
-  # targets -> the linked skill is denied.
-  mkdir -p "$FH/.claude/skills/own" "$FH/.claude/projects" "$FH/dev/other/skills/linked"; echo k >"$FH/.claude/skills/own/SKILL.md"
-  echo l >"$FH/dev/other/skills/linked/SKILL.md"; ln -s "$FH/dev/other/skills/linked" "$FH/.claude/skills/linked"
-  echo m >"$FH/.claude/CLAUDE.md"; echo c >"$FH/.claude/.credentials.json"; echo t >"$FH/.claude/projects/t.jsonl"
-  HOME="$FH" ACP_REPLAY="$SB/oc-hang.jsonl" ACP_REC="$SB/tmp/s174.rec" ACP_ENV_LOG="$SB/tmp/s174.env" OC_SESSION_LOG="$SB/tmp/s174.del" \
-    ACP_PROBE_READ="$FH/.local/share/opencode/auth.json:$FH/.grok/auth.json:$FH/.claude:$FH/.claude/skills/own/SKILL.md:$FH/.claude/skills/linked/SKILL.md:$FH/.claude/CLAUDE.md:$FH/.claude/.credentials.json:$FH/.claude/projects/t.jsonl:$FH/dev/other/secret.txt" stub_run start --sandbox --effort low --cwd "$WT" --out "$SB/s174" opencode:opencode-go/deepseek-v4.1-flash "$SB/q.md" >/dev/null 2>&1
-  for i in $(seq 1 50); do grep -q '"kind": "turn_start"' "$SB/s174/events.jsonl" 2>/dev/null && grep -q session/prompt "$SB/tmp/s174.rec" 2>/dev/null && break; sleep 0.1; done
-  stub_run stop "$SB/s174" >/dev/null 2>&1
-  t 174 "SANDBOX, opencode: a fenced opencode seat reads its own store (HOME/.local/share/opencode: OWN) and still not another provider's (HOME/.grok); stopped mid-turn, its session delete runs fenced too, in its cwd" \
-    sh -c "grep -qx sandboxed=1 '$SB/tmp/s174.env' && grep -qxF 'r:$FH/.local/share/opencode/auth.json=ok' '$SB/tmp/s174.env' && grep -qxF 'r:$FH/.grok/auth.json=denied' '$SB/tmp/s174.env' && [ \"\$(cat '$SB/tmp/s174.del')\" = \"\$(printf 'session delete ses_f2c74432dffeoPDAL0Eq6RHjaI --standalone\n%s\nsandboxed=1' '$WT')\" ] && jq -e '.status==\"incomplete\" and .rc==143' '$SB/s174/envelope.json' >/dev/null && jq -e '.sandbox==true' '$SB/s174/session' >/dev/null"
-  t 176 "SANDBOX, opencode reads Claude's config: a fenced opencode seat reads HOME/.claude's own entry, its skills (a skill linked from another repo under dev too) and CLAUDE.md -- and still not Claude's login, its transcripts, or the linked repo's other files" \
-    sh -c "for r in .claude=ok .claude/skills/own/SKILL.md=ok .claude/skills/linked/SKILL.md=ok .claude/CLAUDE.md=ok .claude/.credentials.json=denied .claude/projects/t.jsonl=denied dev/other/secret.txt=denied; do grep -qxF \"r:$FH/\$r\" '$SB/tmp/s174.env' || exit 1; done"
-  # 170: codex seats run with the user's codex memories OFF (the twin of claude's auto-memory off).
-  # Falsification: drop --disable memories from codex_argv -> red.
-  t 170 "NO SEAT USES THE USER'S CODEX MEMORIES: every codex launch disables memories as a root option, a launch and a relaunch, sandboxed (s149, s149r) or not (s152)" \
-    python3 "$SB/chk.py" disabled memories "$SB/tmp/s149.argv" "$SB/tmp/s149r.argv" "$SB/s152.argv"
-  # THE JOB DIRS (165): a sandboxed seat writes no job dir under the jobs root
-  # (XDG_STATE_HOME/hands, where every default job dir lives: a sibling's here, the root put in a writable $TMPDIR so
-  # only the deny stops it), and none of its own engine files wherever --out put its dir (here in $TMPDIR, writable,
-  # outside that root) -- its handle, events, inbox, stream, envelope, a turn dir,
-  # its driver files, a new file, a dir named xdg (the retired private store's) -- but its outbox (a writer's temp beside it
-  # too). Falsification: drop the jobs-root deny (the sibling is written), the job-dir deny (its own files are), the outbox
-  # allow (EPERM); allow DIR/xdg again (it is written)
-  mkdir -p "$SB/tmp/state/hands/sib" "$SB/tmp/s165"
-  O165="$(cd "$SB/tmp/s165" && pwd -P)"; SIB="$(cd "$SB/tmp/state/hands/sib" && pwd -P)"; echo '{"provider":"codex","cwd":"/"}' >"$SIB/session"; echo tok >"$SIB/driver.token"
-  HOME="$FH" CLAUDE_CODE_MESSAGING_SOCKET="$SB/nosock" CLAUDE_CODE_MESSAGING_TOKEN=tok-stub CX_STUB_MODE=probe CX_PROBE_SH='! mkdir "$1/xdg" 2>/dev/null' \
-    CX_PROBE_READ="$O165/driver.sock:$O165/driver.token:$O165/prompt.txt:$SIB/driver.token:$SIB/session" CX_PROBE_WRITE="$O165/session:$O165/events.jsonl:$O165/inbox.jsonl:$O165/stream.jsonl:$O165/envelope.json:$O165/turn-1/x:$O165/new.txt:$O165/driver.sock:$O165/driver.token:$SIB/session:$SIB/new.txt:$O165/outbox.jsonl:$O165/outbox.jsonl.tmp.1" \
-    XDG_STATE_HOME="$SB/tmp/state" stub_run start --sandbox --cwd "$WT" --out "$O165" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
-  stub_run wait "$O165" --timeout 30 >/dev/null 2>&1   # turn 2 probes again, with turn-1/ made by the engine
-  CLAUDE_CODE_MESSAGING_SOCKET="$SB/nosock" CLAUDE_CODE_MESSAGING_TOKEN=tok-stub XDG_STATE_HOME="$SB/tmp/state" stub_run send "$O165" "$SB/q81.md" >/dev/null 2>&1
-  stub_run wait "$O165" --timeout 30 >/dev/null 2>&1; stub_run stop "$O165" >/dev/null 2>&1
-  t 165 "SANDBOX JOB DIRS: a seat cannot write a sibling's handle or dir under the jobs root, nor (its own dir in a writable \$TMPDIR) its own handle (it stays the launch's), events, inbox, stream, envelope, turn dir, driver files, a new file or DIR/xdg (no private store); it writes its outbox (and outbox.jsonl.tmp.*, an atomic writer's temp)" \
-    sh -c "python3 '$SB/chk.py' probe '$O165' 2 1 sh=0 'w:$O165/session=EPERM' 'w:$O165/events.jsonl=EPERM' 'w:$O165/inbox.jsonl=EPERM' 'w:$O165/stream.jsonl=EPERM' 'w:$O165/envelope.json=EPERM' 'w:$O165/turn-1/x=EPERM' 'w:$O165/new.txt=EPERM' 'w:$O165/driver.sock=EPERM' 'w:$O165/driver.token=EPERM' 'w:$SIB/session=EPERM' 'w:$SIB/new.txt=EPERM' 'w:$O165/outbox.jsonl=ok' 'w:$O165/outbox.jsonl.tmp.1=ok' && [ ! -e '$O165/xdg' ] && jq -e '.sandbox==true and .session==\"th_stub123\"' '$O165/session' >/dev/null && [ \"\$(cat '$SIB/session')\" = '{\"provider\":\"codex\",\"cwd\":\"/\"}' ]"
-  # 166: the push's socket path and token sit in the job dir; a fenced seat cannot read
-  # them (an unsandboxed one can: same uid -- SKILL.md says so). Falsification: drop the profile's driver-file deny
-  t 166 "SANDBOX DRIVER FILES: a fenced seat cannot read DIR/driver.sock or DIR/driver.token (both captured: a stub socket was exported), and still reads the rest of its job dir (prompt.txt)" \
-    python3 "$SB/chk.py" probe "$O165" 1 1 "r:$O165/driver.sock=EPERM" "r:$O165/driver.token=EPERM" "r:$O165/prompt.txt=ok"
-  # 194: no other job dir is readable either: every seat a driver buys captures the SAME socket and token, so a sibling's
-  # driver.token is a way into the driver's session, and its stream is another task. Falsification: drop the JOBS read
-  # deny -> both read ok
-  t 194 "SANDBOX, OTHER JOB DIRS: a fenced seat cannot read a sibling's driver.token or handle in the jobs root (its own job dir stays readable: 166)" \
-    python3 "$SB/chk.py" probe "$O165" 1 1 "r:$SIB/driver.token=EPERM" "r:$SIB/session=EPERM"
-  # 196: a fence that cannot hold refuses the launch (floor(), typed sandbox-unavailable, before any CLI runs): no
-  # sandbox-exec, or a $TMPDIR at or above HOME (its write allowance would cover HOME). In-process, so it runs anywhere.
-  # Falsification: drop either check -> floor() goes on to the version check (cli-too-old for /bin/false)
-  mkdir -p "$SB/t196/home"
-  t 196 "SANDBOX REFUSALS: a fenced launch is refused sandbox-unavailable when sandbox-exec is missing or \$TMPDIR holds HOME; a safe \$TMPDIR goes on to the version check" \
-    env HOME="$SB/t196/home" python3 -c 'import os, sys, tempfile
-sys.path.insert(0, sys.argv[1]); import seat
-h = {"provider": "claude", "sandbox": True, "cli": "/bin/false"}
-seat.SBX = "/nonexistent/sandbox-exec"; r = seat.floor(h); assert r[0] == "sandbox-unavailable" and "missing" in r[1], r
-seat.SBX = "/bin/sh"; tempfile.tempdir = sys.argv[2]; r = seat.floor(h); assert r[0] == "sandbox-unavailable" and "holds HOME" in r[1], r
-tempfile.tempdir = sys.argv[3]; r = seat.floor(h); assert r[0] == "cli-too-old", r' "$HERE" "$SB/t196" "$SB/tmp"
-  # 197: the repo roots a fenced seat cannot read are HANDS_REPOS (colon-separated; default ~/dev). Falsification: the
-  # old fixed HOME/dev -> the repo under the named root reads ok and the one under dev is denied
-  mkdir -p "$FH/code/other"; echo s >"$FH/code/other/secret.txt"; echo s >"$FH/dev/other/secret197.txt"
-  HOME="$FH" HANDS_REPOS="$FH/code" CX_STUB_MODE=probe CX_PROBE_READ="$FH/code/other/secret.txt:$FH/dev/other/secret197.txt" \
-    stub_run --sandbox --cwd "$WT" --out "$SB/s197" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
-  t 197 "SANDBOX, HANDS_REPOS: a repo under a named root is unreadable to a fenced seat; ~/dev is protected only by default" \
-    python3 "$SB/chk.py" probe "$SB/s197" 1 1 "r:$FH/code/other/secret.txt=EPERM" "r:$FH/dev/other/secret197.txt=ok"
-  # 190: A FENCED SEAT IN THE DEFAULT ROOT: a sandboxed buy without --out lands in HOME/.local/state/hands
-  # (under HOME, so the profile's deny-all covers it as well as the JOBS deny) and its CLI writes its own outbox there and
-  # nothing else: not its handle, not a new file, not a sibling dir in the root. Falsification: put the JOBS deny after the
-  # outbox allow -> the outbox is denied in a default dir only (165's --out dir, outside the root, stays green)
-  cat >"$SB/p190.sh" <<'EOF'
-d="$1" && case "$d" in "$2"/*-codex-*) ;; *) exit 1 ;; esac && echo '{}' >>"$d/outbox.jsonl" && ! ls "$2" >/dev/null 2>&1 \
-  && ! (echo x >>"$d/session") 2>/dev/null && ! (echo x >>"$d/new.txt") 2>/dev/null && ! mkdir "$2/sib190" 2>/dev/null
-EOF
-  ( unset XDG_STATE_HOME; HOME="$FH" CX_STUB_MODE=probe CX_PROBE_SH="sh '$SB/p190.sh' \"\$1\" '$FH/.local/state/hands'" \
-    stub_run --sandbox --cwd "$WT" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1 )
-  D190="$(ls -d "$FH"/.local/state/hands/*-codex-* 2>/dev/null | head -1)"
-  t 190 "SANDBOX, THE DEFAULT ROOT: a fenced seat bought without --out (its dir in HOME/.local/state/hands) writes its own outbox there, and not its handle, a new file or a sibling dir in the root, nor lists the root" \
-    sh -c "[ -n '$D190' ] && python3 '$SB/chk.py' probe '$D190' 1 1 sh=0 && [ \"\$(cat '$D190/outbox.jsonl')\" = '{}' ] && [ ! -e '$FH/.local/state/hands/sib190' ] && jq -e '.sandbox==true' '$D190/session' >/dev/null"
-  # 167: a rule naming file-read-data beats a file-read* rule wherever it stands, so the repo allow
-  # (file-read-data) used to beat the SECRETS deny (file-read*) whenever the seat's "repo" held a secret -- a cwd that is
-  # a non-repo HOME read HOME/.ssh. Falsification: name only file-read* in the SECRETS deny (the key reads), or in OWN
-  # (the CLI's own state is EPERM, here and in 149)
-  HOME="$FH" CX_STUB_MODE=probe CX_PROBE_READ="$FH/.ssh/id_fake:$FH/.grok/auth.json:$FH/.claude.json:$FH/.codex/auth.json" \
-    stub_run --sandbox --cwd "$FH" --out "$SB/s167" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
-  t 167 "SANDBOX, a cwd that holds secrets (a non-repo fake HOME: the seat's repo is the cwd itself): the seat still cannot read the ssh key or another provider's store (HOME/.grok, HOME/.claude.json), and reads its own CLI's state (HOME/.codex)" \
-    python3 "$SB/chk.py" probe "$SB/s167" 1 1 "r:$FH/.ssh/id_fake=EPERM" "r:$FH/.grok/auth.json=EPERM" "r:$FH/.claude.json=EPERM" "r:$FH/.codex/auth.json=ok"
-  # MAIL TRAPS (160-163): the wrapper routes a seat's mail UNFENCED, so an address is
-  # checked before anything is written. The seat (a sandboxed claude probe) builds the counter-example itself,
-  # under the fence: in its $TMPDIR a fake peer holding a copy of its own handle with an inbox.jsonl linked to a victim
-  # under the fake HOME, and a link to that fake peer; then it mails five traps. The suite plants the rest where the seat
-  # cannot write (a dir whose `session` is no handle; two FIFO inboxes, one held open). An address is resolved first and
-  # judged as the dir it names (171: an alias is delivered). Falsification: open the inbox without O_NOFOLLOW (160, 161),
-  # take any file named session (162), drop O_NONBLOCK or the regular-file check (163).
-  echo victim >"$FH/victim.txt"; mkdir -p "$FH/app" "$SB/s160" "$SB/tmp/fifo1" "$SB/tmp/fifo2"
-  S160="$(cd "$SB/s160" && pwd -P)"; T160="$(cd "$SB/tmp" && pwd -P)"
-  echo 'not a handle' >"$FH/app/session"
-  for f in fifo1 fifo2; do echo '{"provider":"claude","sandbox":true}' >"$T160/$f/session"; mkfifo "$T160/$f/inbox.jsonl"; done
-  mkdir -p "$T160/open"; echo '{"provider":"claude"}' >"$T160/open/session"; : >"$T160/open/inbox.jsonl"
-  python3 -c 'import os, sys, time; os.open(sys.argv[1], os.O_RDWR); time.sleep(120)' "$T160/fifo2/inbox.jsonl" & H160=$!
-  cat >"$SB/trap160.sh" <<EOF
-[ -e "$T160/fake" ] && exit 0
-mkdir "$T160/fake" && cp "$S160/session" "$T160/fake/" && ln -s "$FH/victim.txt" "$T160/fake/inbox.jsonl" && ln -s "$T160/fake" "$T160/linkpeer" || exit 1
-for t in "$T160/fake" "$T160/linkpeer" "$FH/app" "$T160/fifo1" "$T160/fifo2" "$T160/open"; do printf '{"to":"%s","text":"INJECTED && rm -rf ~"}\n' "\$t" >>"$S160/outbox.jsonl"; done
-EOF
-  HOME="$FH" CL_STUB_MODE=probe CL_PROBE_SH="sh '$SB/trap160.sh'" CL_PROBE_WRITE="$FH/victim.txt" \
-    stub_run start --sandbox --cwd "$WT" --out "$S160" claude:sonnet "$SB/q.md" >/dev/null 2>&1
-  for i in $(seq 1 150); do
-    [ "$(jq -s '[.[] | select(.kind=="error" and .mail)] | length' "$S160/events.jsonl" 2>/dev/null)" = 6 ] \
-      && [ "$(jq -s '[.[] | select(.kind=="progress" and .sender=="hands")] | length' "$S160/events.jsonl" 2>/dev/null)" = 6 ] && break
-    sleep 0.1; done
-  t 160 "MAIL TRAP, the counter-example: a --sandbox seat that cannot write a victim under HOME itself (EPERM) builds, under the fence, a fake peer in its \$TMPDIR -- a copy of its handle, inbox.jsonl a symlink to the victim -- and mails it: the wrapper refuses (the inbox is opened O_NOFOLLOW), the victim is untouched, and the sender gets the typed error (one unknown-seat event, one hands notice delivered once)" \
-    sh -c "[ \"\$(cat '$FH/victim.txt')\" = victim ] && python3 '$SB/chk.py' probe '$S160' 1 1 'w:$FH/victim.txt=EPERM' 'sh=0' && python3 '$SB/chk.py' trapped '$S160' 1 '$T160/fake'"
-  t 161 "MAIL TRAP, a SYMLINKED PEER DIR: the address is resolved first and judged as the dir it names -- a link to the fake peer is refused like the peer itself (its inbox a link to the victim) and typed back, the victim untouched" \
-    sh -c "[ \"\$(cat '$FH/victim.txt')\" = victim ] && python3 '$SB/chk.py' trapped '$S160' 2 '$T160/linkpeer'"
-  t 162 "MAIL TRAP, NO HANDLE: a real dir whose \`session\` is no hands handle is no seat -- refused, typed back, no inbox created in it" \
-    python3 "$SB/chk.py" trapped "$S160" 3 "$FH/app" "$FH/app/inbox.jsonl"
-  t 163 "MAIL TRAP, a NON-REGULAR INBOX: a FIFO inbox with no reader never blocks the wrapper, one held open takes nothing -- both refused and typed back, in order" \
-    sh -c "python3 '$SB/chk.py' trapped '$S160' 4 '$T160/fifo1' && python3 '$SB/chk.py' trapped '$S160' 5 '$T160/fifo2' && python3 '$SB/chk.py' drained '$T160/fifo2/inbox.jsonl'"
-  # 195: a fenced seat mails only fenced seats (and the driver): an unsandboxed peer would act on the line outside the
-  # fence. Falsification: drop the check -> the line lands in the open peer's inbox
-  t 195 "MAIL FROM A FENCED SEAT TO AN UNSANDBOXED ONE is refused (unfenced-peer), typed back once, and nothing reaches that seat's inbox" \
-    python3 "$SB/chk.py" unfenced "$S160" 6 "$T160/open" "$T160/open/inbox.jsonl"
-  stub_run stop "$S160" >/dev/null 2>&1; kill $H160 2>/dev/null
-  # 164: the engine's other opens of a seat's own mail files never follow a link either (an unsandboxed seat; the suite
+  # 159, 170: NO PERSONAL HOOKS, NO CODEX MEMORIES. Every seat runs its CLI with the user's hooks off, each by its own
+  # switch, and codex with the user's memories off (the twin of claude's auto-memory off), on a launch and a relaunch.
+  # Falsification: drop any one switch -> its half here.
+  CX_ARGV_LOG="$SB/h159a.argv" stub_run start --cwd "$SB/tmp" --out "$SB/h159" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
+  stub_run wait "$SB/h159" --timeout 30 >/dev/null 2>&1; stub_run stop "$SB/h159" >/dev/null 2>&1
+  CX_ARGV_LOG="$SB/h159b.argv" stub_run send "$SB/h159" "$SB/q81.md" >/dev/null 2>&1
+  stub_run wait "$SB/h159" --timeout 30 >/dev/null 2>&1; stub_run stop "$SB/h159" >/dev/null 2>&1
+  t 159 "NO SEAT RUNS THE USER'S HOOKS: codex disables hooks as a root option on an app-server launch and relaunch; claude's ONE --settings carries disableAllHooks on a launch (g49) and a relaunch (p82); grok's agent runs with its claude- and cursor-hook scanners off (a100)" \
+    sh -c "python3 '$SB/chk.py' disabled hooks '$SB/h159a.argv' '$SB/h159b.argv' && for f in '$SB/g49.argv' '$SB/p82.argv'; do [ \"\$(grep -c -- --settings \"\$f\")\" = 1 ] && awk 'p==\"--settings\"{print;exit}{p=\$0}' \"\$f\" | jq -e '.disableAllHooks==true' >/dev/null || exit 1; done && sed -n 6p '$SB/a100.env' | grep -qx hooks=0,0"
+  t 170 "NO SEAT USES THE USER'S CODEX MEMORIES: every codex launch disables memories as a root option, a launch and a relaunch" \
+    python3 "$SB/chk.py" disabled memories "$SB/h159a.argv" "$SB/h159b.argv"
+  # 164: the engine's other opens of a seat's own mail files never follow a link either (the suite
   # plants the links): the outbox read, the sender's notice, the driver's mail. Falsification: read the outbox with a
   # plain open (the linked file's line is routed), drop O_NOFOLLOW (the victim is written), let the notice raise (the post
   # thread dies: the next mail is never typed), let the driver's mail raise (rc 1)
@@ -1730,7 +1566,7 @@ EOF
   # through a PRIVATE server (a standalone one never resumes another process's turns). Falsification: drop --standalone ->
   # the argv half; a throwaway store -> the logged store is not the caller's; seed one -> two CLI runs; keep the key -> SET.
   t 19 "list carries static seats, and asks the opencode catalog through a PRIVATE server (models --standalone) on the CALLER's store (XDG_DATA_HOME unchanged), ONE CLI run (nothing seeded), no key in its env" \
-    sh -c "ACP_ARGV_LOG='$SB/l19.argv' ACP_ENV_LOG='$SB/l19.env' ACP_PIDFILE='$SB/l19.pids' OPENCODE_API_KEY=sk-caller-env PATH='$SB/bin:$PATH' HOME='$SB' TMPDIR='$SB/tmp' '$0' --list </dev/null >'$SB/l19.out' && grep -q 'claude:sonnet' '$SB/l19.out' && grep -q 'codex:gpt-5.6-terra' '$SB/l19.out' && [ \"\$(tr '\\n' ' ' <'$SB/l19.argv')\" = 'models --standalone ' ] && [ \"\$(sed -n '1p' '$SB/l19.env')\" = '$SB/oc-store' ] && [ \"\$(wc -l <'$SB/l19.pids' | tr -d ' ')\" = 1 ] && [ \"\$(sed -n '6p' '$SB/l19.env')\" = key= ]"
+    sh -c "ACP_ARGV_LOG='$SB/l19.argv' ACP_ENV_LOG='$SB/l19.env' ACP_PIDFILE='$SB/l19.pids' OPENCODE_API_KEY=sk-caller-env PATH='$SB/bin:$PATH' HOME='$SB' TMPDIR='$SB/tmp' '$0' --list </dev/null >'$SB/l19.out' && grep -q 'claude:sonnet' '$SB/l19.out' && grep -q 'codex:gpt-5.6-terra' '$SB/l19.out' && [ \"\$(tr '\\n' ' ' <'$SB/l19.argv')\" = 'models --standalone ' ] && [ \"\$(sed -n '1p' '$SB/l19.env')\" = '$SB/oc-store' ] && [ \"\$(wc -l <'$SB/l19.pids' | tr -d ' ')\" = 1 ] && [ \"\$(sed -n '5p' '$SB/l19.env')\" = key= ]"
   # 19b: no grok models cache -> --list says so. Falsification: the old `| sed || echo` (the pipe's rc is sed's) -> silent
   mkdir -p "$SB/h19b"
   t 19b "list names an absent grok models cache instead of printing nothing" \
@@ -1771,8 +1607,8 @@ EOF
   stub_run wait "$SB/w199" --timeout 10 >"$SB/w199.wait" 2>/dev/null; echo $? >"$SB/w199.rc"
   t 199 "WAIT AFTER A WRAPPER DIED MID-TURN: incomplete, reason wrapper-gone, the sent turn (2), rc 1 -- never turn 1's ok answer" \
     sh -c "[ -n '$W199' ] && [ \"\$(cat '$SB/w199.rc')\" = 1 ] && jq -e '.status==\"incomplete\" and .reason==\"wrapper-gone\" and .turn==2' '$SB/w199.wait' >/dev/null"
-  # 200: the driver files are written 0600 through the no-link open (opened()): a link planted at either name (an
-  # unsandboxed seat can, in its own dir) takes nothing at the next capture, a relaunching send. Falsification: open
+  # 200: the driver files are written 0600 through the no-link open (opened()): a link planted at either name (a
+  # seat can, in its own dir) takes nothing at the next capture, a relaunching send. Falsification: open
   # driver.token without O_NOFOLLOW -> the victim holds the token
   CLAUDE_CODE_MESSAGING_SOCKET="$SB/nosock200" CLAUDE_CODE_MESSAGING_TOKEN=tok-200 stub_run --cwd "$SB/tmp" --out "$SB/p200" claude:sonnet "$SB/q.md" >/dev/null 2>&1
   printf keep >"$SB/v200"; for n in driver.sock driver.token; do rm -f "$SB/p200/$n"; ln -s "$SB/v200" "$SB/p200/$n"; done
@@ -1797,13 +1633,6 @@ def lstat(q, *a, **k):
     return os.stat_result((r[0], r[1], r[2] + 1) + tuple(r[3:])) if q.endswith("/mnt") else r
 seat.os.lstat = lstat
 assert not seat.stale(p, cut)' "$HERE" "$SB/t201/20250101-000000-codex-9"
-  # 203: a path in the sandbox profile is one SBPL string literal: a quote or backslash in it cannot end the string or
-  # add a rule. Falsification: the old bare '"%s"' -> the quote ends the literal
-  t 203 "SBPL STRINGS ARE ESCAPED: a path holding a quote and a backslash stays one string literal in the profile" \
-    python3 -c 'import sys
-sys.path.insert(0, sys.argv[1]); import seat
-q, b = chr(34), chr(92)
-assert seat.sbstr("a" + q + "b" + b + "c") == q + "a" + b + q + "b" + b + b + "c" + q' "$HERE"
   # 188: THE JOBS ROOT. A buy without --out makes its dir in $XDG_STATE_HOME/hands,
   # else HOME/.local/state/hands (unset, or relative: XDG ignores a relative value) -- never in $TMPDIR, which macOS
   # wipes at boot and prunes after 3 days -- named <date>-<time>-<provider>-<pid>, root and dir 0700 (XDG; prompts live

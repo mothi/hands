@@ -13,7 +13,7 @@ DIR/events.jsonl, and everything downstream of the events is one rule (Seat.fini
 Job dir: session (the handle) prompt.txt in.fifo stream.jsonl stderr.log events.jsonl inbox.jsonl outbox.jsonl
 turn-N/{result.txt,envelope.json} envelope.json result.txt driver.sock driver.token job.log
 """
-import errno, fcntl, json, os, queue, re, select, shutil, signal, socket, stat, subprocess, sys, tempfile, threading, time
+import errno, fcntl, json, os, queue, re, select, shutil, signal, socket, stat, subprocess, sys, threading, time
 import acp
 from acp import Turn, clip, event, now, small, usage   # the vocabulary every wire shares: one copy, in acp.py
 
@@ -33,35 +33,8 @@ WIRES = {'claude': ('stdin', 'steer'), 'grok': ('acp', 'queue'), 'opencode': ('a
 # THE VERSION FLOOR: provider -> the oldest CLI this engine is proven on; every launch (start or relaunch) reads the
 # CLI's --version and refuses an older or unreadable one (cli-too-old), caching nothing
 FLOOR = {'claude': (2, 1, 283), 'codex': (0, 160, 0), 'grok': (1, 0, 46), 'opencode': (2, 0, 22)}
-# THE SANDBOX (start --sandbox; off by default; the handle records the choice, so every relaunch keeps it): the CLI runs
-# under sandbox-exec with ONE profile for every provider, built per launch from -D parameters (fence()). It reads no
-# SECRETS (keys, credential files, shell histories, keychains, browser profiles, every provider's credential store), no
-# repo under a REPOS root but its own (the toplevel and git common dir), and no job dir in JOBS but its own; it writes only
-# the cwd, that common dir (a worktree commits there), $TMPDIR and /dev -- and of the job dirs only its own outbox
-# (fence()). OWN: the CLI's own state, read and written -- the one table where providers differ. An entry is
-# HOME-relative unless absolute; a trailing * makes it a prefix. Network and the environment stay open. No sandbox-exec,
-# or a $TMPDIR at or above HOME (its write allowance would cover HOME): the launch is refused, never unfenced (floor())
-SBX = '/usr/bin/sandbox-exec'
-SECRETS = ('.ssh', '.gnupg', '.aws', '.azure', '.config/gcloud', '.config/gh', '.docker', '.kube', '.netrc',
-           '.git-credentials', '.npmrc', '.pypirc', '.bash_history', '.zsh_history', 'Library/Keychains',
-           'Library/Application Support/Google/Chrome', 'Library/Application Support/BraveSoftware',
-           'Library/Application Support/Microsoft Edge', 'Library/Safari', 'Library/Containers/com.apple.Safari',
-           'Library/Cookies', 'Library/Application Support/Firefox', 'Library/Application Support/Arc', '.claude*', '.codex',
-           '.grok', '.config/opencode', '.local/share/opencode', '.pi', '.gemini')
-
-
-def repos():   # the roots whose repos a fenced seat cannot read (its own excepted): HANDS_REPOS, colon-separated, else ~/dev
-    return [os.path.expanduser(r) for r in os.environ.get('HANDS_REPOS', '~/dev').split(':') if r]
-OWN = {'claude': ('.claude*', 'Library/Keychains', 'Library/Caches/claude-cli-nodejs', '/private/tmp/claude*', '/private/tmp/cc-socks*'),
-       'codex': ('.codex',), 'grok': ('.grok',),
-       'opencode': ('.config/opencode', '.cache/opencode', '.local/state/opencode', '.local/share/opencode')}
-# READ: config a CLI loads from ANOTHER tool's folder, read only -- opencode 2.x always resolves ~/.claude and loads its
-# skills, agents, commands and CLAUDE.md, and a denied read fails its every session (opencode 2.0.22: "Internal service
-# failure"). Each entry opens with its parent folder's own entry (so it resolves) and the real path of the entry and of
-# every link directly in it (a skill linked from a repo); the rest of that folder (logins, transcripts) stays denied
-READ = {'opencode': ('.claude/skills', '.claude/agents', '.claude/commands', '.claude/CLAUDE.md')}
-# NO PERSONAL HOOKS: every seat, sandboxed or not, runs its CLI with the user's hooks off -- hooks are
-# the user's code, written for the user's own sessions (a denied one blocks a fenced seat). Each launch names its CLI's own
+# NO PERSONAL HOOKS: every seat runs its CLI with the user's hooks off -- hooks are
+# the user's code, written for the user's own sessions. Each launch names its CLI's own
 # switch: claude disableAllHooks (launch), codex --disable hooks (codex_argv), grok its claude- and cursor-hook scanners
 # (acp.recipe). opencode runs no claude hooks; its plugins have no switch short of its whole config dir (SKILL.md)
 NOTE = ('turn-N/result.txt + envelope.json land at each turn_end (absent = not finished, never finished-empty); '
@@ -216,12 +189,6 @@ def launch(h):   # claude: one process for the whole seat -> (argv, env)
 
 
 def floor(h):   # None = launch; else (reason, why) for a typed refusal before any launch
-    if h.get('sandbox'):   # THE SANDBOX is never dropped: a fence that cannot hold refuses the launch
-        tmp, home = os.path.realpath(tempfile.gettempdir()), os.path.realpath(os.path.expanduser('~'))
-        if not os.access(SBX, os.X_OK):
-            return 'sandbox-unavailable', '%s is missing: --sandbox is macOS-only' % SBX
-        if os.path.commonpath([tmp, home]) == tmp:
-            return 'sandbox-unavailable', '$TMPDIR %s holds HOME, so the fence would let the seat write all of it' % tmp
     want, cli = FLOOR.get(h['provider']), h.get('cli') or h['provider']
     if not want:
         return None
@@ -234,62 +201,6 @@ def floor(h):   # None = launch; else (reason, why) for a typed refusal before a
         return None
     return 'cli-too-old', '%s --version says %r; this engine needs %s >= %s: update the CLI' % (
         cli, clip(out.strip(), 80), h['provider'], '.'.join(map(str, want)))
-
-
-def sbstr(p):   # a path as an SBPL string literal: a quote or backslash in it cannot end the string
-    return '"%s"' % p.replace('\\', '\\\\').replace('"', '\\"')
-
-
-def sbpath(p):   # a table entry as an SBPL filter
-    s = sbstr(p.rstrip('*')) if p.startswith('/') else '(string-append (param "HOME") %s)' % sbstr('/' + p.rstrip('*'))
-    return '(%s %s)' % ('prefix' if p.endswith('*') else 'subpath', s)
-
-
-def fence(d, h, argv):   # the CLI's argv, under THE SANDBOX when the handle asks for it. One line: ps prints argv whole
-    if not h.get('sandbox'):
-        return argv
-    cwd = os.path.realpath(h['cwd'])
-    try:   # the seat's own repo: its toplevel and git common dir (absolute); no repo = the cwd alone
-        g = subprocess.run(['git', '-C', cwd, 'rev-parse', '--path-format=absolute', '--show-toplevel', '--git-common-dir'],
-                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
-        repo, common = g.stdout.split('\n')[:2] if g.returncode == 0 else (cwd, cwd)
-    except (OSError, subprocess.SubprocessError, ValueError):
-        repo, common = cwd, cwd
-    par = {'HOME': os.path.expanduser('~'), 'JOB': d, 'JOBS': JOBS, 'CWD': cwd, 'TMP': tempfile.gettempdir(), 'REPO': repo,
-           'GIT': common}
-    roots = ['ROOT%d' % i for i in range(len(repos()))]
-    par.update(zip(roots, repos()))
-    reads = []
-    for e in READ.get(h['provider'], ()):
-        p = os.path.join(os.path.realpath(par['HOME']), e)
-        try:
-            kids = [J(p, k) for k in os.listdir(p)] if os.path.isdir(p) else []
-        except OSError:
-            kids = []
-        reads += ['(literal %s)' % sbstr(os.path.dirname(p)), '(subpath %s)' % sbstr(p)] + [
-            '(subpath %s)' % sbstr(os.path.realpath(q)) for q in [p] + kids if os.path.realpath(q) != q]
-    # PRECEDENCE (measured, macOS 27): a rule naming an operation beats one on its wildcard WHEREVER they stand; among
-    # rules on one operation the last match wins. The ~/dev deny and the repo allow name file-read-data (metadata stays
-    # readable, so paths resolve), so every read rule after them names it too -- else a cwd holding a secret (a non-repo
-    # HOME: the repo is the cwd) would read it
-    rules = ['(version 1)', '(allow default)',
-             '(deny file-read-data %s)' % ' '.join('(subpath (param "%s"))' % r for r in roots) if roots else '',
-             '(allow file-read-data (subpath (param "REPO")) (subpath (param "GIT")) (subpath (param "JOB")))',
-             '(deny file-read* file-read-data %s)' % ' '.join(map(sbpath, SECRETS)), '(deny file-write*)',
-             '(allow file-write* (subpath (param "CWD")) (subpath (param "GIT")) (subpath (param "TMP")) (subpath "/dev"))',
-             '(allow file-read* file-read-data file-write* %s)' % ' '.join(map(sbpath, OWN[h['provider']])),
-             '(allow file-read* file-read-data %s)' % ' '.join(reads) if reads else '',
-             # THE JOB DIRS, last (the last match wins): the seat writes no job dir -- no other seat's under the jobs root
-             # (JOBS: writable only when the cwd or $TMPDIR holds it), none of its own handle, events, inbox, stream,
-             # envelopes, turns or driver files -- but its outbox (a writer's temp beside it too: outbox.jsonl*); the CLIs
-             # write nothing else there (stderr is a descriptor the wrapper opened)
-             '(deny file-write* (subpath (param "JOBS")) (subpath (param "JOB")))',
-             '(allow file-write* (prefix (string-append (param "JOB") "/outbox.jsonl")))',
-             # no other job dir is readable either: a sibling's driver token is the same driver's, its stream another task's
-             '(deny file-read* file-read-data (subpath (param "JOBS")))', '(allow file-read* file-read-data (subpath (param "JOB")))',
-             # THE DRIVER FILES: the push's socket path and token (capture()) are the wrapper's alone -- unreadable here
-             '(deny file-read* file-read-data (literal (string-append (param "JOB") "/driver.sock")) (literal (string-append (param "JOB") "/driver.token")))']
-    return [SBX, '-p', ' '.join(rules)] + [w for k, v in par.items() for w in ('-D', '%s=%s' % (k, os.path.realpath(v)))] + argv
 
 
 def codex_argv(h):   # codex: ONE app-server process per launch, over stdio (codex-cli 0.160), all root
@@ -617,7 +528,7 @@ def rcode(rc):   # a process a signal ended reads 128 + N, as the reaper reports
 
 def capture(d):   # the driver's inbox socket when the host exports one (Claude Code does); absent = no push. The wrapper
     # drops both names from its own env (spawn), so no seat process inherits them -- but DIR/driver.* sit in the job dir:
-    # an unsandboxed seat (same uid) can read them and post to the driver; only the sandbox denies the read (fence())
+    # a seat (same uid) can read them and post to the driver
     s, t = os.environ.get('CLAUDE_CODE_MESSAGING_SOCKET'), os.environ.get('CLAUDE_CODE_MESSAGING_TOKEN')
     for n, v in ((('driver.sock', s), ('driver.token', t)) if s and t else ()):   # both 0600, through opened(): a link a
         try:                                                                    # seat planted there takes nothing
@@ -758,7 +669,7 @@ class Seat:
 
     def route(s, to, mid, text, turn):   # seat mail: the addressed seat's inbox, which ITS wrapper delivers; never a launch.
         # The address is resolved FIRST (realpath: /var/... and /private/var/... name one seat on macOS) and judged as the
-        # dir it names. The wrapper runs unfenced, so that dir is checked before the line is written: it holds a hands
+        # dir it names, and that dir is checked before the line is written: it holds a hands
         # handle and its inbox is a regular file (opened(): never a link). A link names nothing a seat could not address by
         # its real path. The check and the write go through ONE open of the dir: a path swapped after the resolve still
         # lands only beside a handle
@@ -771,10 +682,7 @@ class Seat:
                 peer = read_handle('session', fd)
                 if not peer:
                     raise OSError('no hands session handle in it')
-                if s.h.get('sandbox') and not peer.get('sandbox'):   # the peer would act on it outside the fence
-                    why = ('unfenced-peer', '%s is not sandboxed: a sandboxed seat mails only sandboxed seats and the driver' % to)
-                else:
-                    append('inbox.jsonl', {'t': now(), 'from': s.d, 'id': mid, 'text': text}, fd)
+                append('inbox.jsonl', {'t': now(), 'from': s.d, 'id': mid, 'text': text}, fd)
             finally:
                 os.close(fd)
         except (OSError, ValueError) as e:
@@ -867,7 +775,7 @@ class Seat:
         argv, env = launch(h)
         rfd = s.fifo()
         with open(J(d, 'stderr.log'), 'ab') as ef:   # the wrapper is the ONE writer of the CLI's stdin (pump)
-            p = reaped(s.limit() - time.time(), fence(d, h, argv), stdin=subprocess.PIPE,
+            p = reaped(s.limit() - time.time(), argv, stdin=subprocess.PIPE,
                        stdout=subprocess.PIPE, stderr=ef, cwd=h['cwd'], env=dict(os.environ, **env))
         s.W = W = Wire(s.prov, s.first - 1, h.get('session'), s.put, s.pending)
         s.t = threading.Thread(target=s.first_turn, daemon=True)
@@ -1005,7 +913,7 @@ class Seat:
         # polite close (opencode 2.0.22); codex's app-server reaps its commands on EOF, which an interrupt alone does not
         # (codex-cli 0.160), so an rpc turn in flight is interrupted first. The reaper is a backstop 10 s later (a close takes
         # <= 4 x 2 s)
-        wrap = lambda argv: reaped_argv(deadline + 10 - time.time(), fence(s.d, s.h, argv))
+        wrap = lambda argv: reaped_argv(deadline + 10 - time.time(), argv)
         log = lambda line, way: append(J(s.d, 'stream.jsonl'), {'t': now(), 'dir': way, 'msg': jparse(line)})
         seat, why = acp.launch(s.prov, s.h, wrap, log, J(s.d, 'stderr.log')) if s.fam == 'acp' else s.codex(wrap, log)
         if why:
@@ -1047,7 +955,7 @@ class Seat:
             n += 1
             s.q.task_done()
 
-    def codex(s, wrap, log):   # the rpc launch: the app-server under the reaper and the fence, past its handshake -> (rpc,
+    def codex(s, wrap, log):   # the rpc launch: the app-server under the reaper, past its handshake -> (rpc,
         # why); its notifications reach the translator on the reader thread, a deadline's typed timeout with them
         s.W = Wire(s.prov, s.first - 1, s.h.get('session'), s.put, s.pending)
         rpc = acp.Rpc(wrap(codex_argv(s.h)), s.h['cwd'], None, log, J(s.d, 'stderr.log'),
@@ -1082,12 +990,12 @@ class Seat:
     def forget(s, sid, n):   # GUARD 2, ABANDONED TURNS: a turn whose agent went mid-turn other than by the
         # deadline's close (a stop, a crash, a kill) may keep its execution claim, which opencode's managed background service
         # resumes at its next boot; its session is deleted -- the wire's own command (acp.forget; None = nothing to delete), in
-        # the seat's cwd, under its fence and the reaper, its output to stderr.log (no provider error: failures are typed from
+        # the seat's cwd, under the reaper, its output to stderr.log (no provider error: failures are typed from
         # past it) -- before the turn's envelope lands, so a sync buy's stop never races it
         argv = acp.forget(s.prov, sid, s.h.get('cli'))
         if argv:
             with open(J(s.d, 'stderr.log'), 'ab') as ef:
-                rc = rcode(subprocess.call(reaped_argv(60, fence(s.d, s.h, argv)), stdin=subprocess.DEVNULL, stdout=ef, stderr=ef, cwd=s.h['cwd']))
+                rc = rcode(subprocess.call(reaped_argv(60, argv), stdin=subprocess.DEVNULL, stdout=ef, stderr=ef, cwd=s.h['cwd']))
             s.eoff = size(J(s.d, 'stderr.log'))
             s.put(event('progress', n, text='session %s deleted (rc %s): its turn was abandoned, so nothing may resume it' % (sid, rc)))
 

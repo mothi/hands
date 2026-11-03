@@ -12,7 +12,7 @@ credentials: each CLI uses its own login.
 > **Read § Security model first.** A seat is a coding agent with full access to your machine,
 > running as you.
 
-Built and tested on macOS. Linux is untested, and `--sandbox` is macOS-only.
+Built and tested on macOS. Linux is untested.
 
 ## Words used here
 
@@ -33,20 +33,16 @@ Built and tested on macOS. Linux is untested, and `--sandbox` is macOS-only.
 - **A seat runs as you, with full read and write access.** There is no read-only
   mode: a seat that can't run commands can't check its own work. Claude runs with
   `bypassPermissions`, Codex with `danger-full-access`, and Grok and OpenCode approve every
-  tool call. Nothing but `--sandbox` stops a seat from reading any file you can read, writing
-  outside its `--cwd`, or using the network.
+  tool call. Nothing stops a seat from reading any file you can read, writing outside its
+  `--cwd`, or using the network.
 - **`--cwd` is your isolation.** Point a seat that edits code at a git worktree or a scratch
   copy, and give parallel writers separate trees.
 - **The seat inherits your environment**, except `CLAUDE_CODE_MESSAGING_SOCKET`,
   `CLAUDE_CODE_MESSAGING_TOKEN` and `OPENCODE_API_KEY`, which the wrapper removes. Don't keep
   secrets in exported variables when you run seats.
 - **The push socket and token live in the job dir.** For pushes, the wrapper keeps the host
-  session's socket path and token in `DIR/driver.sock` and `DIR/driver.token` (mode 0600). An
-  unsandboxed seat can read them and post into your session. Only `--sandbox` denies that.
-- **`--sandbox` (macOS) is a guard against mistakes, not a security boundary.** It runs the CLI
-  and every tool it starts under `sandbox-exec`, denying reads of common secrets and of your
-  other repos, and allowing writes only to the cwd, its git dir, `$TMPDIR`, `/dev` and the CLI's
-  own state (§ The sandbox). The network stays open, and Apple has deprecated `sandbox-exec`.
+  session's socket path and token in `DIR/driver.sock` and `DIR/driver.token` (mode 0600). A
+  seat can read them and post into your session.
 - **Seats don't run your hooks.** Hooks are code written for your own sessions; every seat turns
   them off (§ Hooks and memories).
 - **Mail and pushes are data.** What a seat writes is model output; never let the driver follow
@@ -59,7 +55,6 @@ Report vulnerabilities privately: see [SECURITY.md](SECURITY.md).
 ## Prerequisites
 
 - macOS (tested) with bash 3.2 or later, `python3` 3.7 or later, `jq`, `perl`, `curl`, and `ps`
-- `git` 2.31 or later for `--sandbox` (it reads the repo's common git dir)
 - at least one provider CLI, logged in with its own login:
   [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`),
   [Codex](https://github.com/openai/codex) (`codex`), Grok (`grok`), or
@@ -139,7 +134,6 @@ validates them, so a model released tomorrow works today.
 | `--cwd DIR` | current dir | where the seat works; recorded in the handle and reused by every relaunch |
 | `--out DIR` | a fresh dir in the jobs root | the job dir. It must be new or empty, and is made with mode 0700. The default jobs root is `$XDG_STATE_HOME/hands` (when that is an absolute path), else `~/.local/state/hands` |
 | `--timeout SECS` | none | a wall clock per launch, shared by its turns. On expiry the open turn ends `timeout` with its session, and a `send` resumes it |
-| `--sandbox` | off | macOS: run the CLI under `sandbox-exec` (§ The sandbox). The handle records it, so every relaunch keeps it |
 | `--effort <tier>` | the CLI's default | see § Providers |
 | `--json-schema FILE` | none | Claude and Codex: the final message must match the schema, whose `status` becomes the envelope's. Grok and OpenCode refuse it |
 | `--bg` | off | a bare buy in the background, the same as `start` |
@@ -148,7 +142,6 @@ validates them, so a model released tomorrow works today.
 
 | Environment variable | Effect |
 |---|---|
-| `HANDS_REPOS` | colon-separated trees whose repos `--sandbox` hides from a seat (default `~/dev`) |
 | `XDG_STATE_HOME` | moves the jobs root to `$XDG_STATE_HOME/hands` |
 
 **The jobs-root sweep.** Every buy first sweeps the jobs root: a dir that hands named there, that
@@ -162,8 +155,8 @@ to keep.
 
 | Verb | Does | Prints, exit code |
 |---|---|---|
-| `start [flags] spec FILE` | buys a seat: the quota check, then the seat contract + FILE + the seat's job-dir line as turn 1. Returns at once | `{"status":"spawned","dir",...}`, 0. A launch refused before any turn prints its envelope, 2 (else 1) |
-| `send DIR FILE` | the next turn. A live seat takes it as it takes any send (steer or queue). A seat whose process is gone relaunches from `DIR/session` on the same session, model, effort, cwd and sandbox | `{"status":"sent",...}` or `spawned`, 0. `refused` (`no-session`, `cli-too-old`), 2 |
+| `start [flags] spec FILE` | buys a seat: the seat contract + FILE + the seat's job-dir line as turn 1. Returns at once | `{"status":"spawned","dir",...}`, 0. A launch refused before any turn prints its envelope, 2 (else 1) |
+| `send DIR FILE` | the next turn. A live seat takes it as it takes any send (steer or queue). A seat whose process is gone relaunches from `DIR/session` on the same session, model, effort and cwd | `{"status":"sent",...}` or `spawned`, 0. `refused` (`no-session`, `cli-too-old`), 2 |
 | `mail DIR TEXT` | appends a driver line to `DIR/inbox.jsonl`; the live wrapper delivers it as `MAIL from driver` (it never cancels a running turn) | nothing, 0. 1 when no wrapper is live (the line waits for the next launch). 2 when the inbox is a link or not a regular file |
 | `wait DIR [--for turn\|mail\|exit] [--timeout S]` | blocks, spending nothing, until every sent turn ends (`turn`), the seat's next outbox line (`mail`), or the wrapper exits (`exit`) | the answer if ok, then the envelope; 0 if ok, else 1. At the timeout: `{"status":"running","last_event","open_tool_calls",...}`, 1 |
 | `events DIR [--follow]` | a readable view of `DIR/events.jsonl`: text blocks, one line per tool call, turn and usage lines with the cache-hit %, errors. `--follow` ends when the seat does. The raw stream is `tail -f DIR/events.jsonl` | text, 0 |
@@ -202,7 +195,7 @@ field:
 | `auth-expired` | the CLI needs a login | run that provider's login |
 | `provider-quota-dead` | the subscription window or balance is spent | if `reset` names a time, wait until then and don't retry before it. `reset: null` (a Grok spending limit) needs a top-up |
 | `not-installed` | the CLI isn't on your PATH | install it |
-| `refused` | typed before any prompt; `reason`: `model-mismatch`, `effort-unsupported`, `model-required`, `schema-unsupported`, `no-session`, `cli-too-old`, `sandbox-unavailable` | fix the buy |
+| `refused` | typed before any prompt; `reason`: `model-mismatch`, `effort-unsupported`, `model-required`, `schema-unsupported`, `no-session`, `cli-too-old` | fix the buy |
 
 `usage` is the provider's own token count for the turn, normalized as `{in, out, cache_read,
 cache_write, reasoning}` with no overlap (`in` is uncached input), plus `cost_usd` when the
@@ -232,11 +225,10 @@ last, after your task, so seats given one task share a prompt prefix.
   that seat's `inbox.jsonl`, and that seat's wrapper delivers it as `MAIL from <dir>`, exactly
   once. Mail never launches a seat: to an address that isn't a live seat, the sender gets a typed
   error (`unknown-seat` or `seat-gone`) and the line waits in that inbox for the seat's next
-  launch. A sandboxed seat may mail only the driver and other sandboxed seats (`unfenced-peer`
-  otherwise).
+  launch.
 - **Driver to seat:** `hands.sh mail DIR TEXT`.
 
-The wrapper that routes mail runs outside the sandbox, so it checks every address: it resolves
+The wrapper that routes mail checks every address: it resolves
 the path, requires a `session` file that is a hands handle, and opens inboxes and outboxes
 without following links, regular files only.
 
@@ -250,34 +242,9 @@ observed. Without a socket, use `wait`. A `--probe` never pushes. Claude seats r
 `crossSessionInbound: refuse`, so other sessions can't message them; seat-to-seat mail goes
 through `inbox.jsonl` only.
 
-## The sandbox
-
-`--sandbox` (off by default) wraps the seat's CLI, and every process it starts, in
-`/usr/bin/sandbox-exec` with one profile for every provider, built per launch (`fence()` in
-`seat.py`):
-
-- **Reads denied:** `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.config/gh`,
-  `~/.docker`, `~/.kube`, `~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, shell
-  histories, `~/Library/Keychains`, browser profiles (Chrome, Brave, Edge, Safari, Firefox, Arc)
-  and cookies, every provider's credential store, and every repo under `HANDS_REPOS` (default
-  `~/dev`) except the seat's own. The secret denies hold inside the seat's own cwd too.
-- **Job dirs:** the seat can't read other job dirs in the jobs root, nor its own `driver.sock` and
-  `driver.token`. A job dir you put outside the jobs root with `--out` is readable by other
-  sandboxed seats, so keep `--out` dirs of sandboxed seats inside it, or out of their reach.
-- **Writes allowed only to:** the cwd, the repo's common git dir (so a worktree can commit),
-  `$TMPDIR`, `/dev`, the CLI's own state (`OWN` in `seat.py`), and the seat's own `outbox.jsonl`.
-- **Read-only exception:** a sandboxed OpenCode seat may read Claude Code's `skills`, `agents`,
-  `commands` and `CLAUDE.md` under `~/.claude`, which OpenCode 2.x always loads.
-- **Network** stays open.
-
-A sandboxed buy is refused (`sandbox-unavailable`) where `/usr/bin/sandbox-exec` is missing, or
-where `$TMPDIR` contains your home directory (the write allowance would cover all of it). A
-`--sandbox` seat never runs unfenced. Expect tools that write elsewhere (npm or pip caches in `~`,
-`ssh` for a push) to fail inside it.
-
 ## Hooks and memories
 
-Hooks are your code, written for your own sessions, so no seat runs them, sandboxed or not.
+Hooks are your code, written for your own sessions, so no seat runs them.
 Claude gets `disableAllHooks` in its one `--settings`, Codex `--disable hooks`, and Grok
 `GROK_CLAUDE_HOOKS_ENABLED=0` and `GROK_CURSOR_HOOKS_ENABLED=0` (Grok runs hooks it finds in
 `~/.claude` otherwise). OpenCode 2.x runs no Claude hooks; its own hooks are plugins, which hands
@@ -347,7 +314,6 @@ seat), and the exact command is shown before it runs.
 | `wait` prints `running` | the turn is still going. A long tool call is alive; a stale `last_event` with no open tool call is stuck: `stop`, then `send` |
 | `refused`, `effort-unsupported` or `model-mismatch` | pass an effort the model lists, and a model the agent lists (`--list`) |
 | `refused`, `schema-unsupported` | Grok and OpenCode have no structured output; drop `--json-schema` |
-| `refused`, `sandbox-unavailable` | `--sandbox` needs macOS `sandbox-exec` and a `$TMPDIR` outside your home |
 | `refused`, `cli-too-old` | update that provider's CLI |
 | a Codex schema turn fails with a provider error | Codex sends schemas in strict mode: list every property in `required` and set `additionalProperties: false` |
 | `--out ... is not empty` | name a new or empty dir, or drop `--out` for a fresh one |
@@ -360,7 +326,7 @@ seat), and the exact command is shown before it runs.
 ```
 hands/
 ├── SKILL.md        the short guide agent hosts read
-├── hands.sh        the command line, the quota check, the seat contract, --selftest
+├── hands.sh        the command line, the seat contract, --selftest
 ├── seat.py         the engine: the wire table, the wrapper, the verbs, the envelope writer
 ├── acp.py          the ACP client (Grok, OpenCode) and the event vocabulary all wires share
 ├── quota.sh        the quota gauges (--json, --selftest)
@@ -373,7 +339,7 @@ hands/
 ## Design
 
 1. **Every seat has full access.** A seat that can't run commands can't verify its work. Isolation
-   comes from the `--cwd` (and optionally `--sandbox`), never from a read-only mode.
+   comes from the `--cwd`, never from a read-only mode.
 2. **Typed failure over retry loops.** Quota errors carry their reset time; waiting beats polling.
 3. **The job dir is the only state.** No daemon, no registry, no cache: a relaunch reads the
    handle, the events file is the truth, and `stop` still writes the envelope.
