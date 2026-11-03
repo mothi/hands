@@ -278,9 +278,13 @@ while True:
         park()
     elif mode == 'count':
         res('turn %d pid %d' % (t, os.getpid()))
-    elif mode == 'slow':   # a turn still running when the next line arrives
+    elif mode == 'slow':   # a turn still running when the next line arrives; STUB_FAIL: it then fails
         time.sleep(float(env('STUB_SLEEP', 2)))
-        res('turn %d pid %d' % (t, os.getpid()))
+        if env('STUB_FAIL'):
+            out({'type': 'result', 'subtype': 'error_during_execution', 'is_error': True, 'errors': ['API Error: 500'],
+                 'session_id': sid})
+        else:
+            res('turn %d pid %d' % (t, os.getpid()))
     elif mode == 'echo':   # the answer is the message itself: the row chooses its bytes
         res(json.loads(line)['message']['content'][0]['text'])
     elif mode == 'quoted':

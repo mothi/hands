@@ -31,9 +31,9 @@ import json, math, os, re, shutil, signal, subprocess, sys, tempfile, time
 
 import quota
 import seat
+import wires
 
 SEAT_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'seat.py')
-PROVIDERS = ('claude', 'codex', 'grok', 'opencode')
 
 # The seat contract. It heads every buy's prompt (a probe's ping too) and names no job dir, so
 # every seat's prompt shares one prefix through the task: the provider's prompt cache can reuse it.
@@ -141,7 +141,7 @@ def buy(spec, prompt_file, options):
         f.write(SEAT_BOX.encode() + b'\n' + task + b'\n' + seat_line(job_dir).encode())
     for name in ('inbox.jsonl', 'outbox.jsonl'):
         open(os.path.join(job_dir, name), 'a').close()
-    if provider not in PROVIDERS:   # a typo, or a provider hands has no wire for (gemini)
+    if provider not in wires.PROVIDERS:   # a typo, or a provider hands has no wire for (gemini)
         say("unknown provider '%s' (claude|codex|grok|opencode)" % provider)
         emit(job_dir, 'error', provider, model, 2, options)
         return 2
@@ -247,7 +247,7 @@ def probe(which):
     Claude's ping also refreshes the quota board: its stream's rate_limit_event is the claude
     reading. A probe never pushes into the driver's session."""
     env = {k: v for k, v in os.environ.items() if not k.startswith('CLAUDE_CODE_MESSAGING_')}
-    providers = PROVIDERS if which == 'all' else which.split()
+    providers = list(wires.PROVIDERS) if which == 'all' else which.split()
     seat.sweep()
     rc = 0
     with tempfile.NamedTemporaryFile('w', prefix='hands-probe.', delete=False) as ping:

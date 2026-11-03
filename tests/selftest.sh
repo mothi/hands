@@ -13,7 +13,7 @@ sys.stdout.write(hands.seat_line(sys.argv[2]))' "${HANDS%/*}" "$1"; }
 
 run_selftest() {
   local HERE PASS=0 FAIL=0 SB SBP
-  HERE="${HANDS%/*}"   # the repo root: hands.py, seat.py, acp.py, quota.py
+  HERE="${HANDS%/*}"   # the repo root: hands.py, seat.py, wires.py, quota.py
   SB="$(mktemp -d "${TMPDIR:-/tmp}/hands-selftest.XXXXXX")"
   SBP="$(cd "$SB" && pwd -P)"   # as a wrapper's argv names its dir: a row looks up its own seat, never another suite's
   unset CODEX_ARGV_LOG  # externally-exported sentinels must not reach stub calls
@@ -88,7 +88,7 @@ run_selftest() {
   t 07b "a non-empty --out is refused (rc 2, named): the user's file stays and nothing is written beside it" \
     sh -c "[ $R07B -eq 2 ] && grep -q 'is not empty' '$SB/o7b.err' && [ \"\$(ls -A '$SB/o7b')\" = notes.txt ] && [ \"\$(cat '$SB/o7b/notes.txt')\" = keep ]"
 
-  # grok + opencode are ACP seats (seat.py + acp.py). ONE fake agent answers both: test_acp.py --fake
+  # grok + opencode are ACP seats (seat.py + wires.py). ONE fake agent answers both: test_acp.py --fake
   # replays a recorded transcript request by request (a method out of order exits 3). Seams: ACP_REPLAY
   # (default: that CLI's recorded 4-turn seat, fixtures/*-acp-seat-sample.jsonl, minus the client's
   # cancel, so its turn 3 ends cancelled by itself), ACP_MODE, ACP_REC (the client lines it received),
@@ -183,9 +183,9 @@ def cancelled(d, n, how):   # synthetic: the agent left its tool open, the clien
                  else (use[0].get('usage_unknown') is True and env['usage'] is None)))
 def onefile(d, n, here):   # the raw wire reports the edit twice (translate alone yields two file events); the seat records one
     sys.path.insert(0, here)
-    import acp
+    import wires
     ups = [(r['msg'].get('params') or {}).get('update') for r in map(json.loads, open(J(d, 'stream.jsonl'))) if r['dir'] == 'in' and isinstance(r['msg'], dict)]
-    raw = [x for u in ups if isinstance(u, dict) and 'sessionUpdate' in u for x in acp.translate(u, 0) if x['kind'] == 'file']
+    raw = [x for u in ups if isinstance(u, dict) and 'sessionUpdate' in u for x in wires.translate(u, 0) if x['kind'] == 'file']
     got = [e for e in evs(d) if e['kind'] == 'file' and e['turn'] == int(n)]
     return len(raw) == 2 and len(got) == 1 and (got[0]['call'], got[0]['path']) == (raw[0]['call'], raw[0]['path'])
 def resumed(d, ack, rec, argv, sid):
@@ -654,7 +654,7 @@ for l in open(sys.argv[1]):
   stub_run send "$SB/a112" "$SB/q81.md" >"$SB/a112.sent" 2>/dev/null; stub_run wait "$SB/a112" --timeout 30 >/dev/null 2>&1; stub_run stop "$SB/a112" >/dev/null 2>&1
   t 112 "a send WHILE an ACP turn runs queues (ACP v1 has no mid-turn input): acked sent, expect 2, delivery queue at once; its marker lands in events.jsonl before turn 1 ends; turn 2 opens only after turn 1's turn_end; both ok on ONE agent" \
     python3 "$SB/chk.py" queued "$SB/a112" "$SB/a112.sent"
-  # CODEX SEATS: one `codex app-server` per launch (JSON-RPC on stdio, acp.Rpc): thread/start, or thread/resume on the
+  # CODEX SEATS: one `codex app-server` per launch (JSON-RPC on stdio, wires.Rpc): thread/start, or thread/resume on the
   # recorded thread at a relaunch; every line is a turn/start the app-server steers into the open turn or opens the next
   # with. test-stub.py answers as the app-server (CX_* seams); fixtures/codex-appserver-sample.jsonl is a real wire,
   # sanitized (fixtures/README.md).
@@ -1091,6 +1091,16 @@ STUB
   stub_run stop "$SB/p137" >/dev/null 2>&1
   t 137 "A SEND TO A BUSY SEAT NEVER CANCELS ITS TURN -- stdin (claude, steer), acp (grok, queue); rpc (codex, steer) is row 117: turn 1 ends ok (rc 0) with its own answer, the busy send's message is answered after it as turn 2, on no extra launch (one CLI process), and no cancel reaches the CLI (only user lines on claude's stdin, then the stop's EOF; no session/cancel on the ACP wire)" \
     sh -c "python3 '$SB/chk.py' nocancel '$SB/p137' 1 '$SB/p137.stdin' && python3 '$SB/chk.py' nocancel '$SB/a112' 1 '$SB/a112.rec'"
+  # 209: THE STOP'S rc IS FOR THE TURNS IT CUT. Each stub ends its turn 1 s in; the stop comes first, so the end lands
+  # while the stop closes the CLI. An ok answer keeps rc 0; a failure is the stop's (incomplete, rc 143), as on codex.
+  # Falsification: every turn closed after a stop reads its rc -> the ok turn reads 143; claude's turns read no rc ->
+  # the failed one reads 1
+  CL_STUB_MODE=slow CL_STUB_SLEEP=1 stub_run start --cwd "$SB/tmp" --out "$SB/p209" claude:sonnet "$SB/q.md" >/dev/null 2>&1
+  stub_run stop "$SB/p209" >/dev/null 2>&1
+  CL_STUB_MODE=slow CL_STUB_SLEEP=1 CL_STUB_FAIL=1 stub_run start --cwd "$SB/tmp" --out "$SB/p209f" claude:sonnet "$SB/q.md" >/dev/null 2>&1
+  stub_run stop "$SB/p209f" >/dev/null 2>&1
+  t 209 "THE STOP'S rc IS FOR THE TURNS IT CUT: a claude turn whose ok answer lands while a stop closes its CLI is ok, rc 0, with its answer; one that fails then is the stop's: incomplete, rc 143" \
+    sh -c "jq -e '.status==\"ok\" and .rc==0' '$SB/p209/turn-1/envelope.json' >/dev/null && grep -q '^turn 1 pid' '$SB/p209/turn-1/result.txt' && jq -e '.status==\"incomplete\" and .rc==143' '$SB/p209f/turn-1/envelope.json' >/dev/null && grep -q 'API Error: 500' '$SB/p209f/events.jsonl'"
   t 131 "events --follow ENDS WITH THE SEAT: following a live seat, it exits (rc 0) within 2 s of stop, after draining the file (the stopped turn's incomplete turn_end is its last news) -- no wrapper alive is the one signal, no new state" \
     python3 "$SB/chk.py" follows "$HANDS" "$SB/p131"
   # THE TWO DELIVERY RACES (stub tests first, then the fixes). 138: a send killed mid-write leaves a

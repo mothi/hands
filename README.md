@@ -107,7 +107,7 @@ provider spec, then the prompt file. The other verbs take the job dir first
 
 ## Providers
 
-One wire-table entry each (`WIRES` in `seat.py`). Model ids pass through untouched and the CLI
+One entry each in the provider table (`PROVIDERS` in `wires.py`). Model ids pass through untouched and the CLI
 validates them, so a model released tomorrow works today.
 
 | Provider | Models | How hands drives it | Access | Login |
@@ -312,8 +312,8 @@ hands/
 ├── SKILL.md        the short guide agent hosts read
 ├── hands.sh        the launcher: runs hands.py
 ├── hands.py        the command line: flags, the job dir and its handle, the seat box, the probe
-├── seat.py         the engine: the wire table, the wrapper, the verbs, the envelope writer
-├── acp.py          the ACP client (Grok, OpenCode) and the event vocabulary all wires share
+├── seat.py         the engine: the wrapper, the verbs, the envelope writer
+├── wires.py        the provider table: each CLI's launch, handshake and translation, the JSON-RPC client
 ├── quota.py        the quota board behind hands.sh quota
 └── tests/
     ├── selftest.sh     the hermetic suite for hands.py and seat.py

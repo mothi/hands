@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """seat.py -- hands' engine: a seat is a job dir with a live CLI process in it. python3 stdlib only.
 
-hands.py keeps the grammar and the SEAT BOX; seat.py runs everything after launch. WIRES names each provider's family and delivery; each wire translates its stream into
-DIR/events.jsonl, and everything downstream of the events is one rule (Seat.finish).
+hands.py keeps the grammar and the SEAT BOX; seat.py runs everything after launch. wires.py launches each provider's
+CLI and translates its stream into DIR/events.jsonl; everything downstream of the events is one rule (Seat.finish).
   spawn DIR MSG   detach the wrapper: it delivers MSG as the next turn and runs the seat until the CLI exits
   send DIR FILE   the next turn to the LIVE seat (rc 3: none is live -- hands.py relaunches it)
   mail DIR TEXT   append a driver line to DIR/inbox.jsonl
@@ -12,8 +12,8 @@ Job dir: session (the handle) prompt.txt in.fifo stream.jsonl stderr.log events.
 turn-N/{result.txt,envelope.json} envelope.json result.txt driver job.log
 """
 import errno, fcntl, json, os, re, select, shutil, signal, socket, stat, subprocess, sys, time
-import acp
-from acp import Turn, clip, event, now, small, usage   # the vocabulary every wire shares: one copy, in acp.py
+import wires
+from wires import clip, event, jparse, now, rec   # the vocabulary every wire shares: one copy, in wires.py
 
 HERE, J = os.path.dirname(os.path.abspath(__file__)), os.path.join
 # THE JOBS ROOT, its one copy: every job dir hands.py names itself (a buy without --out, a probe) lives in
@@ -24,14 +24,6 @@ XDG = os.environ.get('XDG_STATE_HOME', '')
 JOBS = J(XDG if os.path.isabs(XDG) else J(os.path.expanduser('~'), '.local', 'state'), 'hands')
 KEEP = 30 * 86400
 NAMED = re.compile(r'\d{8}-\d{6}-[a-z]+-\d+|probe-\d+-[a-z]+')   # the names hands.py gives there (buy, probe)
-# THE WIRE TABLE: provider -> (family, delivery). The wrapper reads DIR/in.fifo for every family: stdin feeds the CLI's
-# stdin, acp (acp.py) runs a turn per line, rpc (codex's app-server on acp.Rpc) starts or steers a turn per line. steer:
-# a send joins the running turn; queue: it waits (ACP v1 has no mid-turn input)
-WIRES = {'claude': ('stdin', 'steer'), 'grok': ('acp', 'queue'), 'opencode': ('acp', 'queue'), 'codex': ('rpc', 'steer')}
-# NO PERSONAL HOOKS: every seat runs its CLI with the user's hooks off -- hooks are
-# the user's code, written for the user's own sessions. Each launch names its CLI's own
-# switch: claude disableAllHooks (launch), codex --disable hooks (codex_argv), grok its claude- and cursor-hook scanners
-# (acp.recipe). opencode runs no claude hooks; its plugins have no switch short of its whole config dir (SKILL.md)
 NOTE = ('turn-N/result.txt + envelope.json land at each turn_end (absent = not finished, never finished-empty); '
         'liveness = the age of the last events.jsonl line, or an open tool_call; next: hands.sh '
         'wait|send|mail|events|stop <dir> -- stop a seat with hands.sh stop, never by killing the wrapper')
@@ -74,13 +66,6 @@ def jload(path):
             return json.load(f)
     except (OSError, ValueError):
         return None
-
-
-def jparse(line):
-    try:
-        return json.loads(line)
-    except ValueError:
-        return line
 
 
 def since(path, off, n=4000):   # the last n bytes past off, as text (a torn last line included)
@@ -148,238 +133,6 @@ def envelope(d, status, prov, model, rc, secs, reset, use, effort, **more):
     if env.get('turn'):
         put(J(d, 'turn-%d' % env['turn'], 'envelope.json'), text)
     put(J(d, 'envelope.json'), text)
-
-
-# ---------- the stdin and rpc wires' entries: launch, the in.fifo line, the translators (class Wire)
-def launch(h):   # claude: one process for the whole seat -> (argv, env)
-    m, e, sid = h.get('model'), h.get('effort'), h.get('session')
-    # Every seat runs bypassPermissions: full access, as the caller. Background tasks OFF: a turn left waiting on one
-    # parks. ONE settings source, --settings: the seat refuses other sessions' cross-session messages (its own inbox
-    # socket stays bound and drops them).
-    # LEAN (measured on paired haiku buys, prefix 36693 -> 33998 tokens): --strict-mcp-config, no host
-    # MCP servers (their tool schemas cost every call); --exclude-dynamic-system-prompt-sections, cwd, env and git
-    # status move into the first message, so the system prompt is shared across folders; auto-memory OFF, no
-    # memory section and no memory folder (a seat whose cwd is the driver's repo would get the driver's own).
-    # This is the ONE claude launch: start and every relaunch send the same flags, so a resume never re-creates
-    # the cached prefix. NO PERSONAL HOOKS (above): disableAllHooks in the one settings source
-    st = {'crossSessionInbound': 'refuse', 'disableAllHooks': True}
-    a = ['claude', '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--model', m or 'sonnet',
-         '--settings', json.dumps(st, separators=(',', ':')), '--strict-mcp-config', '--exclude-dynamic-system-prompt-sections']
-    a += (['--effort', e] if e else []) + ['--permission-mode', 'bypassPermissions']
-    return a + (['--resume', sid] if sid else []), \
-        {'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS': '1', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1'}
-
-
-def codex_argv(h):   # codex: ONE app-server process per launch, over stdio (codex-cli 0.160), all root
-    # options. --no-daemon: the seat never runs through the user's shared app-server daemon; --disable memories: no user
-    # memory is read or written (the twin of claude's auto-memory off); --disable hooks: NO PERSONAL HOOKS
-    # (above); web_search live: the live search exec's --search gave (app-server reads no --search: its config/read shows
-    # web_search null either way). The cwd, sandbox, model and approvals ride the thread (codex_open), the effort each
-    # turn/start (Seat.rpc_turn)
-    return [h.get('cli') or 'codex', '--no-daemon', '--disable', 'memories', '--disable', 'hooks', '-c', 'web_search="live"', 'app-server']
-
-
-def codex_open(h, rpc):   # the app-server handshake -> the seat's thread: initialize, initialized, then thread/start -- or,
-    # for a seat that has one, thread/resume (a thread has no rollout to resume before its first turn).
-    # Every seat runs danger-full-access, approvals never (no one answers them).
-    # Never ephemeral: a thread with no session files cannot resume. No fallback model: without one, config.toml's runs
-    rpc.ask('initialize', {'clientInfo': {'name': 'hands', 'version': '2'}})
-    rpc.notify('initialized')
-    p = {'cwd': h['cwd'], 'sandbox': 'danger-full-access', 'approvalPolicy': 'never'}
-    p.update({'model': h['model']} if h.get('model') else {})
-    r = rpc.ask('thread/resume', dict(p, threadId=h['session'])) if h.get('session') else rpc.ask('thread/start', dict(p, ephemeral=False))
-    tid = (r.get('thread') or {}).get('id')
-    if not tid:
-        raise acp.AcpError('the app-server answered the thread without its id')
-    return tid
-
-
-def user_line(prov, text):   # the in.fifo line: claude's own stdin shape, else the one the JSON-RPC wrappers read (said())
-    if prov == 'claude':
-        return {'type': 'user', 'message': {'role': 'user', 'content': [{'type': 'text', 'text': text}]}}
-    return {'message': {'content': text}}
-
-
-def said(ln):   # a JSON-RPC wrapper's in.fifo record -> the text it delivers
-    o = jparse(ln.decode('utf-8', 'replace'))
-    return o['message']['content'] if isinstance(o, dict) and isinstance(o.get('message'), dict) else str(o)
-
-
-CODEX_TOOLS = {'commandExecution': ('shell', 'command'), 'fileChange': ('apply_patch', 'changes'),
-               'webSearch': ('web_search', 'query'), 'mcpToolCall': (None, 'arguments')}
-FILE_TOOLS = {'Edit': 'file_path', 'Write': 'file_path', 'MultiEdit': 'file_path', 'NotebookEdit': 'notebook_path'}
-
-
-def rec(turn, status, text='', use=None, final='none', errtext='', session=None, t0=None, extra=None):
-    """A closed turn, as every wire hands it to finish(); extra = usage-event fields (usage_unknown, cost_usd)."""
-    return {'turn': turn, 'status': status, 'text': text or '', 'usage': use, 'final': final, 'errtext': errtext,
-            'session': session, 't0': t0, 'extra': extra or {}}
-
-
-def plus(a, b):   # two raw usage reports summed field by field, over the fields of either (a call may omit one)
-    a, b = a or {}, b or {}
-    return {f: a.get(f, 0) + b.get(f, 0) for f in set(a) | set(b)
-            if type(a.get(f, 0)) in (int, float) and type(b.get(f, 0)) in (int, float)}
-
-
-class Wire:
-    """One translator per stdin/rpc wire, the method named after its provider: feed(obj) emits events through
-    put() and returns the turn records the wire closed (usually none, sometimes one). ACP translates in acp.py."""
-    def __init__(w, prov, base, session, put, pending):
-        # notes + calls + tid: codex's error notices (they type a turn that ends unmarked), the items it opened, and the
-        # open turn's own id. spent: what claude's total_cost_usd held before this turn (cumulative over its process: a
-        # recorded 3-turn seat), so a turn's cost is the step
-        w.prov, w.turn, w.base, w.session, w.put, w.pending, w.cur = prov, base, base, session, put, pending, None
-        w.notes, w.calls, w.spent, w.tid = [], {}, 0, None
-
-    def ev(w, kind, **kw):
-        w.put(event(kind, w.turn, **kw))
-
-    def start(w):
-        cut = [w.cut()] if w.cur else []   # a new turn began with no end marker for the open one
-        w.turn, w.cur = w.turn + 1, Turn()
-        w.ev('turn_start', session=w.session)
-        return cut
-
-    def ensure(w):   # a line that belongs to a turn: after a turn_end only a delivered message opens one
-        return [] if w.cur else w.start() if w.turn == w.base or w.pending() else None
-
-    def end(w, status, text, use, final, errtext='', turn=None, extra=None):
-        t0, w.cur, w.tid = (w.cur.t0 if w.cur else None), None, None
-        return rec(turn or w.turn, status, text, use, final, errtext, w.session, t0, extra)
-
-    def cut(w, turn=None):   # the stream stopped inside (or before) a turn: no end marker, no answer; the usage it
-        # reported so far, in the envelope's fields as a turn_end's is
-        return w.end('incomplete', '', usage(w.cur.usage, w.prov) if w.cur else None, 'none', '\n'.join(w.notes), turn=turn)
-
-    def stray(w, what):
-        w.ev('progress', text='%s belongs to no open turn (the last was turn %d): not a turn' % (what, w.turn))
-        return []
-
-    def tool_call(w, name, call, inp):
-        w.ev('tool_call', tool=name, call=call, input=small(inp))
-        key = FILE_TOOLS.get(name)
-        if key and isinstance(inp, dict) and inp.get(key):
-            w.ev('file', path=inp[key], tool=name, call=call)
-        w.cur.tool()
-
-    def feed(w, o):
-        return getattr(w, w.prov)(o)
-
-    def claude(w, o):
-        ty, st = o.get('type'), o.get('subtype')
-        if ty == 'system' and st == 'init':            # stdin mode re-sends init at every turn
-            w.session = o.get('session_id') or w.session
-            return w.start()
-        if ty not in ('assistant', 'user', 'result', 'tool_progress'):
-            w.ev('progress', text='%s%s' % (ty, '/' + st if st else ''))
-            return []
-        recs = w.ensure()
-        if recs is None:
-            return w.stray(ty)
-        if ty == 'result':                              # .result is the answer only when is_error is false
-            w.session = o.get('session_id') or w.session
-            bad = bool(o.get('is_error')) or st not in (None, 'success')
-            etxt = ' '.join(str(o[k]) for k in ('result', 'errors', 'api_error_status', 'terminal_reason') if o.get(k)) if bad else ''
-            if bad:
-                w.ev('error', text=clip(etxt or st))
-            status = 'error' if bad else ('truncated' if o.get('stop_reason') == 'max_tokens' else 'ok')
-            text = o.get('result') if status == 'ok' and isinstance(o.get('result'), str) else ''
-            tot, cost = o.get('total_cost_usd'), None
-            if type(tot) in (int, float):
-                cost, w.spent = round(tot - w.spent, 10), tot
-            return recs + [w.end(status, text, usage(o.get('usage'), 'claude'), 'field', etxt,
-                                 extra=None if cost is None else {'cost_usd': cost})]
-        if ty == 'tool_progress':
-            w.ev('progress', tool=o.get('tool_name'), call=o.get('parent_tool_use_id'), text='heartbeat %ss' % o.get('elapsed_time_seconds'))
-            return recs
-        cont = (o.get('message') or {}).get('content')
-        if isinstance(cont, str):
-            w.ev('progress', text='user message: ' + clip(cont, 120))
-        for c in cont if isinstance(cont, list) else []:
-            ct = c.get('type') if isinstance(c, dict) else None
-            if ct == 'text':
-                w.ev('text', text=c.get('text', ''))
-            elif ct == 'thinking':
-                w.ev('thought', text=c.get('thinking', ''))
-            elif ct == 'tool_use':
-                w.tool_call(c.get('name'), c.get('id'), c.get('input'))
-            elif ct == 'tool_result':
-                w.ev('tool_result', call=c.get('tool_use_id'), output=clip(c.get('content')), status='error' if c.get('is_error') else 'ok')
-            else:
-                w.ev('progress', text='%s block %s' % (ty, ct))
-        return recs
-
-    def codex(w, o):   # app-server notifications: discrete items, the answer = the LAST agentMessage. Every item, usage and
-        # end names its thread and turn: another thread's (a collaborator codex spawned reports over this connection,
-        # codex-plugin-cc) is never the seat's text, calls or turns -- while a seat turn is open its calls are that turn's
-        # spend and each of its items and turns a progress line (the seat is alive; no payload) -- and what arrives for a
-        # turn that is not the open one (a command codex finishes after its turn completed) takes the
-        # stray path, never a later turn's. Deltas, statuses, startup and account chatter stay raw (stream.jsonl): each
-        # item lands whole at item/completed
-        m, p = o.get('method'), o.get('params') if isinstance(o.get('params'), dict) else {}
-        it, tid = p.get('item') if isinstance(p.get('item'), dict) else {}, p.get('turnId') or (p.get('turn') or {}).get('id')
-        if p.get('threadId') not in (None, w.session):
-            if w.cur is not None and m == 'thread/tokenUsage/updated':
-                w.cur.usage = plus(w.cur.usage, (p.get('tokenUsage') or {}).get('last'))
-            elif w.cur is not None and m in ('item/completed', 'turn/started', 'turn/completed'):
-                w.ev('progress', text=' '.join(x for x in ('collaborator', m, it.get('type')) if x))
-            return []
-        if m == 'turn/started':
-            recs = w.start()
-            w.tid, w.notes, w.calls = tid, [], {}
-            return recs
-        if m == 'error':   # a notice (a retry among them), never a failure by itself: turn/completed failed is the failure
-            e = p.get('error') if isinstance(p.get('error'), dict) else {}
-            w.notes.append(' '.join(str(x) for x in (e.get('message'), e.get('codexErrorInfo')) if x))
-            w.ev('progress', text='error notice: ' + clip(w.notes[-1], 200))
-            return []
-        if m not in ('item/started', 'item/completed', 'thread/tokenUsage/updated', 'turn/completed', 'turn/plan/updated'):
-            return []
-        if w.cur is None or tid != w.tid:
-            return w.stray(' '.join(x for x in (m, it.get('type')) if x))
-        k, iid = it.get('type'), it.get('id')
-        if m == 'thread/tokenUsage/updated':   # one per model call (probe: turn 1 sent two, 17274 + 17325 = its total
-            # 34599): `last` is that call's, so the turn's usage is their sum; `total` is the thread's
-            w.cur.usage = plus(w.cur.usage, (p.get('tokenUsage') or {}).get('last'))
-        elif m == 'turn/completed':
-            t = p.get('turn') or {}
-            st, e = t.get('status'), t.get('error') if isinstance(t.get('error'), dict) else {}
-            text, use = w.cur.final(), usage(w.cur.usage, 'codex')
-            if st == 'completed':
-                return [w.end('ok', text, use, 'boundary')]
-            why = ' '.join(str(x) for x in (e.get('message'), e.get('codexErrorInfo')) if x) or 'turn %s' % st
-            if st != 'interrupted':
-                w.ev('error', text=clip(why))
-            return [w.end('cancelled' if st == 'interrupted' else 'error', '', use, 'boundary', '\n'.join(w.notes + [why]))]
-        elif m == 'turn/plan/updated':
-            w.ev('progress', text=clip('plan: ' + '; '.join('[%s] %s' % (x.get('status'), x.get('step'))
-                                                            for x in p.get('plan') or [] if isinstance(x, dict)), 300))
-        elif k == 'agentMessage' and m == 'item/completed':
-            w.ev('text', text=it.get('text', ''))
-            w.cur.text(iid, it.get('text', ''))
-            w.cur.boundary()
-        elif k == 'reasoning' and m == 'item/completed':
-            said = ' '.join(it.get('summary') or it.get('content') or [])
-            if said:
-                w.ev('thought', text=said)
-        elif k in CODEX_TOOLS:
-            name, field = CODEX_TOOLS[k]
-            name, inp = name or '%s/%s' % (it.get('server'), it.get('tool')), it.get(field)
-            if iid not in w.calls:   # an item first seen at its completion still opens its call
-                w.calls[iid] = inp
-                w.tool_call(name, iid, inp)
-            if m == 'item/completed':   # webSearch reports no status; its query may arrive only here
-                bad = it.get('status') in ('failed', 'declined') or it.get('exitCode') not in (None, 0) or it.get('error')
-                w.ev('tool_result', tool=name, call=iid, status='error' if bad else 'ok', input=None if w.calls[iid] else small(inp),
-                     output=clip(it.get('aggregatedOutput') or it.get('result') or it.get('error')))
-                for ch in it['changes'] if k == 'fileChange' and isinstance(it.get('changes'), list) else []:
-                    if isinstance(ch, dict) and ch.get('path'):
-                        w.ev('file', path=ch['path'], tool=name, call=iid)
-                w.cur.tool()
-        elif k not in ('userMessage', None) and m == 'item/completed':   # the input itself is its delivery marker
-            w.ev('progress', text=clip('item %s' % k, 200))
-        return []
 
 
 # ---------- processes: the wrapper is found by its argv, the seat by the process groups under it
@@ -530,10 +283,6 @@ def reaped_argv(secs, argv):   # every seat CLI, and opencode's session delete, 
     return [sys.executable, J(HERE, 'seat.py'), 'reap', str(0 if secs == INF else max(1, int(secs)))] + argv
 
 
-def reaped(secs, argv, **kw):
-    return subprocess.Popen(reaped_argv(secs, argv), **kw)
-
-
 def rcode(rc):   # a process a signal ended reads 128 + N, as the reaper reports it
     return rc if rc is None or rc >= 0 else 128 - rc
 
@@ -626,7 +375,7 @@ def marker(d, text, expect, turn, **mail):   # THE delivery marker (a send, MSG,
 
 
 def record(prov, text):   # a message as one in.fifo line
-    return json.dumps(user_line(prov, text), ensure_ascii=False).encode()
+    return json.dumps(wires.user_line(prov, text), ensure_ascii=False).encode()
 
 
 def deliver(d, prov, fd, text, expect, turn):   # a send's delivery, through in.fifo. The record is framed LF + line + LF:
@@ -654,7 +403,8 @@ def whole(d, lines):   # in.fifo -> the records to deliver: whole JSON-object li
 class Seat:
     """The wrapper: it outlives the CLI, owns the translation, and writes every turn's envelope."""
     def __init__(s, d, h, msg, ready):
-        s.d, s.h, s.msg, s.ready, s.prov, (s.fam, s.delivery) = d, h, msg, ready, h['provider'], WIRES[h['provider']]
+        s.d, s.h, s.msg, s.ready, s.prov = d, h, msg, ready, h['provider']
+        s.fam, s.delivery = wires.PROVIDERS[s.prov][:2]
         s.errs, s.mail_off, s.wfd, s.W = [], size(J(d, 'outbox.jsonl')), None, None
         s.seen, s.halt, s.late = -1, False, False   # halt: a stop; late: the deadline
         # inq: the records the CLI is to get next, in order (in.fifo's, then the wrapper's own); ibuf: in.fifo's torn tail;
@@ -787,76 +537,70 @@ class Seat:
         # would have, so this launch numbers its turns past every marker already written (else a wait counts to the wrong turn)
         s.finish([rec(n, 'incomplete', session=h.get('session')) for n in range(st.end + 1, st.expect + 1)], None)
         s.first = State(d).read().next_turn(s.delivery, False)
+        deadline = s.limit()
+        # THE POLITE CLOSE (every wire), at the deadline and at a stop alike: the wrapper ends the CLI itself, with
+        # Cli.close (stdin EOF first, TERM only after its grace) -- opencode keeps a turn's execution claim on a TERM and
+        # releases it on a polite close (opencode 2.0.22); codex's app-server reaps its commands on EOF, which an interrupt
+        # alone does not (codex-cli 0.160), so a codex turn in flight is interrupted first. The reaper is a backstop 10 s
+        # past the deadline: it ends the CLI's group itself if the wrapper's close has not
+        wrap = lambda argv: reaped_argv(deadline + 10 - time.time(), argv)
+        if s.fam != 'acp':   # claude and codex translate on one Wire for the whole launch; ACP per turn (acp_turn)
+            s.W = wires.Wire(s.prov, s.first - 1, h.get('session'), s.put, s.pending)
+        seat, why = wires.launch(h, wrap, s.log, J(d, 'stderr.log'), s.feed)
+        if why:
+            return s.early(*why, seat=seat)
+        if s.W and seat.session_id:   # codex: the thread its handshake started or resumed
+            s.W.session = seat.session_id
+        s.fifo()
+        s.waiting, s.n, s.asked = [], s.first, False
+        while not s.halt and seat.proc.poll() is None and time.time() < deadline:
+            s.tick()
+            s.waiting += s.inq
+            s.inq = []
+            s.hand_on(seat)
+            r, w = seat.fds()
+            r, w, _ = select.select(r + [s.rfd], w, [], 0.5)
+            seat.ready(r, w)
+            if s.rfd in r:
+                s.read_fifo()
+        s.late = seat.proc.poll() is None and time.time() >= deadline   # set BEFORE the close the turn reads it in
+        if seat.proc.poll() is None and s.W and s.W.tid:   # codex outlived the loop: the deadline or a stop ends its turn
+            try:
+                seat.call('turn/interrupt', {'threadId': s.W.session, 'turnId': s.W.tid}, 5)
+            except wires.AcpError:
+                pass
+        s.letgo(s.rfd)
+        rc = s.cut(rcode(seat.close(2)))   # close() answers a prompt whose pipe an escaped child still holds
+        s.mail()                           # the lines still waiting were delivered and never run: the close-out types them
+        s.close_out(rc, s.W)
+
+    def log(s, line, way):   # stream.jsonl: claude's stdout verbatim; every JSON-RPC line, both ways, stamped
         if s.fam != 'stdin':
-            return s.queued()
-        argv, env = launch(h)
-        rfd = s.fifo()
-        with open(J(d, 'stderr.log'), 'ab') as ef:   # the wrapper is the ONE writer of the CLI's stdin (pump)
-            p = reaped(s.limit() - time.time(), argv, stdin=subprocess.PIPE,
-                       stdout=subprocess.PIPE, stderr=ef, cwd=h['cwd'], env=dict(os.environ, **env))
-        s.W = W = Wire(s.prov, s.first - 1, h.get('session'), s.put, s.pending)
-        rc = s.pump(p, W, rfd)
-        s.letgo(rfd)
-        return s.close_out(s.cut(rc), W)
+            append(J(s.d, 'stream.jsonl'), {'t': now(), 'dir': way, 'msg': jparse(line)})
+        elif way == 'in':
+            with open(J(s.d, 'stream.jsonl'), 'ab') as f:
+                f.write(line.encode() + b'\n')
 
-    def pump(s, p, W, rfd):   # the CLI's stdout -> events; in.fifo's whole records -> its stdin, until a stop closes it
-        fd, buf, gone, closed = p.stdout.fileno(), b'', None, None
-        obuf, cin = b'', p.stdin.fileno()
-        os.set_blocking(cin, False)   # a CLI that is not reading never stalls its own stdout
-        with open(J(s.d, 'stream.jsonl'), 'ab') as raw:
-            while True:
-                if closed is None:
-                    s.tick()
-                    obuf += b''.join(ln + b'\n' for ln in s.inq)
-                    s.inq = []
-                if s.halt and closed is None:   # a stop: the close Rpc.close makes -- stdin EOF, then TERM at 2 s and KILL
-                    closed, obuf = time.time(), b''   # at 4 s for the seat's groups (the reaper sits in the wrapper's own)
-                    p.stdin.close()
-                if closed and time.time() - closed > 2:
-                    term(seat_groups([os.getpid()]), signal.SIGTERM if time.time() - closed < 4 else signal.SIGKILL)
-                r, w, _ = select.select([fd] if closed else [fd, rfd], [cin] if obuf else [], [], 1.0)
-                if rfd in r:
-                    s.read_fifo()
-                if w:
-                    try:
-                        obuf = obuf[os.write(cin, obuf):]
-                    except BlockingIOError:
-                        pass
-                    except OSError:   # the CLI closed its stdin: what it never read, close-out types
-                        obuf = b''
-                if fd in r:
-                    chunk = os.read(fd, 65536)
-                    if not chunk:
-                        break
-                    raw.write(chunk)
-                    raw.flush()
-                    *done, buf = (buf + chunk).split(b'\n')
-                    for ln in done:
-                        s.line(ln, W)
-                elif p.poll() is not None:   # the reaper is done; an escaped grandchild may still hold the pipe
-                    gone = gone or time.time()
-                    if time.time() - gone > 2:
-                        break
-        if buf.strip():
-            s.line(buf, W)
-        p.stdin.close()
-        rc = p.wait()
-        s.mail()
-        return rc
+    def hand_on(s, seat):   # the lines waiting -> the CLI. claude takes each at once (it queues or steers them itself);
+        # an ACP agent one prompt at a time (ACP v1 has no queue), turn `n` next; codex one turn/start at a time, each sent
+        # once the last is answered (`asked`), so it steers the turn its predecessor started
+        if s.fam == 'stdin' and s.waiting:
+            seat.write(b''.join(ln + b'\n' for ln in s.waiting))
+            s.waiting = []
+        elif s.fam == 'acp' and s.waiting and not seat.busy():
+            s.acp_turn(seat, s.n, wires.said(s.waiting.pop(0)))
+            s.n += 1
+        elif s.fam == 'rpc' and s.waiting and not s.asked:
+            s.rpc_turn(seat, s.waiting.pop(0))
 
-    def line(s, ln, W):
-        txt = ln.decode('utf-8', 'replace')
-        o = jparse(txt)
+    def feed(s, o):   # what the CLI said (a claude stdout line; a codex notification) -> its events, and the turns it
+        # closed through finish; a stream error that closed none is pushed
         if not isinstance(o, dict):
-            if txt.strip():
-                W.ev('progress', text='non-JSON line: ' + clip(txt, 120))
+            s.W.ev('progress', text='non-JSON line: ' + clip(o, 120))
             return
-        s.feed(o, W, None)
-
-    def feed(s, o, W, rc):   # one stream object (a stdout line; an rpc notification) -> its events, and the turns it closed
-        s.errs = []          # through finish; a stream error that closed none is pushed
-        recs = W.feed(o)
-        s.finish(recs, rc)
+        s.errs = []
+        recs = s.W.feed(o)
+        s.finish(recs, s.cut(None))
         for e in s.errs if not recs else []:
             push(s.d, s.h, e['turn'], 'error', 'stream error', e.get('text'))
 
@@ -875,7 +619,8 @@ class Seat:
                 status, reset = ('incomplete', '') if s.halt else typed(
                     status, r['errtext'] + ('\n' + since(J(d, 'stderr.log'), s.eoff) if rc is not None else ''), rc)
                 text = ''
-            rc_ = rc if rc not in (None, 0) else (0 if status == 'ok' else 1)
+            # a turn its CLI answered ok reads rc 0, whatever ended the CLI after it (a stop, the deadline)
+            rc_ = 0 if status == 'ok' else rc if rc not in (None, 0) else 1
             n, session, use = r['turn'], h.get('session') or r['session'], r['usage']
             if use and type(r['extra'].get('cost_usd')) in (int, float):   # the turn's cost, when the wire reports it
                 use = dict(use, cost_usd=r['extra']['cost_usd'])
@@ -917,74 +662,18 @@ class Seat:
         if seat and status == 'refused':   # a failure closed it above, for its rc
             seat.close(2)
 
-    # ---------- the JSON-RPC families: one agent per launch on acp.Rpc, the wrapper reading in.fifo itself -- acp runs one
-    # turn per line, in order, on a worker (ACP v1 has no mid-turn input); rpc delivers each line at once (Seat.rpc_turn).
-    # Like every wrapper, it lives until its launch's deadline or a stop
     def limit(s):   # the launch's deadline: its --timeout from the first turn's start; none given = no deadline (INF)
         return s.t_first + int(s.h['timeout']) if s.h.get('timeout') else INF
 
     def cut(s, rc):   # the rc of what the wrapper's own close ended: the deadline's reads 142 (typed timeout) and a stop's
         return 142 if s.late else 143 if s.halt else rc   # 143, as the reaper's alarm and a TERM would; else the CLI's own
 
-    def queued(s):
-        deadline = s.limit()
-        # THE POLITE CLOSE (every JSON-RPC wire), at the deadline and at a stop alike: the wrapper ends the agent itself, with
-        # Rpc.close (stdin EOF first, TERM only after its grace) -- opencode keeps a turn's execution claim on a TERM and
-        # releases it on a polite close (opencode 2.0.22); codex's app-server reaps its commands on EOF, which an interrupt
-        # alone does not (codex-cli 0.160), so an rpc turn in flight is interrupted first. The reaper is a backstop 10 s past
-        # the deadline (a close takes <= 4 x 2 s)
-        wrap = lambda argv: reaped_argv(deadline + 10 - time.time(), argv)
-        log = lambda line, way: append(J(s.d, 'stream.jsonl'), {'t': now(), 'dir': way, 'msg': jparse(line)})
-        seat, why = acp.launch(s.prov, s.h, wrap, log, J(s.d, 'stderr.log')) if s.fam == 'acp' else s.codex(wrap, log)
-        if why:
-            return s.early(*why, seat=seat)
-        s.fifo()
-        # waiting: the lines delivered and not yet handed on -- acp: one prompt at a time (ACP v1 has no queue), turn
-        # `n` next; rpc: one turn/start at a time, each sent once the last is answered (`asked`), so it steers the turn
-        # its predecessor started
-        s.waiting, s.n, s.asked = [], s.first, False
-        while not s.halt and seat.proc.poll() is None and time.time() < deadline:
-            s.tick()
-            s.waiting += s.inq
-            s.inq = []
-            if s.waiting and s.fam == 'acp' and not seat.busy():
-                s.acp_turn(seat, s.n, said(s.waiting.pop(0)))
-                s.n += 1
-            elif s.waiting and s.fam == 'rpc' and not s.asked:
-                s.rpc_turn(seat, s.waiting.pop(0))
-            r, w = seat.fds()
-            r, w, _ = select.select(r + [s.rfd], w, [], 0.5)
-            seat.ready(r, w)
-            if s.rfd in r:
-                s.read_fifo()
-        s.late = seat.proc.poll() is None and time.time() >= deadline   # set BEFORE the close the turn reads it in
-        if seat.proc.poll() is None and s.W and s.W.tid:   # the agent outlived the loop: the deadline or a stop ends it
-            try:
-                seat.call('turn/interrupt', {'threadId': s.W.session, 'turnId': s.W.tid}, 5)
-            except acp.AcpError:
-                pass
-        s.letgo(s.rfd)
-        rc = s.cut(rcode(seat.close(2)))   # close() answers a prompt whose pipe an escaped child still holds
-        s.mail()                           # the lines still waiting were delivered and never run: the close-out types them
-        s.close_out(rc, s.W)
-
-    def codex(s, wrap, log):   # the rpc launch: the app-server under the reaper, past its handshake -> (rpc,
-        # why); its notifications reach the translator on the reader thread, a deadline's typed timeout with them
-        s.W = Wire(s.prov, s.first - 1, s.h.get('session'), s.put, s.pending)
-        rpc = acp.Rpc(wrap(codex_argv(s.h)), s.h['cwd'], None, log, J(s.d, 'stderr.log'),
-                      lambda m, p: s.feed({'method': m, 'params': p}, s.W, s.cut(None)))
-        try:
-            s.W.session = codex_open(s.h, rpc)
-        except acp.AcpError as x:
-            return rpc, ('error', 'handshake', str(x))
-        return rpc, None
-
     def rpc_turn(s, rpc, ln):   # THE rpc delivery: every line is a turn/start, which the app-server steers into the turn in
         # flight or starts the next turn with (its protocol: turnTrigger is "ignored when this request steers an already-
         # active turn") -- so no client guess of the open turn races its end. The
         # seat's effort rides every one. A turn/start it refuses on an idle thread is that turn, failed; an
         # agent gone mid-delivery leaves the turn to the close-out
-        inp = [{'type': 'text', 'text': said(ln)}]
+        inp = [{'type': 'text', 'text': wires.said(ln)}]
         p = dict({'threadId': s.W.session, 'input': inp}, **({'effort': s.h['effort']} if s.h.get('effort') else {}))
         s.asked = True
         rpc.request('turn/start', p, s.rpc_answered)
@@ -1003,10 +692,10 @@ class Seat:
     def forget(s, sid, n):   # GUARD 2, ABANDONED TURNS: a turn whose agent went mid-turn other than by the
         # deadline's close (a stop -- a polite close too, kept here until a live opencode check shows it releases the claim
         # --, a crash, a kill) may keep its execution claim, which opencode's managed background service
-        # resumes at its next boot; its session is deleted -- the wire's own command (acp.forget; None = nothing to delete), in
+        # resumes at its next boot; its session is deleted -- the wire's own command (wires.forget; None = nothing to delete), in
         # the seat's cwd, under the reaper, its output to stderr.log (no provider error: failures are typed from
         # past it) -- before the turn's envelope lands, so a sync buy's stop never races it
-        argv = acp.forget(s.prov, sid, s.h.get('cli'))
+        argv = wires.forget(s.prov, sid, s.h.get('cli'))
         if argv:
             with open(J(s.d, 'stderr.log'), 'ab') as ef:
                 rc = rcode(subprocess.call(reaped_argv(60, argv), stdin=subprocess.DEVNULL, stdout=ef, stderr=ef, cwd=s.h['cwd']))
@@ -1017,7 +706,7 @@ class Seat:
         seen, off, t0 = set(), size(J(s.d, 'stderr.log')), time.time()
 
         def sink(u):
-            for e in acp.translate(u, n, now(), s.prov):
+            for e in wires.translate(u, n, now(), s.prov):
                 if e['kind'] == 'file':   # grok reports one edit twice: one file event per call and path
                     if (e.get('call'), e.get('path')) in seen:
                         continue
@@ -1026,7 +715,7 @@ class Seat:
         seat.prompt(text, sink, lambda res: s.acp_done(seat, n, res, off, t0))
 
     def acp_done(s, seat, n, res, off, t0):
-        *head, end = acp.translate(res, n, now(), s.prov)
+        *head, end = wires.translate(res, n, now(), s.prov)
         use = ([e for e in head if e['kind'] == 'usage'] or [{}])[0]
         for e in head:
             if e['kind'] == 'error':
@@ -1074,7 +763,8 @@ def spawn(d, h, msgfile):
         # never reported undelivered while its wrapper runs; the cap only ends a wrapper stuck past every bound
         got = (os.read(r, 64) if select.select([r], [], [], 600)[0] else b'').strip()
         if got not in (b'', b'0'):
-            print(dump({'status': 'spawned', 'pid': pid, 'dir': d, 'expect': int(got), 'delivery': WIRES[h['provider']][1], 'note': NOTE}))
+            print(dump({'status': 'spawned', 'pid': pid, 'dir': d, 'expect': int(got),
+                        'delivery': wires.PROVIDERS[h['provider']].delivery, 'note': NOTE}))
             return 0
         env = jload(J(d, 'envelope.json')) if got == b'0' else None
         if env:   # the wrapper typed the launch before any turn: a refusal (rc 2) or a failure; its why on stderr
@@ -1126,14 +816,14 @@ def send(d, h, path):
             if fd is not None:
                 os.set_blocking(fd, True)
                 st = State(d).read()
-                sent = st.next_turn(WIRES[prov][1], True)
+                sent = st.next_turn(wires.PROVIDERS[prov].delivery, True)
                 try:
                     deliver(d, prov, fd, msg, sent, st.turn)
                 except OSError:                  # its reader died mid-write: its wrapper types that turn
                     sent = None
                 os.close(fd)
                 if sent is not None:
-                    print(dump({'status': 'sent', 'dir': d, 'expect': sent, 'delivery': WIRES[prov][1]}))
+                    print(dump({'status': 'sent', 'dir': d, 'expect': sent, 'delivery': wires.PROVIDERS[prov].delivery}))
                     return 0
         time.sleep(0.2)
     print('seat.py: %s has a live wrapper but no reader (a replay backoff?) -- send again shortly' % d, file=sys.stderr)

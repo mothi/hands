@@ -166,7 +166,7 @@ A seat pays its CLI's session-start prompt once per conversation (~34k tokens on
 seat, mostly cached) — continue a seat with `send` rather than re-buying. Claude seats run
 lean (`--strict-mcp-config`: no host MCP servers; `--exclude-dynamic-system-prompt-sections`: the
 per-folder prompt sections move into the first message; `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`) in ONE
-launch (`launch()` in seat.py), so every relaunch sends the start's exact flags. NO SEAT RUNS YOUR HOOKS
+launch (`claude_command()` in wires.py), so every relaunch sends the start's exact flags. NO SEAT RUNS YOUR HOOKS
 (hooks are your code for your sessions): claude `disableAllHooks` in its one `--settings`; codex `--disable hooks`; grok
 `GROK_CLAUDE_HOOKS_ENABLED=0` `GROK_CURSOR_HOOKS_ENABLED=0` (grok otherwise runs the hooks it finds in
 `~/.claude`). opencode 2.x runs no Claude hooks; its own hooks are plugins (`~/.config/opencode/plugin(s)`,

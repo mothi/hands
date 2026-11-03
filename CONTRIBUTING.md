@@ -6,7 +6,7 @@ Thanks for helping. hands is small on purpose, and these rules keep it that way.
 
 The flags, the six seat verbs (`start`, `send`, `mail`, `wait`, `events`, `stop`) and `quota` are
 the whole interface. A new capability is a separate script that calls `hands.sh`, not another flag. A new
-provider is one entry in the wire table (`WIRES` in `seat.py`), not a flag.
+provider is one entry in the provider table (`PROVIDERS` in `wires.py`), not a flag.
 
 ## Every change is tested
 
