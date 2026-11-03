@@ -277,9 +277,10 @@ run_probe() {
 
 # ---------- selftest (hermetic: zero model calls, zero network, own cache+tmp) ----------
 run_selftest() {
-  local HERE PASS=0 FAIL=0 SB
+  local HERE PASS=0 FAIL=0 SB SBP
   HERE="$(cd "$(dirname "$0")" && pwd)"
   SB="$(mktemp -d "${TMPDIR:-/tmp}/hands-selftest.XXXXXX")"
+  SBP="$(cd "$SB" && pwd -P)"   # as a wrapper's argv names its dir: a row looks up its own seat, never another suite's
   unset CODEX_ARGV_LOG  # externally-exported sentinels must not reach stub calls
   unset ACP_REPLAY ACP_MODE ACP_REC ACP_ARGV_LOG ACP_ENV_LOG ACP_PIDFILE OC_SESSION_LOG
   unset CL_ARGV_LOG CL_STUB_MODE CL_STDIN_LOG
@@ -886,7 +887,7 @@ for l in open(sys.argv[1]):
   # 900 and an armed reaper; drop limit()'s no-timeout branch -> the launch fails.
   ACP_REPLAY="$SB/oc-hang.jsonl" ACP_REC="$SB/a177.rec" stub_run start --effort low --cwd "$SB/gdir" --out "$SB/a177" opencode:opencode-go/deepseek-v4.1-flash "$SB/q.md" >/dev/null 2>&1
   for i in $(seq 1 50); do grep -q '"kind": "turn_start"' "$SB/a177/events.jsonl" 2>/dev/null && grep -q session/prompt "$SB/a177.rec" 2>/dev/null && break; sleep 0.1; done
-  W177="$(pgrep -f "seat.py spawn [^ ]*/a177 " | head -1)"; ps -A -ww -o ppid=,command= | awk -v p="${W177:-none}" '$1==p' >"$SB/a177.ps"
+  W177="$(pgrep -f "seat.py spawn $SBP/a177 " | head -1)"; ps -A -ww -o ppid=,command= | awk -v p="${W177:-none}" '$1==p' >"$SB/a177.ps"
   stub_run stop "$SB/a177" >/dev/null 2>&1
   t 177 "NO LIMIT BY DEFAULT: a seat bought without --timeout records timeout null and runs its agent under a reaper armed with 0 (no alarm): no wall clock cuts its work" \
     sh -c "jq -e '.timeout==null' '$SB/a177/session' >/dev/null && grep -q 'wt_alarm.* seat [^ ]*/hands.sh 0 ' '$SB/a177.ps'"
@@ -912,7 +913,7 @@ for l in open(sys.argv[1]):
   CX_ARGV_LOG="$SB/c113.argv" CX_STDIN_LOG="$SB/c113.stdin" CX_CWD_LOG="$SB/c113.cwd" CX_STUB_CALLS="$SB/c113.calls" \
     stub_run start --effort high --cwd "$SB/cxw" --out "$SB/c113" codex:gpt-5.6-terra "$SB/q.md" >"$SB/c113.ack" 2>/dev/null
   stub_run wait "$SB/c113" --timeout 30 >/dev/null 2>&1; sleep 1.5
-  ps -A -ww -o command= | grep -q "seat.py spawn [^ ]*/c113 " && echo alive >"$SB/c113.idle"
+  ps -A -ww -o command= | grep -q "seat.py spawn $SBP/c113 " && echo alive >"$SB/c113.idle"
   stub_run send "$SB/c113" "$SB/q81.md" >"$SB/c113.ack2" 2>/dev/null
   stub_run wait "$SB/c113" --timeout 30 >/dev/null 2>&1
   stub_run stop "$SB/c113" >/dev/null 2>&1; echo $? >"$SB/c113.stoprc"
@@ -965,7 +966,7 @@ for l in open(sys.argv[1]):
   CX_STUB_MODE=park CX_STUB_PIDFILE="$SB/c180.pid" stub_run start --cwd "$SB/cxw" --out "$SB/c180" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
   for i in $(seq 1 50); do [ -s "$SB/c180.pid" ] && break; sleep 0.1; done
   stub_run send "$SB/c180" "$SB/q81.md" >/dev/null 2>&1; stub_run send "$SB/c180" "$SB/q81.md" >/dev/null 2>&1
-  W180="$(ps -A -ww -o pid=,command= | grep 'seat.py spawn [^ ]*/c180 ' | grep -v grep | awk '{print $1}')"
+  W180="$(ps -A -ww -o pid=,command= | grep "seat.py spawn $SBP/c180 " | grep -v grep | awk '{print $1}')"
   [ -n "$W180" ] && kill -KILL -- "-$W180" 2>/dev/null; kill -KILL $(cat "$SB/c180.pid") 2>/dev/null; sleep 0.3
   stub_run send "$SB/c180" "$SB/q81.md" >"$SB/c180.a1" 2>/dev/null; stub_run wait "$SB/c180" --timeout 20 >/dev/null 2>&1
   stub_run send "$SB/c180" "$SB/q81.md" >"$SB/c180.a2" 2>/dev/null; stub_run wait "$SB/c180" --timeout 20 >/dev/null 2>&1; echo $? >"$SB/c180.wrc"
@@ -1448,7 +1449,7 @@ STUB
   CL_STUB_MODE=slow CL_STUB_SLEEP=20 stub_run start --cwd "$SB/tmp" --out "$SB/w199" claude:sonnet "$SB/q.md" >/dev/null 2>&1
   stub_run wait "$SB/w199" --timeout 60 >/dev/null 2>&1; stub_run send "$SB/w199" "$SB/q81.md" >/dev/null 2>&1
   for i in $(seq 100); do jq -s -e 'any(.[]; .kind=="turn_start" and .turn==2)' "$SB/w199/events.jsonl" >/dev/null 2>&1 && break; sleep 0.1; done
-  W199="$(ps -A -ww -o pid=,command= | grep 'seat.py spawn [^ ]*/w199 ' | grep -v grep | awk '{print $1}' | head -1)"
+  W199="$(ps -A -ww -o pid=,command= | grep "seat.py spawn $SBP/w199 " | grep -v grep | awk '{print $1}' | head -1)"
   [ -n "$W199" ] && kill -KILL -- "-$W199" 2>/dev/null; sleep 0.3
   stub_run wait "$SB/w199" --timeout 10 >"$SB/w199.wait" 2>/dev/null; echo $? >"$SB/w199.rc"
   t 199 "WAIT AFTER A WRAPPER DIED MID-TURN: incomplete, reason wrapper-gone, the sent turn (2), rc 1 -- never turn 1's ok answer" \
