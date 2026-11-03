@@ -12,8 +12,8 @@ you ran. You should get a first reply within a week.
 
 Read README § Security model before you run a seat. In short:
 
-- A seat is a coding agent with **full read and write access, running as you**. `--rw` is
-  required on every buy. Without `--sandbox`, nothing stops a seat from reading your files,
+- A seat is a coding agent with **full read and write access, running as you**. There is no
+  read-only mode. Without `--sandbox`, nothing stops a seat from reading your files,
   running any command, or reaching the network.
 - `--sandbox` (macOS only) runs the seat's CLI under `sandbox-exec`. It denies reads of common
   secret stores and other repos, and limits writes. It is a guard against mistakes, not a

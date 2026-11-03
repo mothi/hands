@@ -30,8 +30,8 @@ Built and tested on macOS. Linux is untested, and `--sandbox` is macOS-only.
 
 ## Security model
 
-- **A seat runs as you, with full read and write access.** `--rw` is required on every buy: a
-  seat that can't run commands can't check its own work. Claude runs with
+- **A seat runs as you, with full read and write access.** There is no read-only
+  mode: a seat that can't run commands can't check its own work. Claude runs with
   `bypassPermissions`, Codex with `danger-full-access`, and Grok and OpenCode approve every
   tool call. Nothing but `--sandbox` stops a seat from reading any file you can read, writing
   outside its `--cwd`, or using the network.
@@ -93,7 +93,7 @@ $H --probe all        # which providers answer (a 1-token ping each; it spends a
 $H --list             # known models, as provider:model lines
 
 echo "List the files here and say what each one is for." > task.md
-$H start --rw --cwd /tmp/hands-try codex task.md   # prints {"status":"spawned","dir":"DIR",...}
+$H start --cwd /tmp/hands-try codex task.md   # prints {"status":"spawned","dir":"DIR",...}
 $H wait DIR           # blocks until the turn ends: the answer, then the envelope line
 
 echo "Now suggest one improvement." > followup.md
@@ -115,7 +115,7 @@ provider spec, then the prompt file. The other verbs take the job dir first
 One wire-table entry each (`WIRES` in `seat.py`). Model ids pass through untouched and the CLI
 validates them, so a model released tomorrow works today.
 
-| Provider | Models | How hands drives it | Access with `--rw` | Login |
+| Provider | Models | How hands drives it | Access | Login |
 |---|---|---|---|---|
 | `claude` | `sonnet` (default), `opus`, `haiku`, `fable`, or any Claude model id | one `claude -p --input-format stream-json` process per seat, lean: no MCP servers from your config, no auto-memory. Turns go to its stdin. Sends **steer** the running turn | `bypassPermissions` | `claude` (interactive login) |
 | `codex` | the CLI's default, or any id (`codex debug models` lists them) | one `codex app-server` process per seat (never the shared daemon), JSON-RPC on stdio, live web search on (`-c web_search="live"`). Each send is a `turn/start`, which **steers** the running turn or opens the next | thread sandbox `danger-full-access` | `codex login` |
@@ -126,7 +126,6 @@ validates them, so a model released tomorrow works today.
 - **OpenCode** uses whatever providers your own OpenCode setup has: name them as
   `provider/model`. The probe and the quota gauge assume an OpenCode Go subscription
   (`opencode-go/...`); without one, `--probe opencode` fails and the gauge reads `unknown`.
-  OpenCode 2.x has no read-only mode, so every OpenCode buy needs `--rw` (all buys do anyway).
 - **Effort.** Claude and Codex take `low|medium|high|xhigh|max` (Codex also `ultra` where its
   catalog lists it), passed through for the CLI to validate. Grok and OpenCode need `--effort`
   set to a value that model lists (`grok-4.6`: `low|medium|high|xhigh`;
@@ -137,7 +136,6 @@ validates them, so a model released tomorrow works today.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--rw` | required | full access (see the table); a buy without it is refused before any spend |
 | `--cwd DIR` | current dir | where the seat works; recorded in the handle and reused by every relaunch |
 | `--out DIR` | a fresh dir in the jobs root | the job dir. It must be new or empty, and is made with mode 0700. The default jobs root is `$XDG_STATE_HOME/hands` (when that is an absolute path), else `~/.local/state/hands` |
 | `--timeout SECS` | none | a wall clock per launch, shared by its turns. On expiry the open turn ends `timeout` with its session, and a `send` resumes it |
@@ -224,7 +222,7 @@ later. A launch that failed before its first turn has no session (`send` is refu
 
 ## Mail and push
 
-Every `--rw` buy's prompt starts with the **seat contract** (`seat_box()` in `hands.sh`): the same
+Every buy's prompt starts with the **seat contract** (`seat_box()` in `hands.sh`): the same
 text for every seat, telling it how to report and how to mail. The seat's own job-dir line comes
 last, after your task, so seats given one task share a prompt prefix.
 
@@ -374,8 +372,8 @@ hands/
 
 ## Design
 
-1. **Every buy carries `--rw`.** A seat that can't run commands can't verify its work. Isolation
-   comes from the `--cwd` (and optionally `--sandbox`), never from read-only mode.
+1. **Every seat has full access.** A seat that can't run commands can't verify its work. Isolation
+   comes from the `--cwd` (and optionally `--sandbox`), never from a read-only mode.
 2. **Typed failure over retry loops.** Quota errors carry their reset time; waiting beats polling.
 3. **The job dir is the only state.** No daemon, no registry, no cache: a relaunch reads the
    handle, the events file is the truth, and `stop` still writes the envelope.

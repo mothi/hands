@@ -29,7 +29,7 @@
 # provider's next inference call (quota.sh header), and the claude
 # reading IS the rate_limit_event a claude call leaves in its job stream. rearm
 # never mints or exchanges a credential itself. Every heal is `hands.sh --probe <pool>` —
-# hands' own aliveness ping: its ONE invocation table (read-only pins, a neutral cwd, its
+# hands' own aliveness ping: its ONE invocation table (its pinned models, a neutral cwd, its
 # bounded timeout that reaps the process group), never a second copy of any CLI's argv here.
 # A claude probe writes <the jobs root>/probe-*-claude/stream.jsonl, exactly where the gauge
 # reads, so the heal needs no state file of its own.
@@ -274,12 +274,12 @@ STUB
     sh -c "rm -f '$SB/log/'* '$SB/probes'; env $E REARM_FIX='$SB/fx-green.json' '$SELF' >'$SB/o3.txt' 2>&1 \
       && [ -z \"\$(ls -A '$SB/log')\" ] && grep -q 'quota(observe): claude' '$SB/o3.txt' \
       && ! grep -q '^rearm:' '$SB/o3.txt'"
-  t 04 "ALL THREE stale → all three fire ONCE each through hands' probe, read-only where the wire has a mode: claude haiku dontAsk, codex a read-only thread, grok its ACP agent" \
+  t 04 "ALL THREE stale → all three fire ONCE each through hands' probe: claude haiku, codex a full-access thread, grok its ACP agent" \
     sh -c "rm -rf '$SB/log/'* '$SB/cwd-'* '$SB/thread-codex' '$SB/probes' '$SB/state/hands'; env $E REARM_FIX='$SB/fx-all.json' '$SELF' >'$SB/o4.txt' 2>&1 \
       && [ \$(grep -c 'token-stale → refreshed' '$SB/o4.txt') -eq 3 ] \
       && [ \$(cat '$SB/log/claude' '$SB/log/codex' '$SB/log/grok' | wc -l) -eq 3 ] \
-      && grep -q '|--model|haiku|.*--permission-mode|dontAsk' '$SB/log/claude' && ! grep -q bypassPermissions '$SB/log/claude' \
-      && jq -e '.sandbox==\"read-only\"' '$SB/thread-codex' >/dev/null && grep -qx '|agent|--no-leader|--always-approve|stdio' '$SB/log/grok'"
+      && grep -q '|--model|haiku|' '$SB/log/claude' \
+      && jq -e '.sandbox==\"danger-full-access\"' '$SB/thread-codex' >/dev/null && grep -qx '|agent|--no-leader|--always-approve|stdio' '$SB/log/grok'"
   # 26: THE CLAUDE HEAL LEAVES THE READING. The gauge reads the newest claude job
   # stream, so a heal that pinged claude without leaving a stream there would heal nothing: this
   # row runs the REAL quota.sh over the sandbox jobs root after the heal. Falsified by pinging the

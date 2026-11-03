@@ -39,8 +39,6 @@ and session ids, emails, tokens, local timestamps, and anything else that is you
 
 ## Engine rules
 
-- **`--rw` on every buy.** A buy without it is refused before any spend. `HANDS_RW_FENCE=off`
-  exists only for the suites; never set it for real use.
 - **One seat contract.** `seat_box()` in `hands.sh` is the only copy of the text every seat
   receives first. A seat's prompt is that box, a blank line, the task file, a blank line, and its
   job-dir line; the job dir's `prompt.txt` is exactly that input.

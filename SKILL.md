@@ -11,13 +11,13 @@ picks no model.
 
 ```bash
 D=~/.claude/skills/hands/hands.sh   # this file's directory, wherever it is installed
-$D start --rw --cwd /path/repo codex:gpt-5.6-terra /tmp/task.md  # → {"status":"spawned","dir":DIR,…}
+$D start --cwd /path/repo codex:gpt-5.6-terra /tmp/task.md  # → {"status":"spawned","dir":DIR,…}
 $D send DIR /tmp/followup.md       # the next turn; a gone seat resumes its session
 $D mail DIR "run the lint first"   # a driver line in DIR/inbox.jsonl
 $D wait DIR                        # blocks: the answer (on ok), then the envelope -- see BACKGROUND below
 $D events DIR --follow             # the readable view, live; ends with the seat (raw: tail -f DIR/events.jsonl)
 $D stop DIR                        # TERM, KILL after a 5 s drain; the envelope still lands
-$D --rw --cwd /path/repo claude:opus /tmp/task.md   # sync = start + wait + stop (sub-minute probes ONLY)
+$D --cwd /path/repo claude:opus /tmp/task.md   # sync = start + wait + stop (sub-minute probes ONLY)
 $D --probe all                     # 1-token aliveness ping per provider (internal: it never pushes)
 $D --list                          # every model, as provider:model lines
 ```
@@ -31,7 +31,7 @@ Model IDs pass through untouched — the CLI validates them. Each CLI reads its 
 (`~/.claude`, `~/.codex`, `~/.grok`, `~/.local/share/opencode`): an opencode seat runs on your normal
 opencode setup, so any provider you configured there works as `provider/model`. This skill stores no
 credentials of its own (a live seat's job dir keeps the host's push socket path and token: § Mail and push).
-SECURITY: a seat runs as the user with full read and write access (`--rw` is required on every buy), and
+SECURITY: a seat runs as the user with full read and write access (there is no read-only mode), and
 inherits the caller's environment minus the push socket, its token and `OPENCODE_API_KEY`. Point it at a
 worktree or scratch dir with `--cwd`; `--sandbox` (macOS) limits what it reads and writes.
 `--bg` on a bare buy is `start`.
@@ -81,7 +81,7 @@ next message.
 ## Mail and push
 
 The engine prepends the SEAT BOX — the seat contract, one copy, `seat_box` in `hands.sh`
-— to every `--rw` buy, so no brief carries it. The box is the same bytes for every seat; the one
+— to every buy, so no brief carries it. The box is the same bytes for every seat; the one
 per-seat line (`YOUR JOB DIR: DIR`) comes last, after the task, so seats given one task share a
 prompt prefix through the task end. Its MAIL lines have the seat append
 `{"to":"driver","text":…}` to `DIR/outbox.jsonl`, or put another seat's job dir in `to` to message that seat
@@ -150,10 +150,9 @@ from the structured output — claude's dedicated field; codex's final message, 
 
 ## The three rails
 
-1. **Every buy carries `--rw`** (a seat that cannot execute cannot verify; the engine refuses a
-   bare buy pre-spend). Isolation comes from the `--cwd`,
-   never from read-only: point mutating work at a worktree or scratch dir; parallel writers
-   need disjoint trees. `--sandbox` (macOS, opt-in; off by default) fences the seat CLI
+1. **Every seat has full access** (a seat that cannot execute cannot verify; hands has no
+   read-only mode). Isolation comes from the `--cwd`: point mutating work at a worktree or
+   scratch dir; parallel writers need disjoint trees. `--sandbox` (macOS, opt-in; off by default) fences the seat CLI
    under `sandbox-exec`: it cannot read keys and cloud credentials (`~/.ssh`, `~/.gnupg`, `~/.aws`, ...),
    shell histories, keychains, browser profiles, any other provider's credential store, its job dir's
    `driver.sock`/`driver.token`, any other job dir in the jobs root, or another repo under `HANDS_REPOS`
@@ -186,7 +185,7 @@ from the structured output — claude's dedicated field; codex's final message, 
 2. Ask tiered questions (the host's question UI, else one compact message). Always: the task
    (if missing) and the seat — alive providers only, one recommended (the engine itself routes
    nothing). Only when in doubt: the `--cwd` when the task edits an ambiguous
-   tree (default a scratch dir; `--rw` is never a question); `--effort` for codex, and always for grok and
+   tree (default a scratch dir); `--effort` for codex, and always for grok and
    opencode (they require one the model lists). Never:
    timeout, out-dir — defaults, named in the confirmation line.
 3. Echo the exact `hands.sh` command before running it.
@@ -217,10 +216,9 @@ parallelism — never for something you can answer in-context.
 ## OpenCode and ACP seats
 
 OpenCode ids are `provider/model`; model-less buys are refused (e.g.
-`opencode:opencode-go/deepseek-v4.1-flash`); `--probe` pings that model at low, `--rw` (2.x lists no
+`opencode:opencode-go/deepseek-v4.1-flash`); `--probe` pings that model at low (2.x lists no
 working free model). The muse `-contributor` tier trains on prompts: never send it work you
-would not publish. opencode 2.x has no read-only mode (its plan agent still
-runs shell), so an opencode buy without `--rw` is refused. An opencode seat
+would not publish. An opencode seat
 runs on your normal opencode store and login (no store of its own, nothing seeded): any provider you
 configured in opencode works by naming `provider/model`. `OPENCODE_API_KEY` is dropped from every
 seat (a seat's shell inherits its CLI's environment, and the variable would also unlock the zen

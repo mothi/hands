@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """seat.py -- hands' engine: a seat is a job dir with a live CLI process in it. python3 stdlib only.
 
-hands.sh keeps the grammar, the rw fence, the pool gate, the SEAT BOX and the reaper (wt_alarm); seat.py runs
+hands.sh keeps the grammar, the SEAT BOX and the reaper (wt_alarm); seat.py runs
 everything after launch. WIRES names each provider's family and delivery; each wire translates its stream into
 DIR/events.jsonl, and everything downstream of the events is one rule (Seat.finish).
   spawn DIR MSG   detach the wrapper: it delivers MSG as the next turn and runs the seat until the CLI exits
@@ -198,8 +198,7 @@ def launch(h):   # claude: one process for the whole seat -> (argv, env)
     if schema:
         with open(schema) as f:
             schema = f.read()
-    # rw = bypassPermissions; ro = dontAsk (never plan: plan mode hands the answer off as a plan file) plus web,
-    # which every seat keeps. Background tasks OFF: a turn left waiting on one parks. ONE settings source,
+    # Every seat runs bypassPermissions: full access, as the caller. Background tasks OFF: a turn left waiting on one parks. ONE settings source,
     # --settings: the seat refuses other sessions' cross-session messages (its own inbox socket stays bound and
     # drops them); seat-to-seat mail goes through hands' inbox.jsonl, never the host socket.
     # LEAN (measured on paired haiku buys, prefix 36693 -> 33998 tokens): --strict-mcp-config, no host
@@ -211,8 +210,7 @@ def launch(h):   # claude: one process for the whole seat -> (argv, env)
     st = {'crossSessionInbound': 'refuse', 'disableAllHooks': True}
     a = ['claude', '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--model', m or 'sonnet',
          '--settings', json.dumps(st, separators=(',', ':')), '--strict-mcp-config', '--exclude-dynamic-system-prompt-sections']
-    a += (['--effort', e] if e else []) + ['--permission-mode'] + (
-        ['bypassPermissions'] if h.get('rw') else ['dontAsk', '--allowedTools', 'WebSearch,WebFetch'])
+    a += (['--effort', e] if e else []) + ['--permission-mode', 'bypassPermissions']
     return a + (['--resume', sid] if sid else []) + (['--json-schema', schema] if schema else []), \
         {'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS': '1', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1'}
 
@@ -305,11 +303,11 @@ def codex_argv(h):   # codex: ONE app-server process per launch, over stdio (cod
 
 def codex_open(h, rpc):   # the app-server handshake -> the seat's thread: initialize, initialized, then thread/start -- or,
     # for a seat that has one, thread/resume (a thread has no rollout to resume before its first turn).
-    # rw = danger-full-access; ro = read-only, which still READS the whole disk; approvals never (no one answers them).
+    # Every seat runs danger-full-access, approvals never (no one answers them).
     # Never ephemeral: a thread with no session files cannot resume. No fallback model: without one, config.toml's runs
     rpc._rpc('initialize', {'clientInfo': {'name': 'hands', 'version': '2'}})
     rpc._send({'jsonrpc': '2.0', 'method': 'initialized'})
-    p = {'cwd': h['cwd'], 'sandbox': 'danger-full-access' if h.get('rw') else 'read-only', 'approvalPolicy': 'never'}
+    p = {'cwd': h['cwd'], 'sandbox': 'danger-full-access', 'approvalPolicy': 'never'}
     p.update({'model': h['model']} if h.get('model') else {})
     r = rpc._rpc('thread/resume', dict(p, threadId=h['session'])) if h.get('session') else rpc._rpc('thread/start', dict(p, ephemeral=False))
     tid = (r.get('thread') or {}).get('id')
