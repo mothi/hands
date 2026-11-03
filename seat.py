@@ -17,7 +17,7 @@ import errno, fcntl, json, os, queue, re, select, shutil, signal, socket, stat, 
 import acp
 from acp import Turn, clip, event, now, small, usage   # the vocabulary every wire shares: one copy, in acp.py
 
-HERE, J, MISSING = os.path.dirname(os.path.abspath(__file__)), os.path.join, object()
+HERE, J = os.path.dirname(os.path.abspath(__file__)), os.path.join
 # THE JOBS ROOT, its one copy: every job dir hands.sh names itself (a buy without --out, a probe) lives in
 # $XDG_STATE_HOME/hands (an absolute one; XDG ignores a relative value), else ~/.local/state/hands -- state that
 # outlives a reboot, where macOS's $TMPDIR is wiped at boot and pruned after 3 days. hands.sh takes it from sweep's
@@ -30,9 +30,6 @@ NAMED = re.compile(r'\d{8}-\d{6}-[a-z]+-\d+|probe-\d+-[a-z]+')   # the names han
 # stdin, acp (acp.py) runs a turn per line, rpc (codex's app-server on acp.Rpc) starts or steers a turn per line. steer:
 # a send joins the running turn; queue: it waits (ACP v1 has no mid-turn input)
 WIRES = {'claude': ('stdin', 'steer'), 'grok': ('acp', 'queue'), 'opencode': ('acp', 'queue'), 'codex': ('rpc', 'steer')}
-# THE VERSION FLOOR: provider -> the oldest CLI this engine is proven on; every launch (start or relaunch) reads the
-# CLI's --version and refuses an older or unreadable one (cli-too-old), caching nothing
-FLOOR = {'claude': (2, 1, 283), 'codex': (0, 160, 0), 'grok': (1, 0, 46), 'opencode': (2, 0, 22)}
 # NO PERSONAL HOOKS: every seat runs its CLI with the user's hooks off -- hooks are
 # the user's code, written for the user's own sessions. Each launch names its CLI's own
 # switch: claude disableAllHooks (launch), codex --disable hooks (codex_argv), grok its claude- and cursor-hook scanners
@@ -157,10 +154,7 @@ def envelope(d, status, prov, model, rc, secs, reset, use, effort, **more):
 
 # ---------- the stdin and rpc wires' entries: launch, the in.fifo line, the translators (class Wire)
 def launch(h):   # claude: one process for the whole seat -> (argv, env)
-    m, e, sid, schema = h.get('model'), h.get('effort'), h.get('session'), h.get('schema')
-    if schema:
-        with open(schema) as f:
-            schema = f.read()
+    m, e, sid = h.get('model'), h.get('effort'), h.get('session')
     # Every seat runs bypassPermissions: full access, as the caller. Background tasks OFF: a turn left waiting on one
     # parks. ONE settings source, --settings: the seat refuses other sessions' cross-session messages (its own inbox
     # socket stays bound and drops them).
@@ -174,31 +168,16 @@ def launch(h):   # claude: one process for the whole seat -> (argv, env)
     a = ['claude', '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--model', m or 'sonnet',
          '--settings', json.dumps(st, separators=(',', ':')), '--strict-mcp-config', '--exclude-dynamic-system-prompt-sections']
     a += (['--effort', e] if e else []) + ['--permission-mode', 'bypassPermissions']
-    return a + (['--resume', sid] if sid else []) + (['--json-schema', schema] if schema else []), \
+    return a + (['--resume', sid] if sid else []), \
         {'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS': '1', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1'}
-
-
-def floor(h):   # None = launch; else (reason, why) for a typed refusal before any launch
-    want, cli = FLOOR.get(h['provider']), h.get('cli') or h['provider']
-    if not want:
-        return None
-    try:
-        out = subprocess.run([cli, '--version'], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30).stdout
-    except (OSError, subprocess.SubprocessError):
-        out = ''
-    got = re.search(r'(\d+)\.(\d+)\.(\d+)', out)
-    if got and tuple(map(int, got.groups())) >= want:
-        return None
-    return 'cli-too-old', '%s --version says %r; this engine needs %s >= %s: update the CLI' % (
-        cli, clip(out.strip(), 80), h['provider'], '.'.join(map(str, want)))
 
 
 def codex_argv(h):   # codex: ONE app-server process per launch, over stdio (codex-cli 0.160), all root
     # options. --no-daemon: the seat never runs through the user's shared app-server daemon; --disable memories: no user
     # memory is read or written (the twin of claude's auto-memory off); --disable hooks: NO PERSONAL HOOKS
     # (above); web_search live: the live search exec's --search gave (app-server reads no --search: its config/read shows
-    # web_search null either way). The cwd, sandbox, model and approvals ride the thread (codex_open), the effort and
-    # schema each turn/start (Seat.rpc_turn)
+    # web_search null either way). The cwd, sandbox, model and approvals ride the thread (codex_open), the effort each
+    # turn/start (Seat.rpc_turn)
     return [h.get('cli') or 'codex', '--no-daemon', '--disable', 'memories', '--disable', 'hooks', '-c', 'web_search="live"', 'app-server']
 
 
@@ -233,10 +212,10 @@ CODEX_TOOLS = {'commandExecution': ('shell', 'command'), 'fileChange': ('apply_p
 FILE_TOOLS = {'Edit': 'file_path', 'Write': 'file_path', 'MultiEdit': 'file_path', 'NotebookEdit': 'notebook_path'}
 
 
-def rec(turn, status, text='', use=None, final='none', errtext='', so=MISSING, session=None, t0=None, extra=None):
+def rec(turn, status, text='', use=None, final='none', errtext='', session=None, t0=None, extra=None):
     """A closed turn, as every wire hands it to finish(); extra = usage-event fields (usage_unknown, cost_usd)."""
     return {'turn': turn, 'status': status, 'text': text or '', 'usage': use, 'final': final, 'errtext': errtext,
-            'so': so, 'session': session, 't0': t0, 'extra': extra or {}}
+            'session': session, 't0': t0, 'extra': extra or {}}
 
 
 def plus(a, b):   # two raw usage reports summed field by field, over the fields of either (a call may omit one)
@@ -267,9 +246,9 @@ class Wire:
     def ensure(w):   # a line that belongs to a turn: after a turn_end only a delivered message opens one
         return [] if w.cur else w.start() if w.turn == w.base or w.pending() else None
 
-    def end(w, status, text, use, final, errtext='', so=MISSING, turn=None, extra=None):
+    def end(w, status, text, use, final, errtext='', turn=None, extra=None):
         t0, w.cur, w.tid = (w.cur.t0 if w.cur else None), None, None
-        return rec(turn or w.turn, status, text, use, final, errtext, so, w.session, t0, extra)
+        return rec(turn or w.turn, status, text, use, final, errtext, w.session, t0, extra)
 
     def cut(w, turn=None):   # the stream stopped inside (or before) a turn: no end marker, no answer; the usage it
         # reported so far, in the envelope's fields as a turn_end's is
@@ -311,7 +290,7 @@ class Wire:
             tot, cost = o.get('total_cost_usd'), None
             if type(tot) in (int, float):
                 cost, w.spent = round(tot - w.spent, 10), tot
-            return recs + [w.end(status, text, usage(o.get('usage'), 'claude'), 'field', etxt, o.get('structured_output', MISSING),
+            return recs + [w.end(status, text, usage(o.get('usage'), 'claude'), 'field', etxt,
                                  extra=None if cost is None else {'cost_usd': cost})]
         if ty == 'tool_progress':
             w.ev('progress', tool=o.get('tool_name'), call=o.get('parent_tool_use_id'), text='heartbeat %ss' % o.get('elapsed_time_seconds'))
@@ -365,12 +344,12 @@ class Wire:
         if m == 'thread/tokenUsage/updated':   # one per model call (probe: turn 1 sent two, 17274 + 17325 = its total
             # 34599): `last` is that call's, so the turn's usage is their sum; `total` is the thread's
             w.cur.usage = plus(w.cur.usage, (p.get('tokenUsage') or {}).get('last'))
-        elif m == 'turn/completed':   # under an outputSchema the final message IS the structured output: parsed here, once
+        elif m == 'turn/completed':
             t = p.get('turn') or {}
             st, e = t.get('status'), t.get('error') if isinstance(t.get('error'), dict) else {}
             text, use = w.cur.final(), usage(w.cur.usage, 'codex')
             if st == 'completed':
-                return [w.end('ok', text, use, 'boundary', '', jparse(text))]
+                return [w.end('ok', text, use, 'boundary')]
             why = ' '.join(str(x) for x in (e.get('message'), e.get('codexErrorInfo')) if x) or 'turn %s' % st
             if st != 'interrupted':
                 w.ev('error', text=clip(why))
@@ -720,9 +699,6 @@ class Seat:
         # would have, so this launch numbers its turns past every marker already written (else a wait counts to the wrong turn)
         s.finish([rec(n, 'incomplete', session=h.get('session')) for n in range(st.end + 1, st.expect + 1)], None)
         s.first = State(d).read().next_turn(s.delivery, False)
-        old = floor(h)
-        if old:   # the CLI's version, before any launch of any family
-            return s.early('refused', *old)
         if s.fam != 'stdin':
             return s.queued()
         argv, env = launch(h)
@@ -796,23 +772,16 @@ class Seat:
         """ONE rule for every wire: typed status -> turn files -> envelope -> usage + turn_end events -> push."""
         d, h = s.d, s.h
         for r in recs:
-            status, text, reason, extra, reset = r['status'], r['text'], None, {}, ''
+            status, text, reason, reset = r['status'], r['text'], None, ''
             s.handle(r['session'])
             if r['session'] and r['session'] != h.get('session'):   # SESSION CONSTANCY: a turn on another
                 status, reason, text = 'error', 'session-changed', ''   # conversation (a resume that started fresh)
-            elif status == 'ok' and h.get('schema'):   # the envelope status is the schema field, read ONLY there
-                so = r['so']
-                if isinstance(so, dict) and so.get('status') in ('ok', 'blocked', 'error'):
-                    status, text = so['status'], json.dumps(so, ensure_ascii=False)
-                    extra = {k: so[k] for k in ('summary', 'blockers', 'files', 'next') if k in so}
-                else:
-                    status, reason, text = 'error', 'no-envelope', ''
             elif status == 'ok' and not text.strip():
                 status, reason, text = 'error', 'empty', ''
             elif status != 'ok':   # typed from provider error fields and the CLI's stderr, never from prose
                 status, reset = typed(status, r['errtext'] + ('\n' + since(J(d, 'stderr.log'), s.eoff) if rc is not None else ''), rc)
                 text = ''
-            rc_ = rc if rc not in (None, 0) else (0 if status in ('ok', 'blocked') else 1)
+            rc_ = rc if rc not in (None, 0) else (0 if status == 'ok' else 1)
             n, session, use = r['turn'], h.get('session') or r['session'], r['usage']
             if use and type(r['extra'].get('cost_usd')) in (int, float):   # the turn's cost, when the wire reports it
                 use = dict(use, cost_usd=r['extra']['cost_usd'])
@@ -820,7 +789,7 @@ class Seat:
             put(J(d, 'turn-%d' % n, 'result.txt'), text)
             t0 = s.t_first if n == s.first else (r['t0'] or s.t_first)
             envelope(d, status, s.prov, h.get('model'), rc_, int(time.time() - t0), reset, use, h.get('effort'),
-                     session=session, turn=n, delivery=s.delivery, reason=reason, **extra)
+                     session=session, turn=n, delivery=s.delivery, reason=reason)
             if status == 'ok':   # result.txt -> the latest ok turn's answer
                 if os.path.lexists(J(d, '.result.lnk')):
                     os.remove(J(d, '.result.lnk'))
@@ -922,13 +891,10 @@ class Seat:
     def rpc_turn(s, rpc, ln):   # THE rpc delivery: every line is a turn/start, which the app-server steers into the turn in
         # flight or starts the next turn with (its protocol: turnTrigger is "ignored when this request steers an already-
         # active turn") -- so no client guess of the open turn races its end. The
-        # seat's effort and schema ride every one. A turn/start it refuses on an idle thread is that turn, failed; an
+        # seat's effort rides every one. A turn/start it refuses on an idle thread is that turn, failed; an
         # agent gone mid-delivery leaves the turn to the close-out
         inp = [{'type': 'text', 'text': said(ln)}]
         p = dict({'threadId': s.W.session, 'input': inp}, **({'effort': s.h['effort']} if s.h.get('effort') else {}))
-        if s.h.get('schema'):
-            with open(s.h['schema']) as f:
-                p['outputSchema'] = json.load(f)
         r = rpc._request('turn/start', p)
         if r is None or 'error' not in r:
             return
@@ -980,7 +946,7 @@ class Seat:
             err = json.dumps(res.get('error') or res.get('incomplete') or '', ensure_ascii=False) + '\n' + since(J(s.d, 'stderr.log'), off)
             if rc is not None and not s.late:   # its agent gone mid-turn, not by the deadline: the turn is abandoned
                 s.forget(seat.session_id, n)
-        s.finish([rec(n, end['status'], end.get('text'), use.get('usage'), end.get('final'), err, MISSING, end.get('session'), t0,
+        s.finish([rec(n, end['status'], end.get('text'), use.get('usage'), end.get('final'), err, end.get('session'), t0,
                       {k: use[k] for k in ('usage_unknown', 'cost_usd') if k in use})], rc)
 
 

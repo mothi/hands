@@ -6,17 +6,11 @@
 # P_STUB_CALLS (launch counter), P_STUB_REPLAY (a recorded stream, split into turns), P_STUB_PIDFILE, P_STUB_SLEEP (slow
 # mode's seconds, 2); codex: CX_REPLAY (a recorded app-server wire, {t,dir,msg} lines: the launch count names its process,
 # each opening turn/start plays its recorded turn), CX_FAIL_TEXT (the provider error text its failures carry);
-# P_VERSION: what --version prints (answered before any log or counter; default a version at its floor or above);
-# P_VERSION_SLEEP: seconds --version takes first (a launch caught in its version check).
 import json, os, signal, subprocess, sys, time
 prov = os.path.basename(sys.argv[0])
 P = {'claude': 'CL', 'codex': 'CX'}[prov]
 env = lambda k, d=None: os.environ.get(P + '_' + k) or d
 mode = env('STUB_MODE', 'ok')
-if sys.argv[1:] == ['--version']:
-    time.sleep(float(env('VERSION_SLEEP', 0)))
-    print(env('VERSION', {'claude': '2.1.300 (Claude Code)', 'codex': 'codex-cli 0.160.0'}[prov]))
-    sys.exit(0)
 if env('ARGV_LOG'):
     open(env('ARGV_LOG'), 'w').write(''.join(a + '\n' for a in sys.argv[1:]))
 launch = 1
@@ -138,8 +132,6 @@ def codex_server():   # the app-server (codex-cli 0.160 v2): one thread, th_stub
         if mode in ('notice', 'quota'):   # a retry notice first
             note('error', threadId=st['th'], turnId=st['cur']['id'], willRetry=True, error={'message': 'Reconnecting... 1/5'})
         body = {'quota': [], 'quoted': [msg('The log I read says: ' + fail)], 'quotedfail': [msg('The log I read says: ' + fail)],
-                'schema': [msg('{"status":"ok","summary":"an early claim"}', 'msg_1'), cmd(), msg('{"status":"blocked","summary":"needs owner","blockers":["b1"]}')],
-                'noschema': [msg('status: ok, all done')],                                   # prose where the schema JSON belongs
                 'nofinal': [msg('{"status":"ok","summary":"voided"}', 'msg_1'), cmd()],      # a tool after the only message voids it
                 'files': [edit('fc-7', '/w/file-1.txt'), cmd('exec-8', 2), edit('fc-11', '/w/file-2.txt', '/w/file-1.txt'), msg('FINAL-3: the audit')],
                 'slow': [msg('turn %d pid %d: %s' % (st['n'], os.getpid(), said))], 'stale': [msg('turn %d: %s' % (st['n'], said))],
@@ -282,10 +274,6 @@ while True:
         res('turn %d pid %d' % (t, os.getpid()))
     elif mode == 'echo':   # the answer is the message itself: the row chooses its bytes
         res(json.loads(line)['message']['content'][0]['text'])
-    elif mode == 'schema':
-        res('{"status":"ok","summary":"prose says ok"}', structured_output={'status': 'blocked', 'summary': 'needs owner', 'blockers': ['b1']})
-    elif mode == 'noschema':
-        res('{"status":"ok","summary":"prose says ok"}')
     elif mode == 'quoted':
         res('The log I read says: Claude AI usage limit reached, resets 5pm')
     elif mode == 'quotedfail':   # a FAILING turn whose prose quotes a quota line: typed error, never quota

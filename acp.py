@@ -500,8 +500,6 @@ def launch(provider, h, wrap, log=None, stderr_path=None):
     set explicitly to a value the (set) model lists (none only when it lists none). Never a substitute model. wrap(argv) puts
     the agent under the caller's reaper."""
     m, e = h.get("model"), h.get("effort")
-    if h.get("schema"):   # ACP v1 has no structured-output field, and the envelope never reads prose
-        return None, ("refused", "schema-unsupported", "ACP has no structured-output field: drop --json-schema")
     try:
         argv, env, sets = recipe(provider, m, e, h.get("cli"))
     except ValueError as x:
@@ -515,7 +513,8 @@ def launch(provider, h, wrap, log=None, stderr_path=None):
             have = seat.set_config("model", m)
         vals = seat.values("thought_level") or []                   # read after the model: each lists its own variants
         if m and have != m:
-            return seat, ("refused", "model-mismatch", "the agent runs %s, the seat names %s: never substituted" % (have, m))
+            return seat, ("refused", "model-mismatch", "the agent runs %s and lists %s; the seat names %s: never substituted"
+                          % (have, ", ".join(seat.values("model") or []) or "no models", m))
         if e not in (vals or [None]):
             return seat, ("refused", "effort-unsupported", "%s lists effort %s; the seat names %s" % (have, "|".join(vals) or "none", e or "none"))
         for k, v in sets:

@@ -4,14 +4,13 @@
 # token while you use it: README § Security model).
 #
 #   hands.sh start [opts] provider[:model] prompt-file   buy a seat; returns at once: {"status":"spawned","dir":DIR,...}
-#   hands.sh [opts] provider[:model] prompt-file         sync: start + wait + stop (--bg = start)
+#   hands.sh [opts] provider[:model] prompt-file         sync: start + wait + stop
 #   hands.sh send DIR FILE        the next turn (a seat whose process is gone relaunches on its session)
 #   hands.sh mail DIR TEXT        a driver line the seat's live wrapper delivers
 #   hands.sh wait DIR [--for turn|mail|exit] [--timeout S]   blocks until the turn ends: the answer, then the envelope
 #   hands.sh events DIR [--follow]   a readable view of DIR/events.jsonl
 #   hands.sh stop DIR             TERM the seat, KILL after a 5 s drain; the envelope still lands
 #   hands.sh --probe [claude|codex|grok|opencode|all]   a 1-token aliveness ping per provider (spends a little quota)
-#   hands.sh --list               known models, as provider:model lines
 #   hands.sh --selftest           hermetic tests: stub CLIs, no network, no spend
 #
 # opts (all before the provider spec; the prompt is always a file):
@@ -22,9 +21,8 @@
 #   --timeout SECS      a wall clock per launch (default: none; the seat runs until its work ends or a stop)
 #   --effort <tier>     claude, codex: low|medium|high|xhigh|max, passed through (codex adds ultra where it lists it);
 #                       grok, opencode: required, a value the model lists (grok-4.6: low|medium|high|xhigh)
-#   --json-schema FILE  claude, codex: the final message follows the schema, whose status is the envelope's
 #
-# envelope: {"status":"ok|blocked|error|incomplete|cancelled|truncated|timeout|auth-expired|provider-quota-dead|not-installed|refused",
+# envelope: {"status":"ok|error|incomplete|cancelled|truncated|timeout|auth-expired|provider-quota-dead|not-installed|refused",
 #   "provider","model","effort","rc","seconds","reset","dir","usage","session","turn","delivery",...}
 #   exit 0 ok, 1 any other status, 2 refused or a usage error. README.md is the manual;
 #   CONTRIBUTING.md has the engine's rules.
@@ -33,13 +31,13 @@ set -u
 # NO SEAT INHERITS THE DRIVER'S MESSAGING SOCKET/TOKEN: a process holding both can post into
 # the driver's session as its own child. NOT unset here -- the push needs them: seat.py's wrapper reads both
 # (capture(): DIR/driver.*) and drops them from its env before any seat process starts (spawn). A CLI started
-# outside a wrapper drops them where it starts: run_probe (a probe never pushes) and run_list.
+# outside a wrapper drops them where it starts: run_probe (a probe never pushes).
 
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-BG=0 CWD="$PWD" TIMEOUT="" OUT="" EFFORT="" PROBE="" LIST=0 SELFTEST=0 SCHEMA="" VERB=""
+CWD="$PWD" TIMEOUT="" OUT="" EFFORT="" PROBE="" SELFTEST=0 VERB=""
 SEATPY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/seat.py"   # the wire layer
-case "${1:-}" in   # the seat verbs come first; start is the buy with --bg as its default
-  start) VERB=start BG=1; shift ;;
+case "${1:-}" in   # the seat verbs come first; start is the buy that returns at once
+  start) VERB=start; shift ;;
   send|mail|wait|events|stop) VERB="$1"; shift; VERB_ARGS=("$@"); set -- ;;
 esac
 
@@ -54,14 +52,11 @@ cli_path() {  # resolve a provider CLI even when it's not on PATH
 need() { [ $# -ge 2 ] || { echo "hands: $1 needs a value" >&2; exit 2; }; }
 while [ $# -gt 0 ]; do
   case "$1" in
-    --bg) BG=1 ;;
     --cwd) need "$@"; CWD="$2"; shift ;;
     --timeout) need "$@"; TIMEOUT="$2"; shift ;;
     --out) need "$@"; OUT="$2"; shift ;;
     --effort) need "$@"; EFFORT="$2"; shift ;;
-    --json-schema) need "$@"; SCHEMA="$2"; shift ;;
     --probe) if [ $# -gt 1 ] && [ "${2#-}" = "$2" ]; then PROBE="$2"; shift; else PROBE=all; fi ;;
-    --list) LIST=1 ;;
     --selftest) SELFTEST=1 ;;
     -h|--help) sed -n '/^# hands — /,/^set -u/{/^set -u/!p;}' "$0"; exit 0 ;;
     --) shift; break ;;
@@ -99,7 +94,7 @@ wt_alarm() { # $1 secs (0 = no alarm), rest argv — run argv in its own pgroup 
     # forward INT/TERM/HUP to the group: the old exec-form CLI sat in the callers
     # foreground pgroup, so ^C reached it and its shim-spawned children; the private
     # pgroup would otherwise orphan them on ^C — the same defect on a different signal
-    # ...but NEVER catch what the caller already ignored: `nohup` (the --bg path)
+    # ...but NEVER catch what the caller already ignored: `nohup` (a background buy)
     # sets HUP/INT to SIG_IGN precisely so a seat outlives a terminal
     # teardown, and the old exec form honoured that by inheritance. A handler installed
     # over SIG_IGN would kill the very seats those guards exist to protect.
@@ -199,22 +194,22 @@ refuse() { emit "$1" refused "$2" "$3" 2 "" "$4"; return 2; }   # dir prov model
 
 # ---------- seats: the handle, then seat.py ----------
 # The CLI runs in ONE canonical physical cwd (a relative --cwd would resolve twice). DIR/session is the
-# handle every later send resumes with: provider, model, effort, cwd, timeout, schema, the
+# handle every later send resumes with: provider, model, effort, cwd, timeout, the
 # CLI path, and the session id seat.py records at first sight.
 seat_launch() { # $1 prov  $2 model  $3 dir
   local prov="$1" model="$2" dir="$3" bin acwd rc ack
   bin="$(cli_path "$prov")"
   [ -n "$bin" ] || { emit "$dir" not-installed "$prov" "$model" 0; return 1; }
   acwd="$(cd "$CWD" 2>/dev/null && pwd -P)" || { echo "hands: --cwd $CWD unresolvable" >&2; acwd=""; }
-  if [ -z "$acwd" ] || { [ -n "$SCHEMA" ] && ! cp "$SCHEMA" "$dir/schema.json"; }; then
+  if [ -z "$acwd" ]; then
     emit "$dir" error "$prov" "$model" 2; return 2
   fi
   jq -n -c --arg p "$prov" --arg m "$model" --arg e "$EFFORT" --arg c "$acwd" --arg t "$TIMEOUT" \
-     --arg s "${SCHEMA:+$dir/schema.json}" --arg b "$bin" '{provider:$p, model:(if $m=="" then null else $m end),
+     --arg b "$bin" '{provider:$p, model:(if $m=="" then null else $m end),
      effort:(if $e=="" then null else $e end), cwd:$c, timeout:(if $t=="" then null else ($t|tonumber) end),
-     schema:(if $s=="" then null else $s end), cli:$b, session:null}' >"$dir/session" 2>/dev/null \
+     cli:$b, session:null}' >"$dir/session" 2>/dev/null \
     || { echo "hands: --timeout takes seconds" >&2; emit "$dir" error "$prov" "$model" 2; return 2; }
-  if [ "$BG" = 1 ]; then python3 "$SEATPY" spawn "$dir" "$dir/prompt.txt"; return $?; fi
+  if [ "$VERB" = start ]; then python3 "$SEATPY" spawn "$dir" "$dir/prompt.txt"; return $?; fi
   SEAT_DIR="$dir"; trap 'seat_abort 130' INT; trap 'seat_abort 143' TERM; trap 'seat_abort 129' HUP
   ack="$(python3 "$SEATPY" spawn "$dir" "$dir/prompt.txt")"; rc=$?
   if [ "$rc" -eq 2 ]; then printf '%s\n' "$ack"   # refused before any prompt: that envelope is the answer
@@ -276,25 +271,6 @@ run_probe() {
            } | tee -a "$lines"; rc=1; }
   done
   rm -f "$pf" "$lines"; return $rc
-}
-
-run_list() {
-  unset CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN   # the catalog CLI runs outside any wrapper (see the top)
-  echo "# provider:model — paste straight into hands calls; ids pass through, the CLI validates"
-  echo "# claude — aliases; any Anthropic model id also works"
-  printf 'claude:%s\n' sonnet opus haiku fable
-  echo "# codex — known ids; any id passes through, the CLI catalog validates"
-  printf 'codex:%s\n' gpt-5.6-sol gpt-5.6-terra gpt-5.6-luna gpt-6-astra
-  echo "# grok — from ~/.grok/models_cache.json"
-  if [ -r "$HOME/.grok/models_cache.json" ]; then jq -r '.models | keys[]' "$HOME/.grok/models_cache.json" 2>/dev/null | sed 's/^/grok:/'
-  else echo "# grok: models cache absent (run grok once)"; fi
-  echo "# opencode — live catalog (ids are provider/model)"
-  local oc; oc="$(cli_path opencode)"
-  if [ -n "$oc" ]; then
-    # the caller's own store, as a seat sees it (no OPENCODE_API_KEY), on a PRIVATE server (--standalone): a
-    # standalone server never resumes another process's turns (only the managed service sweeps them)
-    wt_alarm 60 env -u OPENCODE_API_KEY "$oc" models --standalone </dev/null 2>/dev/null | sed 's/^/opencode:/'
-  else echo "# opencode: not installed"; fi
 }
 
 # ---------- selftest (hermetic: zero model calls, zero network, own cache+tmp) ----------
@@ -589,9 +565,6 @@ def staled(d, sendfile, waited):   # a send its turn outran opens the next turn,
             and result(d, 2) == 'turn 2: ' + said and (w['turn'], w['status']) == (2, 'ok')
             and [e['turn'] for e in es if e.get('call') == 'exec-late-1'] == [1] and strays == ['item/completed commandExecution', 'thread/tokenUsage/updated']
             and json.load(open(J(d, 'turn-2', 'envelope.json')))['usage'] == {'in': 6, 'out': 3, 'cache_read': 4, 'reasoning': 1})
-def schemas(f, schema, n):   # every turn/start of every launch carries the schema whole as its outputSchema
-    starts = [p for run in rpcin(f) for m, p in run if m == 'turn/start']
-    return len(starts) == int(n) and all(p.get('outputSchema') == json.load(open(schema)) for p in starts)
 CXCOLLAB = {'in': 506, 'out': 53, 'cache_read': 4, 'reasoning': 1}   # the main turn's two calls (10/4/3/1) + its collaborator's (500/50)
 def collab(d):   # a collaborator codex spawned reports on its own thread: one seat turn, the main answer, none of the
     # collaborator's text, thought or calls -- but its tokens are the turn's, and its items and turns show the seat alive
@@ -716,16 +689,7 @@ def torn(d, stdin, sent):   # the next record reaches the CLI whole: every line 
     return (all(isinstance(x, dict) and x.get('type') == 'user' for x in ls) and len(ls) == 2
             and ls[-1]['message']['content'][0]['text'] == want and (end['status'], end['turn']) == ('ok', 2)
             and open(J(d, 'turn-2', 'result.txt')).read() == want and len(drops) == 1 and 'TORN' in drops[0]['text'])
-def floored(d, want):   # a launch refused on its CLI's version: rc 2, the printed envelope typed, the CLI never launched
-    ack, e = json.load(open(d + '.ack')), json.load(open(J(d, 'envelope.json')))
-    return (open(d + '.rc').read().split() == ['2'] and ack == e and (e['status'], e['reason'], e['rc']) == ('refused', 'cli-too-old', 2)
-            and ('>= ' + want) in e['reset'] and not os.path.exists(d + '.calls') and not os.path.exists(J(d, 'turn-1')))
-def refloored(d, want):   # a relaunch refused on the CLI's version launches nothing; the next good one resumes turn 2
-    ack, es = json.load(open(d + '.ack')), [json.loads(l) for l in open(J(d, 'events.jsonl'))]
-    return (open(d + '.rc').read().split() == ['2'] and (ack['status'], ack['reason']) == ('refused', 'cli-too-old') and ('>= ' + want) in ack['reset']
-            and open(d + '.calls1').read().split() == ['1'] and open(d + '.calls').read().split() == ['2']
-            and [(e['turn'], e['status']) for e in es if e['kind'] == 'turn_end'] == [(1, 'ok'), (2, 'ok')]
-            and json.load(open(J(d, 'turn-2', 'envelope.json')))['session'] == json.load(open(J(d, 'turn-1', 'envelope.json')))['session'])
+
 def relaunch1(d, calls, a1, a2):   # two sends racing to a gone seat: ONE launch answers both, one acks spawned, the other sent
     acks = sorted(json.loads(open(f).read().strip().split('\n')[-1])['status'] for f in (a1, a2))
     rs = [open(J(d, 'turn-%d' % n, 'result.txt')).read() for n in (1, 2, 3)]
@@ -789,7 +753,6 @@ sys.exit(0 if globals()[sys.argv[1]](*sys.argv[2:]) else 1)
 PY
   cat >"$SB/acp-stub" <<'STUB'
 #!/bin/sh
-[ "$*" = --version ] && { echo "${ACP_VERSION:-@VERSION@}"; exit 0; }
 # `session ...` (opencode: the wrapper deletes an abandoned turn's session): OC_SESSION_LOG appends argv and the cwd per
 # call -- after a second, as a real delete takes a moment (its standalone server) that nothing may cut
 if [ "${1:-}" = session ]; then
@@ -803,8 +766,7 @@ exec python3 @TEST@ --fake "${ACP_REPLAY:-@SEAT@}" "${ACP_MODE:-eof}" "${ACP_REC
 STUB
   for c in grok opencode; do
     python3 "$SB/chk.py" derive "$HERE/fixtures/$c-acp-seat-sample.jsonl" "$SB/$c-seat.jsonl" nocancel
-    v="grok 1.0.46 (stub)"; [ "$c" = opencode ] && v=2.0.22
-    sed -e "s|@TEST@|'$HERE/test_acp.py'|" -e "s|@SEAT@|$SB/$c-seat.jsonl|" -e "s|@VERSION@|$v|" "$SB/acp-stub" >"$SB/bin/$c"; chmod +x "$SB/bin/$c"
+    sed -e "s|@TEST@|'$HERE/test_acp.py'|" -e "s|@SEAT@|$SB/$c-seat.jsonl|" "$SB/acp-stub" >"$SB/bin/$c"; chmod +x "$SB/bin/$c"
   done
   python3 "$SB/chk.py" derive "$HERE/fixtures/grok-acp-seat-sample.jsonl" "$SB/grok-hang.jsonl" hang
   python3 "$SB/chk.py" derive "$HERE/fixtures/grok-acp-seat-sample.jsonl" "$SB/grok-402.jsonl" "err:$HERE/fixtures/grok-402-balance.txt"
@@ -883,11 +845,6 @@ for l in open(sys.argv[1]):
   ACP_ARGV_LOG="$SB/a109b.argv" stub_run --effort low --out "$SB/a109b" opencode:foo "$SB/q.md" >/dev/null 2>&1; R109B=$?
   t 109 "an opencode seat names provider/model: a model-less and a non-slash buy are refused before launch (rc 2, refused model-required, no agent argv)" \
     sh -c "[ $R109A -eq 2 ] && [ $R109B -eq 2 ] && [ ! -e '$SB/a109a.argv' ] && [ ! -e '$SB/a109b.argv' ] && jq -e -s 'all(.status==\"refused\" and .reason==\"model-required\")' '$SB/a109a/envelope.json' '$SB/a109b/envelope.json' >/dev/null"
-  printf '{"type":"object"}' >"$SB/a127.schema"
-  ACP_ARGV_LOG="$SB/a127a.argv" stub_run --effort low --json-schema "$SB/a127.schema" --cwd "$SB/tmp" --out "$SB/a127a" grok:grok-4.6 "$SB/q.md" >/dev/null 2>&1; R127A=$?
-  ACP_ARGV_LOG="$SB/a127b.argv" stub_run --effort low --json-schema "$SB/a127.schema" --cwd "$SB/tmp" --out "$SB/a127b" opencode:opencode-go/deepseek-v4.1-flash "$SB/q.md" >/dev/null 2>&1; R127B=$?
-  t 127 "--json-schema on an ACP seat (grok, opencode) is refused before any launch (rc 2, refused schema-unsupported, no agent argv): ACP v1 has no structured-output field, and the envelope never reads prose" \
-    sh -c "[ $R127A -eq 2 ] && [ $R127B -eq 2 ] && [ ! -e '$SB/a127a.argv' ] && [ ! -e '$SB/a127b.argv' ] && jq -e -s 'length==2 and all(.status==\"refused\" and .reason==\"schema-unsupported\")' '$SB/a127a/envelope.json' '$SB/a127b/envelope.json' >/dev/null"
   ACP_REPLAY="$SB/grok-hang.jsonl" ACP_MODE=stubborn ACP_REC="$SB/a110.rec" OC_SESSION_LOG="$SB/a110.del" stub_run start --effort low --cwd "$SB/tmp" --out "$SB/a110" grok:grok-4.6 "$SB/q.md" >/dev/null 2>&1
   for i in $(seq 1 50); do grep -q '"kind": "turn_start"' "$SB/a110/events.jsonl" 2>/dev/null && [ -s "$SB/a110.rec.child" ] && break; sleep 0.1; done
   stub_run stop "$SB/a110" >/dev/null 2>&1; echo $? >"$SB/a110.rc"
@@ -1012,16 +969,6 @@ for l in open(sys.argv[1]):
   stub_run stop "$SB/c180" >/dev/null 2>&1
   t 180 "A RELAUNCH AFTER A WRAPPER DIED WITHOUT ITS CLOSE-OUT (SIGKILL mid-turn, two sends steered into it) closes turn 1 incomplete first, then numbers past it: the relaunch acks spawned expect 2, the next send sent expect 3, and wait returns turn 3's answer" \
     sh -c "jq -e '.status==\"spawned\" and .expect==2' '$SB/c180.a1' >/dev/null && jq -e '.status==\"sent\" and .expect==3' '$SB/c180.a2' >/dev/null && [ \"\$(cat '$SB/c180.wrc')\" = 0 ] && jq -e '.status==\"incomplete\"' '$SB/c180/turn-1/envelope.json' >/dev/null && jq -e '.status==\"ok\" and .turn==3' '$SB/c180/envelope.json' >/dev/null && [ ! -e '$SB/c180/turn-4' ]"
-  printf '{"type":"object","properties":{"status":{"type":"string","enum":["ok","blocked","error"]},"summary":{"type":"string"},"blockers":{"type":"array","items":{"type":"string"}}},"required":["status","summary","blockers"],"additionalProperties":false}' >"$SB/c125.schema"
-  CX_STUB_MODE=schema CX_STDIN_LOG="$SB/c125.stdin" stub_run --json-schema "$SB/c125.schema" --cwd "$SB/cxw" --out "$SB/c125" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
-  CX_STUB_MODE=schema CX_STDIN_LOG="$SB/c125.stdin" stub_run send "$SB/c125" "$SB/q81.md" >/dev/null 2>&1
-  stub_run wait "$SB/c125" --timeout 30 >/dev/null 2>&1; stub_run stop "$SB/c125" >/dev/null 2>&1
-  t 125 "CODEX SCHEMA: --json-schema rides EVERY turn/start as outputSchema, the job dir copy of the buy's file; the envelope status is the FINAL message parsed as JSON: blocked, summary + blockers riding the envelope, while an earlier message (voided by a later tool) claimed ok" \
-    sh -c "S=\$(jq -r .schema '$SB/c125/session') && cmp -s '$SB/c125.schema' \"\$S\" && python3 '$SB/chk.py' schemas '$SB/c125.stdin' \"\$S\" 2 && jq -e -s 'length==2 and all(.status==\"blocked\" and .summary==\"needs owner\" and .blockers==[\"b1\"] and .rc==0 and .session==\"th_stub123\")' '$SB/c125/turn-1/envelope.json' '$SB/c125/turn-2/envelope.json' >/dev/null"
-  for m in noschema nofinal; do
-    CX_STUB_MODE=$m stub_run --json-schema "$SB/c125.schema" --cwd "$SB/cxw" --out "$SB/c126-$m" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1; done
-  t 126 "...a codex schema turn whose final message is prose, or absent (its one message voided by a later tool), is error no-envelope (rc 1, empty result): the envelope never reads prose, and an earlier message is never promoted" \
-    sh -c "jq -e -s 'length==2 and all(.status==\"error\" and .reason==\"no-envelope\" and .rc==1)' '$SB/c126-noschema/envelope.json' '$SB/c126-nofinal/envelope.json' >/dev/null && [ ! -s '$SB/c126-noschema/turn-1/result.txt' ] && [ ! -s '$SB/c126-nofinal/turn-1/result.txt' ]"
   CX_STUB_MODE=park CX_STUB_PIDFILE="$SB/c123.pid" CX_STDIN_LOG="$SB/c123.stdin" stub_run --effort high --timeout 3 --cwd "$SB/cxw" --out "$SB/c123" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
   t 182 "a codex seat's DEADLINE closes it politely: a turn/interrupt naming the open turn, then its stdin closed (the app-server reaps the command it ran); turn 1 is timeout (rc 142) on its thread and no process is left" \
     python3 "$SB/chk.py" interrupted "$SB/c123" "$SB/c123.pid"
@@ -1095,12 +1042,12 @@ for l in open(sys.argv[1]):
   t 58 "codex seats PERSIST sessions: thread/start asks for a persisted thread (ephemeral false, the resume substrate)" \
     sh -c "grep '\"thread/start\"' '$SB/pf58.stdin' | jq -e '.params.ephemeral==false' >/dev/null"
 
-  # the --bg spawn line self-teaches the output contract (drivers once read
+  # the start spawn line self-teaches the output contract (drivers once read
   # absent results as instant-empty completion); codex, the last one-shot buy, is a seat now.
   PATH="$SB/bin:$PATH" TMPDIR="$SB/tmp" XDG_CACHE_HOME="$SB/cache" \
-    "$0" --bg --cwd "$SB/tmp" --out "$SB/bg70" codex:gpt-5.6-terra "$SB/q.md" >"$SB/bg70.spawn" 2>/dev/null
+    "$0" start --cwd "$SB/tmp" --out "$SB/bg70" codex:gpt-5.6-terra "$SB/q.md" >"$SB/bg70.spawn" 2>/dev/null
   for i in 1 2 3 4 5 6 7 8 9 10; do [ -e "$SB/bg70/envelope.json" ] && break; sleep 0.5; done
-  t 70 "a --bg codex buy is a SEAT like every other (no legacy nohup path left): its spawn line is an ACK (spawned, expect 1, delivery steer) that states the per-turn output contract, and turn 1 lands in turn-1/ ok" \
+  t 70 "a codex start is a SEAT like every other: its spawn line is an ACK (spawned, expect 1, delivery steer) that states the per-turn output contract, and turn 1 lands in turn-1/ ok" \
     sh -c "jq -e '.status==\"spawned\" and .expect==1 and .delivery==\"steer\" and (.note|test(\"turn-N\")) and (.note|test(\"never finished-empty\"))' '$SB/bg70.spawn' >/dev/null && jq -e '.status==\"ok\" and .turn==1' '$SB/bg70/envelope.json' >/dev/null && [ \"\$(cat '$SB/bg70/turn-1/result.txt')\" = 'stub ok' ]"
 
   # GROUP KILL + SESSION HARVEST rows (an orphan incident: a timed-out codex
@@ -1171,7 +1118,7 @@ STUB
     sh -c "[ \"\$(cat '$SB/t74.rc' 2>/dev/null)\" = 130 ] && [ -s '$SB/t74.pid' ] && ! kill -0 \$(cat '$SB/t74.pid') 2>/dev/null"
 
   # 75 is 74's MIRROR and the nohup contract: when the caller has ALREADY ignored the
-  # signal — `nohup` on the --bg path — the wrapper must not
+  # signal — `nohup` on a background buy — the wrapper must not
   # install a handler over that SIG_IGN. Those guards exist so a seat outlives a terminal
   # teardown, and the old exec form honoured them by inheritance; catching the signal
   # anyway would make every backgrounded buy killable by a stray HUP. The seat must still
@@ -1186,7 +1133,7 @@ STUB
   sleep 0.5
   T75ALIVE=no; kill -0 "$(cat "$SB/t75.pid")" 2>/dev/null && T75ALIVE=yes
   wait $T75SUB 2>/dev/null
-  t 75 "an INT the caller ALREADY ignored (nohup --bg) never reaches the seat: no handler is installed over SIG_IGN, so the seat dies only at its own alarm" \
+  t 75 "an INT the caller ALREADY ignored (nohup) never reaches the seat: no handler is installed over SIG_IGN, so the seat dies only at its own alarm" \
     sh -c "[ '$T75ALIVE' = yes ] && [ \"\$(cat '$SB/t75.rc' 2>/dev/null)\" = 142 ]"
 
   # 78: THE SEAT BOX is engine-injected, not driver-remembered: the seat
@@ -1226,13 +1173,6 @@ STUB
     python3 "$SB/chk.py" vocab "$SB/p84" turn_start,text,thought,tool_call,tool_result,usage,turn_end,progress ok,ok,ok ZEBRA-42
   t 155 "TRIMMED, PRICED STDOUT USAGE: the envelope line wait prints carries usage {in, cache_read, cache_write, out, cost_usd} only (at most 100 bytes; the rest of the line is envelope.json's), envelope.json keeps reasoning too, and claude's turn cost is the step of its process-cumulative total_cost_usd (recorded seat: 0.059393, 0.0156844, 0.0041071)" \
     python3 "$SB/chk.py" trimmed "$SB/p84.wait" "$SB/p84"
-  printf '{"type":"object","properties":{"status":{"type":"string","enum":["ok","blocked","error"]},"summary":{"type":"string"},"blockers":{"type":"array","items":{"type":"string"}}},"required":["status","summary"]}' >"$SB/schema.json"
-  CL_STUB_MODE=schema CL_ARGV_LOG="$SB/p86.argv" stub_run --json-schema "$SB/schema.json" --cwd "$SB/tmp" --out "$SB/p86" claude:sonnet "$SB/q.md" >/dev/null 2>&1
-  t 86 "SCHEMA ENVELOPE: --json-schema reaches the CLI verbatim and the status is read ONLY from the dedicated field — structured_output says blocked while the prose result claims ok: blocked wins, summary + blockers ride the envelope" \
-    sh -c "[ \"\$(awk 'p==\"--json-schema\"{print;exit}{p=\$0}' '$SB/p86.argv')\" = \"\$(cat '$SB/schema.json')\" ] && jq -e '.status==\"blocked\" and .summary==\"needs owner\" and .blockers==[\"b1\"] and .rc==0' '$SB/p86/envelope.json' >/dev/null"
-  CL_STUB_MODE=noschema stub_run --json-schema "$SB/schema.json" --cwd "$SB/tmp" --out "$SB/p87" claude:sonnet "$SB/q.md" >/dev/null 2>&1
-  t 87 "…and a MISSING structured_output (rc 0, subtype success, prose claiming ok) is error, reason no-envelope — never a fallback to the prose" \
-    sh -c "jq -e '.status==\"error\" and .reason==\"no-envelope\"' '$SB/p87/envelope.json' >/dev/null && [ ! -e '$SB/p87/result.txt' ]"
   for m in quoted quotedfail quota authfail; do CL_STUB_MODE=$m stub_run --cwd "$SB/tmp" --out "$SB/p88$m" claude:sonnet "$SB/q.md" >/dev/null 2>&1; done
   t 88 "failure typing reads provider fields + stderr only: an answer QUOTING a usage-limit line stays ok, and a failing turn whose prose quotes one is a plain error (the quoted-text class); an is_error result is provider-quota-dead with its reset; a stderr login failure is auth-expired" \
     sh -c "jq -e '.status==\"ok\"' '$SB/p88quoted/envelope.json' >/dev/null && jq -e '.status==\"error\" and .rc==1' '$SB/p88quotedfail/envelope.json' >/dev/null && jq -e '.status==\"provider-quota-dead\" and (.reset|test(\"resets 6:20am\"))' '$SB/p88quota/envelope.json' >/dev/null && jq -e '.status==\"auth-expired\"' '$SB/p88authfail/envelope.json' >/dev/null"
@@ -1343,13 +1283,11 @@ STUB
   t 93 "STOP reaps a persistent seat mid-turn: the seat process is dead, no wrapper remains, and the turn in flight is typed incomplete (rc 143) with its session" \
     sh -c "[ \"\$(cat '$SB/p93.rc')\" = 0 ] && python3 '$SB/chk.py' gone '$SB/p89b' \$(cat '$SB/p89b.pid') && jq -e '.status==\"incomplete\" and .rc==143 and .session==\"sess-stub\" and .turn==1' '$SB/p89b/envelope.json' >/dev/null"
   # 168 (main's hands row 81): NO SEAT INHERITS THE DRIVER'S MESSAGING SOCKET/TOKEN. The caller exports both; the shim
-  # logs every process of every provider CLI on a buy per provider (153's), --probe all, and --list's catalog (HOME =
-  # the sandbox). Falsification: drop the wrapper's strip (seat.py spawn) -> the buy and probe halves; drop run_list's
-  # unset -> the list half.
+  # logs every process of every provider CLI on a buy per provider (153's) and --probe all. Falsification: drop the
+  # wrapper's strip (seat.py spawn) -> both halves.
   CLAUDE_CODE_MESSAGING_SOCKET="$SB/d.sock" CLAUDE_CODE_MESSAGING_TOKEN=tok-stub SEAT_ENV_LOG="$SB/env168-probe.log" shim_run --probe all >/dev/null 2>&1
-  CLAUDE_CODE_MESSAGING_SOCKET="$SB/d.sock" CLAUDE_CODE_MESSAGING_TOKEN=tok-stub SEAT_ENV_LOG="$SB/env168-list.log" HOME="$SB" shim_run --list >/dev/null 2>&1 </dev/null
-  t 168 "no seat inherits the driver's messaging socket/token: with the caller exporting both, neither name reaches any process of any provider's CLI on a buy (each wire), --probe all, or --list (the opencode catalog)" \
-    sh -c "for c in claude codex grok opencode; do grep -q \"^== \$c \" '$SB/env168-buy.log' && grep -q \"^== \$c \" '$SB/env168-probe.log' || exit 1; done; grep -q '^== opencode models' '$SB/env168-list.log' && for f in buy probe list; do grep -qx PATH '$SB/env168-'\$f.log && ! grep -q '^CLAUDE_CODE_MESSAGING_' '$SB/env168-'\$f.log || exit 1; done"
+  t 168 "no seat inherits the driver's messaging socket/token: with the caller exporting both, neither name reaches any process of any provider's CLI on a buy (each wire) or --probe all" \
+    sh -c "for c in claude codex grok opencode; do grep -q \"^== \$c \" '$SB/env168-buy.log' && grep -q \"^== \$c \" '$SB/env168-probe.log' || exit 1; done; for f in buy probe; do grep -qx PATH '$SB/env168-'\$f.log && ! grep -q '^CLAUDE_CODE_MESSAGING_' '$SB/env168-'\$f.log || exit 1; done"
   # 169 (main's reply row 33, on send): a seat bought with NO socket exported is gone; a send whose caller exports both
   # relaunches it: the relaunched CLI sees neither name, its wrapper captured the socket, and pushed its turn (2, never
   # 1). Falsification: drop the wrapper's strip -> the env half; put main's top-of-file unset back -> no capture, no push.
@@ -1425,20 +1363,6 @@ STUB
   stub_run stop "$MC" >/dev/null 2>&1
   t 144 "driver mail to a BUSY steered seat (codex, mid-turn) joins its turn: its marker lands before turn 1 ends, the labelled text reaches the one app-server as a turn/start the open turn takes, and turn 1 ends ok (rc 0) answering its prompt and the mail -- no second turn, nothing cancelled" \
     python3 "$SB/chk.py" busymail "$MC" "$SB/m144.calls" "$SB/m144.stdin"
-  # VERSION FLOOR (seat.py FLOOR): every launch, start or relaunch, reads its CLI's --version before anything runs
-  CL_VERSION='2.1.282 (Claude Code)' CL_STUB_CALLS="$SB/v147c.calls" stub_run start --cwd "$SB/tmp" --out "$SB/v147c" claude:sonnet "$SB/q.md" >"$SB/v147c.ack" 2>/dev/null; echo $? >"$SB/v147c.rc"
-  ACP_VERSION='grok 1.0.45' ACP_ARGV_LOG="$SB/v147g.calls" stub_run start --effort low --cwd "$SB/tmp" --out "$SB/v147g" grok:grok-4.6 "$SB/q.md" >"$SB/v147g.ack" 2>/dev/null; echo $? >"$SB/v147g.rc"
-  CX_VERSION='codex-cli (dev build)' CX_STUB_CALLS="$SB/v147x.calls" stub_run start --cwd "$SB/cxw" --out "$SB/v147x" codex:gpt-5.6-terra "$SB/q.md" >"$SB/v147x.ack" 2>/dev/null; echo $? >"$SB/v147x.rc"
-  ACP_VERSION='2.0.21' ACP_ARGV_LOG="$SB/v147o.calls" stub_run start --effort low --cwd "$SB/gdir" --out "$SB/v147o" opencode:opencode-go/deepseek-v4.1-flash "$SB/q.md" >"$SB/v147o.ack" 2>/dev/null; echo $? >"$SB/v147o.rc"
-  t 147 "VERSION FLOOR at start: a CLI below its floor (claude 2.1.282 < 2.1.283, grok 1.0.45 < 1.0.46, opencode 2.0.21 < 2.0.22, the version tested lock-free on a shared store) or with no readable version (codex) is refused before any launch -- rc 2, the printed envelope refused with reason cli-too-old naming the floor, the CLI never run past --version (no launch counted, no argv logged)" \
-    sh -c "python3 '$SB/chk.py' floored '$SB/v147c' 2.1.283 && python3 '$SB/chk.py' floored '$SB/v147g' 1.0.46 && python3 '$SB/chk.py' floored '$SB/v147x' 0.160.0 && python3 '$SB/chk.py' floored '$SB/v147o' 2.0.22"
-  CL_STUB_CALLS="$SB/v148.calls" stub_run start --cwd "$SB/tmp" --out "$SB/v148" claude:sonnet "$SB/q.md" >/dev/null 2>&1
-  stub_run wait "$SB/v148" --timeout 30 >/dev/null 2>&1; stub_run stop "$SB/v148" >/dev/null 2>&1
-  CL_VERSION='2.0.9 (Claude Code)' CL_STUB_CALLS="$SB/v148.calls" stub_run send "$SB/v148" "$SB/q81.md" >"$SB/v148.ack" 2>/dev/null; echo $? >"$SB/v148.rc"
-  cp "$SB/v148.calls" "$SB/v148.calls1"
-  CL_STUB_CALLS="$SB/v148.calls" stub_run send "$SB/v148" "$SB/q81.md" >/dev/null 2>&1; stub_run wait "$SB/v148" --timeout 30 >/dev/null 2>&1; stub_run stop "$SB/v148" >/dev/null 2>&1
-  t 148 "VERSION FLOOR at relaunch: a send to a gone seat whose CLI is now below its floor is refused (rc 2, cli-too-old) and launches nothing; the seat stays resumable -- the next send on a good CLI relaunches it and turn 2 answers ok on the same session" \
-    python3 "$SB/chk.py" refloored "$SB/v148" 2.1.283
   # 159, 170: NO PERSONAL HOOKS, NO CODEX MEMORIES. Every seat runs its CLI with the user's hooks off, each by its own
   # switch, and codex with the user's memories off (the twin of claude's auto-memory off), on a launch and a relaunch.
   # Falsification: drop any one switch -> its half here.
@@ -1472,7 +1396,7 @@ STUB
   t 94 "an answer FOLLOWED by a tool call is voided, never promoted: narration before a tool is no report (the turn fails closed: error, reason empty)" \
     sh -c "jq -e '.status==\"error\" and .reason==\"empty\"' '$SB/p94/envelope.json' >/dev/null && [ ! -e '$SB/p94/result.txt' ] && jq -e -s 'map(select(.kind==\"tool_call\" and .call==\"exec-5\")) | length==1' '$SB/p94/events.jsonl' >/dev/null"
   t 95 "INBOX BEFORE PROCESS: every buy creates DIR/inbox.jsonl and DIR/outbox.jsonl, empty, before its seat starts, so the SEAT BOX names existing files (an ACP grok seat too)" \
-    sh -c "for d in '$SB/a100' '$SB/p87'; do [ -f \"\$d/inbox.jsonl\" ] && [ ! -s \"\$d/inbox.jsonl\" ] && [ -f \"\$d/outbox.jsonl\" ] && [ ! -s \"\$d/outbox.jsonl\" ] || exit 1; done"
+    sh -c "for d in '$SB/a100' '$SB/g49'; do [ -f \"\$d/inbox.jsonl\" ] && [ ! -s \"\$d/inbox.jsonl\" ] && [ -f \"\$d/outbox.jsonl\" ] && [ ! -s \"\$d/outbox.jsonl\" ] || exit 1; done"
   : >"$SB/p96.pid"
   CL_STUB_MODE=deaf CL_STUB_PIDFILE="$SB/p96.pid" stub_run start --cwd "$SB/tmp" --out "$SB/p96" claude:sonnet "$SB/q.md" >/dev/null 2>&1
   for i in $(seq 1 50); do [ -s "$SB/p96.pid" ] && break; sleep 0.1; done
@@ -1500,16 +1424,7 @@ STUB
   st="$(classify_blob "plain unrelated failure text")"
   t 16 "unrelated text → error"           sh -c "printf '%s' '${st%%$'\t'*}' | grep -qx error"
 
-  # list + not-installed probe shape (PATH stripped of all provider CLIs; system tools kept)
-  # 19 runs on the stub PATH: --list asks the opencode CLI for its catalog on the caller's own store, as a seat sees it,
-  # through a PRIVATE server (a standalone one never resumes another process's turns). Falsification: drop --standalone ->
-  # the argv half; a throwaway store -> the logged store is not the caller's; seed one -> two CLI runs; keep the key -> SET.
-  t 19 "list carries static seats, and asks the opencode catalog through a PRIVATE server (models --standalone) on the CALLER's store (XDG_DATA_HOME unchanged), ONE CLI run (nothing seeded), no key in its env" \
-    sh -c "ACP_ARGV_LOG='$SB/l19.argv' ACP_ENV_LOG='$SB/l19.env' ACP_PIDFILE='$SB/l19.pids' OPENCODE_API_KEY=sk-caller-env PATH='$SB/bin:$PATH' HOME='$SB' TMPDIR='$SB/tmp' '$0' --list </dev/null >'$SB/l19.out' && grep -q 'claude:sonnet' '$SB/l19.out' && grep -q 'codex:gpt-5.6-terra' '$SB/l19.out' && [ \"\$(tr '\\n' ' ' <'$SB/l19.argv')\" = 'models --standalone ' ] && [ \"\$(sed -n '1p' '$SB/l19.env')\" = '$SB/oc-store' ] && [ \"\$(wc -l <'$SB/l19.pids' | tr -d ' ')\" = 1 ] && [ \"\$(sed -n '5p' '$SB/l19.env')\" = key= ]"
-  # 19b: no grok models cache -> --list says so. Falsification: the old `| sed || echo` (the pipe's rc is sed's) -> silent
-  mkdir -p "$SB/h19b"
-  t 19b "list names an absent grok models cache instead of printing nothing" \
-    sh -c "PATH='$SB/bin:$PATH' HOME='$SB/h19b' TMPDIR='$SB/tmp' '$0' --list </dev/null 2>/dev/null | grep -qx '# grok: models cache absent (run grok once)'"
+  # the not-installed probe shape (PATH stripped of all provider CLIs; system tools kept)
   t 20 "probe(all) four not-installed lines full-schema" sh -c "PATH=/usr/bin:/bin HOME='$SB' TMPDIR='$SB/tmp' XDG_CACHE_HOME='$SB/cache' '$0' --probe all | jq -e -s 'length==4 and all(.[]; .status==\"not-installed\" and has(\"dir\") and has(\"usage\"))'"
   # 20b: the probe's temp files are made fresh (mktemp): links planted at the names an older probe used ($TMPDIR/
   # hands-probe-lines-<pid> and hands-probe-<pid>.txt, the pid known because sh exec keeps it) are never written through.
@@ -1519,21 +1434,6 @@ STUB
   t 20b "probe temp files are fresh: links planted at fixed names are never written through, and the probe leaves no temp file" \
     sh -c "[ \"\$(cat '$SB/victim20b')\" = keep ] && [ \"\$(ls '$SB/tmp20b' | grep -vc '^hands-probe-' )\" = 0 ] && [ \"\$(ls '$SB/tmp20b' | wc -l | tr -d ' ')\" = 2 ]"
 
-  # 198: a stop that finds a wrapper with no seat process yet (here in its version check) never signals the CALLER's
-  # group: the spawn parent, waiting on its wrapper's ack, has the same argv and the caller's group. The script runs in a
-  # session of its own, with a sibling sleep in its group. Falsification: the old fallback (every match's group) -> the
-  # script and its sibling die, and no mark is written
-  cat >"$SB/r198.sh" <<EOF
-sleep 40 & echo \$! >"$SB/r198.sib"
-CL_VERSION_SLEEP=8 "$SELF" start --cwd "$SB/tmp" --out "$SB/o198" claude:sonnet "$SB/q.md" >/dev/null 2>&1 &
-i=0; until ps -A -ww -o command= | grep -q 'seat.py spawn [^ ]*/o198 ' || [ \$i -ge 150 ]; do i=\$((i+1)); sleep 0.1; done
-"$SELF" stop "$SB/o198" >/dev/null 2>&1
-kill -0 \$(cat "$SB/r198.sib") && echo alive >"$SB/r198.ok"
-kill \$(cat "$SB/r198.sib"); wait
-EOF
-  PATH="$SB/bin:$PATH" TMPDIR="$SB/tmp" XDG_CACHE_HOME="$SB/cache" python3 -c 'import os, sys; os.setsid(); os.execvp("sh", ["sh", sys.argv[1]])' "$SB/r198.sh" >/dev/null 2>&1
-  t 198 "STOP DURING A LAUNCH never signals the caller's process group: the calling script and its sibling live on, and no wrapper is left" \
-    sh -c "[ -f '$SB/r198.ok' ] && python3 '$SB/chk.py' gone '$SB/o198'"
   # 199: a wrapper that dies mid-turn (here KILLed with its CLI) leaves the sent turn without an end: wait says so,
   # incomplete wrapper-gone rc 1, never the previous turn's ok answer. Falsification: report the last envelope -> turn 1's
   # answer and ok
@@ -1765,7 +1665,6 @@ case "$VERB" in   # the seat verbs (start is the buy below)
 esac
 if [ "$SELFTEST" = 1 ]; then case "$0" in */*) ;; *) exec bash "$SELF" --selftest ;; esac   # the suite reruns "$0": give it a path
   run_selftest; exit $?
-elif [ "$LIST" = 1 ]; then run_list; exit 0
 elif [ -n "$PROBE" ]; then run_probe "$PROBE"; exit $?
 elif [ $# -ge 2 ]; then
   run_single "$1" "$2"; exit $?

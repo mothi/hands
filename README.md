@@ -60,8 +60,8 @@ Report vulnerabilities privately: see [SECURITY.md](SECURITY.md).
   [Codex](https://github.com/openai/codex) (`codex`), Grok (`grok`), or
   [OpenCode](https://opencode.ai) (`opencode`)
 
-Each launch checks the CLI's `--version` against the oldest version proven to work (`FLOOR` in
-`seat.py`) and refuses an older one as `cli-too-old`.
+hands is tested with Claude Code 2.1.283, codex-cli 0.160, grok 1.0.46 and OpenCode 2.0.22, or
+later. Older CLIs may not speak the same wire.
 
 ## Install
 
@@ -85,7 +85,6 @@ H=~/src/hands/hands.sh
 mkdir -p /tmp/hands-try && cd /tmp/hands-try
 
 $H --probe all        # which providers answer (a 1-token ping each; it spends a little quota)
-$H --list             # known models, as provider:model lines
 
 echo "List the files here and say what each one is for." > task.md
 $H start --cwd /tmp/hands-try codex task.md   # prints {"status":"spawned","dir":"DIR",...}
@@ -135,10 +134,7 @@ validates them, so a model released tomorrow works today.
 | `--out DIR` | a fresh dir in the jobs root | the job dir. It must be new or empty, and is made with mode 0700. The default jobs root is `$XDG_STATE_HOME/hands` (when that is an absolute path), else `~/.local/state/hands` |
 | `--timeout SECS` | none | a wall clock per launch, shared by its turns. On expiry the open turn ends `timeout` with its session, and a `send` resumes it |
 | `--effort <tier>` | the CLI's default | see § Providers |
-| `--json-schema FILE` | none | Claude and Codex: the final message must match the schema, whose `status` becomes the envelope's. Grok and OpenCode refuse it |
-| `--bg` | off | a bare buy in the background, the same as `start` |
 | `--probe [P\|all]` | | a 1-token ping per provider with its smallest model, in `$TMPDIR` (exit 1 if any is unhealthy). A Claude probe still reads about 31k cached prompt tokens |
-| `--list` | | known models as `provider:model` lines (OpenCode's from its live catalog) |
 
 | Environment variable | Effect |
 |---|---|
@@ -156,7 +152,7 @@ to keep.
 | Verb | Does | Prints, exit code |
 |---|---|---|
 | `start [flags] spec FILE` | buys a seat: the seat contract + FILE + the seat's job-dir line as turn 1. Returns at once | `{"status":"spawned","dir",...}`, 0. A launch refused before any turn prints its envelope, 2 (else 1) |
-| `send DIR FILE` | the next turn. A live seat takes it as it takes any send (steer or queue). A seat whose process is gone relaunches from `DIR/session` on the same session, model, effort and cwd | `{"status":"sent",...}` or `spawned`, 0. `refused` (`no-session`, `cli-too-old`), 2 |
+| `send DIR FILE` | the next turn. A live seat takes it as it takes any send (steer or queue). A seat whose process is gone relaunches from `DIR/session` on the same session, model, effort and cwd | `{"status":"sent",...}` or `spawned`, 0. `refused` (`no-session`), 2 |
 | `mail DIR TEXT` | appends a driver line to `DIR/inbox.jsonl`; the live wrapper delivers it as `MAIL from driver` (it never cancels a running turn) | nothing, 0. 1 when no wrapper is live (the line waits for the next launch). 2 when the inbox is a link or not a regular file |
 | `wait DIR [--for turn\|mail\|exit] [--timeout S]` | blocks, spending nothing, until every sent turn ends (`turn`), the seat's next outbox line (`mail`), or the wrapper exits (`exit`) | the answer if ok, then the envelope; 0 if ok, else 1. At the timeout: `{"status":"running","last_event","open_tool_calls",...}`, 1 |
 | `events DIR [--follow]` | a readable view of `DIR/events.jsonl`: text blocks, one line per tool call, turn and usage lines with the cache-hit %, errors. `--follow` ends when the seat does. The raw stream is `tail -f DIR/events.jsonl` | text, 0 |
@@ -186,8 +182,7 @@ field:
 | `status` | Meaning | What to do |
 |---|---|---|
 | `ok` | the turn's final message is in `turn-N/result.txt` (and `DIR/result.txt`) | use it |
-| `blocked` | a schema result whose `status` is `blocked` (`blockers` ride along) | read the blockers |
-| `error` | a failure with no narrower class; `reason` names a known one: `no-envelope`, `empty`, `session-changed`, `wrapper-failed`, `handshake`. A Grok or OpenCode turn the model refuses mid-turn also ends `error` | read `stderr.log` and `stream.jsonl` |
+| `error` | a failure with no narrower class; `reason` names a known one: `empty`, `session-changed`, `wrapper-failed`, `handshake`. A Grok or OpenCode turn the model refuses mid-turn also ends `error` | read `stderr.log` and `stream.jsonl` |
 | `incomplete` | the stream ended inside the turn (a stop, a crash) | `send` to continue |
 | `cancelled` | the agent cancelled the turn | `send` to continue |
 | `truncated` | the turn hit the model's output limit | `send` to continue |
@@ -195,17 +190,13 @@ field:
 | `auth-expired` | the CLI needs a login | run that provider's login |
 | `provider-quota-dead` | the subscription window or balance is spent | if `reset` names a time, wait until then and don't retry before it. `reset: null` (a Grok spending limit) needs a top-up |
 | `not-installed` | the CLI isn't on your PATH | install it |
-| `refused` | typed before any prompt; `reason`: `model-mismatch`, `effort-unsupported`, `model-required`, `schema-unsupported`, `no-session`, `cli-too-old` | fix the buy |
+| `refused` | typed before any prompt; `reason`: `model-mismatch`, `effort-unsupported`, `model-required`, `no-session` | fix the buy |
 
 `usage` is the provider's own token count for the turn, normalized as `{in, out, cache_read,
 cache_write, reasoning}` with no overlap (`in` is uncached input), plus `cost_usd` when the
 provider reports it (Claude, Grok). A Codex turn's usage is the sum of its model calls, including
 calls by collaborator agents while the turn is open. The printed line trims `reasoning`; the files
 keep it, and the raw vendor usage stays in `stream.jsonl`.
-
-**Schema results** (`--json-schema FILE`, Claude and Codex): the status is the schema's own
-`status` field (`ok`, `blocked` or `error`), read only from the structured output; a missing or
-invalid one is `error` with reason `no-envelope`. A valid status is still a claim to check.
 
 Exit codes: `0` ok, `1` any other status, `2` refused or a usage error.
 
@@ -306,10 +297,7 @@ seat), and the exact command is shown before it runs.
 | `provider-quota-dead`, `reset: null` (Grok) | a spending limit; add credits |
 | `auth-expired` | run `claude`, `codex login`, `grok login` or `opencode auth login` |
 | `wait` prints `running` | the turn is still going. A long tool call is alive; a stale `last_event` with no open tool call is stuck: `stop`, then `send` |
-| `refused`, `effort-unsupported` or `model-mismatch` | pass an effort the model lists, and a model the agent lists (`--list`) |
-| `refused`, `schema-unsupported` | Grok and OpenCode have no structured output; drop `--json-schema` |
-| `refused`, `cli-too-old` | update that provider's CLI |
-| a Codex schema turn fails with a provider error | Codex sends schemas in strict mode: list every property in `required` and set `additionalProperties: false` |
+| `refused`, `effort-unsupported` or `model-mismatch` | pass an effort the model lists, and a model the agent lists (the refusal names them) |
 | `--out ... is not empty` | name a new or empty dir, or drop `--out` for a fresh one |
 | an OpenCode `send` after a stop or crash ends `error` (`handshake`) | the abandoned turn's session was deleted: start a fresh seat |
 | results gone after a month | the sweep deleted the idle dir; pass `--out` outside the jobs root for keepers |
