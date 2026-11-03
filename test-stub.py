@@ -166,7 +166,8 @@ def codex_server():   # the app-server (codex-cli 0.160 v2): one thread, th_stub
                 'nofinal': [msg('{"status":"ok","summary":"voided"}', 'msg_1'), cmd()],      # a tool after the only message voids it
                 'files': [edit('fc-7', '/w/file-1.txt'), cmd('exec-8', 2), edit('fc-11', '/w/file-2.txt', '/w/file-1.txt'), msg('FINAL-3: the audit')],
                 'slow': [msg('turn %d pid %d: %s' % (st['n'], os.getpid(), said))], 'stale': [msg('turn %d: %s' % (st['n'], said))],
-                'probe': [msg(probe(said))], 'subagent': [], 'latesub': [], 'nomain': [], 'unauthorized': []}.get(mode, [msg('stub ok')])
+                'probe': [msg(probe(said))] if mode == 'probe' else [],   # probe() reads a macOS-only call: only when asked
+                'subagent': [], 'latesub': [], 'nomain': [], 'unauthorized': []}.get(mode, [msg('stub ok')])
         for it in body:
             if it['type'] != 'agentMessage':
                 item(dict(it, status='inProgress', exitCode=None), False)
