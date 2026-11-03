@@ -1,0 +1,14 @@
+{
+  "config": {
+    "currentPeriod": {
+      "type": "USAGE_PERIOD_TYPE_WEEKLY",
+      "start": "2026-08-12T00:00:00.000000+00:00",
+      "end": "2026-08-19T00:00:00.000000+00:00"
+    },
+    "creditUsagePercent": 91.0,
+    "prepaidBalance": { "val": 0 },
+    "productUsage": [ { "product": "GrokBuild", "usagePercent": 91.0 } ],
+    "isUnifiedBillingUser": true,
+    "billingPeriodEnd": "2026-08-19T00:00:00.000000+00:00"
+  }
+}

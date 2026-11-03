@@ -1,0 +1,42 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: hands selftest
+        run: bash ./hands.sh --selftest
+      - name: ACP suite
+        run: python3 test_acp.py
+      - name: quota selftest
+        run: bash ./quota.sh --selftest
+      - name: rearm selftest
+        run: bash ./rearm.sh --selftest
+
+  # Linux is untested by design (--sandbox is macOS-only); this job reports how far the suites get.
+  ubuntu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: hands selftest
+        run: bash ./hands.sh --selftest
+      - name: ACP suite
+        if: always()
+        run: python3 test_acp.py
+      - name: quota selftest
+        if: always()
+        run: bash ./quota.sh --selftest
+      - name: rearm selftest
+        if: always()
+        run: bash ./rearm.sh --selftest

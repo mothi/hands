@@ -1,0 +1,4 @@
+Error: Internal error: {
+  "message": "API error (status 403 Forbidden): personal-team-blocked:spending-limit: You have run out of credits or need a Grok subscription. Add credits at https://grok.com/?_s=usage or upgrade at https://grok.com/supergrok.",
+  "http_status": 403
+}

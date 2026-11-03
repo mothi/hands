@@ -1,0 +1,31 @@
+{
+  "result": {
+    "ordinaryUsageAllowed": true,
+    "rateLimits": {
+      "limitId": "codex", "limitName": null, "normalModelSlug": null,
+      "primary": { "usedPercent": 40, "windowDurationMins": 10080, "resetsAt": 1794002569 },
+      "secondary": null,
+      "credits": { "hasCredits": false, "unlimited": false, "balance": "0" },
+      "individualLimit": null, "spendControlReached": false, "planType": "plus", "rateLimitReachedType": null
+    },
+    "rateLimitsByLimitId": {
+      "codex": {
+        "limitId": "codex", "limitName": null, "normalModelSlug": null,
+        "primary": { "usedPercent": 40, "windowDurationMins": 10080, "resetsAt": 1794002569 },
+        "secondary": null,
+        "credits": { "hasCredits": false, "unlimited": false, "balance": "0" },
+        "individualLimit": null, "spendControlReached": false, "planType": "plus", "rateLimitReachedType": null
+      }
+    },
+    "rateLimitResetCredits": {
+      "availableCount": 1,
+      "credits": [
+        { "id": "RateLimitResetCredit_FAKEFIXTUREID0000", "resetType": "codexRateLimits", "status": "available",
+          "grantedAt": 1793476413, "expiresAt": 1796068413, "title": "Full reset",
+          "description": "fixture-must-never-appear@example.com" }
+      ]
+    },
+    "accountId": "acct-FAKEFIXTUREID0000",
+    "rateLimitUpsell": null
+  }
+}

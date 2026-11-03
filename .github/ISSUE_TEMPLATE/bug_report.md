@@ -1,0 +1,23 @@
+---
+name: Bug report
+about: Something hands did that it shouldn't have, or didn't do
+labels: bug
+---
+
+**What happened**
+
+**What you expected**
+
+**How to reproduce**
+The `hands.sh` command you ran (with the prompt file's content, if it matters).
+
+**The envelope**
+The JSON line `wait` or the buy printed. Remove anything private first.
+
+**Versions**
+- macOS (or Linux) version:
+- `bash --version | head -1`, `python3 --version`:
+- the provider CLI's `--version` (claude, codex, grok or opencode):
+- does `bash ./hands.sh --selftest` pass? (paste its last line)
+
+Security issues: don't file them here — see SECURITY.md.
