@@ -620,11 +620,19 @@ def lock(d):   # THE delivery lock (events.jsonl's): one record at a time, its t
     return f
 
 
-def deliver(d, prov, fd, text, expect, turn, **mail):   # THE delivery (send, MSG, mail): the marker first, so a delivery that
-    # dies mid-write is typed. The record is framed LF + line + LF: a killed sender's torn bytes end at the next record's
-    # leading LF (whole() drops them). mail: the inbox line it delivers (inbox=its line number) rides the marker
+def marker(d, text, expect, turn, **mail):   # THE delivery marker (a send, MSG, mail), written before the message
+    # itself, so a delivery that dies mid-write is typed. mail: the inbox line it delivers (inbox=its line number)
     append(J(d, 'events.jsonl'), event('progress', turn, expect=expect, bytes=len(text.encode()), text='input: ' + clip(' '.join(text.split()), 200), **mail))
-    data = ('\n' + json.dumps(user_line(prov, text), ensure_ascii=False) + '\n').encode()
+
+
+def record(prov, text):   # a message as one in.fifo line
+    return json.dumps(user_line(prov, text), ensure_ascii=False).encode()
+
+
+def deliver(d, prov, fd, text, expect, turn):   # a send's delivery, through in.fifo. The record is framed LF + line + LF:
+    # a killed sender's torn bytes end at the next record's leading LF (whole() drops them)
+    marker(d, text, expect, turn)
+    data = b'\n' + record(prov, text) + b'\n'
     while data:
         data = data[os.write(fd, data):]
 
@@ -647,8 +655,11 @@ class Seat:
     """The wrapper: it outlives the CLI, owns the translation, and writes every turn's envelope."""
     def __init__(s, d, h, msg, ready):
         s.d, s.h, s.msg, s.ready, s.prov, (s.fam, s.delivery) = d, h, msg, ready, h['provider'], WIRES[h['provider']]
-        s.errs, s.mail_off, s.wfd, s.mlock, s.tlock, s.W = [], size(J(d, 'outbox.jsonl')), None, threading.Lock(), threading.Lock(), None
-        s.seen, s.poster, s.done, s.halt, s.late = -1, None, False, False, False   # halt: a stop; late: the deadline
+        s.errs, s.mail_off, s.wfd, s.tlock, s.W = [], size(J(d, 'outbox.jsonl')), None, threading.Lock(), None
+        s.seen, s.halt, s.late = -1, False, False   # halt: a stop; late: the deadline
+        # inq: the records the CLI is to get next, in order (in.fifo's, then the wrapper's own); ibuf: in.fifo's torn tail;
+        # sent: MSG is delivered; post: when the outbox and inbox are next looked at
+        s.inq, s.ibuf, s.sent, s.post = [], b'', False, 0
 
     def put(s, e):
         append(J(s.d, 'events.jsonl'), e)
@@ -666,21 +677,21 @@ class Seat:
         return State(s.d).read().expect > s.W.turn
 
     def mail(s):   # each new outbox line -> one push to the driver
-        with s.mlock:   # (the post thread and the wrapper's last flush both call it)
-            text, s.mail_off = tail(J(s.d, 'outbox.jsonl'), s.mail_off)
+        text, s.mail_off = tail(J(s.d, 'outbox.jsonl'), s.mail_off)
         turn = State(s.d).read().turn if text else 0   # the turn the mail arrived in
         for ln in text.split('\n')[:-1]:   # LF only, as State.read
             if ln.strip():
                 o = jparse(ln)
                 push(s.d, s.h, turn, 'mail', 'mail to driver', str(o.get('text') if isinstance(o, dict) else o))
 
-    def inbox(s):   # each inbox line not yet delivered -> the conversation, through THE delivery (a send's), in order, once
+    def inbox(s):   # each inbox line not yet delivered -> the conversation, as a send's message, in order, once
         f = J(s.d, 'inbox.jsonl')
         if size(f) == s.seen:
             return
-        with lock(s.d):
-            if s.wfd is None:   # no CLI to take it (relaunching, or closing out): it waits for the next launch
-                return
+        held = s.held()
+        if held is None:
+            return
+        with held:
             s.seen = size(f)
             with open(f, 'rb') as g:
                 lines = g.read(s.seen).split(b'\n')[:-1]
@@ -689,17 +700,57 @@ class Seat:
                 o = jparse(ln.decode('utf-8', 'replace'))
                 if n <= st.mailed or not isinstance(o, dict):
                     continue
-                try:
-                    deliver(s.d, s.prov, s.wfd, label(o), st.next_turn(s.delivery, True), st.turn, inbox=n)
-                except OSError:
-                    return   # its reader died mid-write: the close-out types that turn
+                s.take(label(o), st.next_turn(s.delivery, True), st.turn, inbox=n)
                 st.read()
 
-    def post(s):   # the post thread: push the outbox and deliver the inbox, every second, until the wrapper closes out
-        while not s.done:
+    def held(s):   # THE delivery lock, never waited for (a sender holding it may be blocked writing in.fifo, which only
+        # this loop reads), with in.fifo drained under it: what a sender delivered before goes first. None: try again later
+        f = open(J(s.d, 'events.jsonl'), 'ab')
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            f.close()
+            return None
+        s.read_fifo()
+        return f
+
+    def take(s, text, expect, turn, **mail):   # the wrapper's own delivery (MSG, mail), under held(): straight into inq
+        marker(s.d, text, expect, turn, **mail)
+        s.inq.append(record(s.prov, text))
+
+    def read_fifo(s):   # in.fifo's whole records -> inq
+        while True:
+            try:
+                chunk = os.read(s.rfd, 65536)
+            except BlockingIOError:
+                return
+            if not chunk:
+                return
+            *done, s.ibuf = (s.ibuf + chunk).split(b'\n')
+            s.inq.extend(whole(s.d, done))
+
+    def tick(s):   # every loop pass: MSG first; then, once a second, the outbox pushed and the inbox delivered
+        if not s.send_msg(0):
+            return
+        if time.time() >= s.post:
+            s.post = time.time() + 1
             s.mail()
             s.inbox()
-            time.sleep(1)
+
+    def send_msg(s, wait):   # MSG, as soon as the lock is free (tried for `wait` seconds) -> whether it is delivered
+        t0 = time.time()
+        while not s.sent:
+            held = s.held()
+            if held is not None:
+                with held:
+                    s.take(s.msg, s.first, s.first - 1)
+                s.sent = True
+                s.acked(s.first)
+            elif time.time() - t0 >= wait:
+                return False
+            else:
+                time.sleep(0.05)
+        return True
 
     def acked(s, n):   # the spawn caller's ACK: the turn MSG opens, or 0 = the launch was typed before any turn
         if s.ready is not None:
@@ -710,18 +761,9 @@ class Seat:
             os.close(s.ready)
             s.ready = None
 
-    def first_turn(s):
-        try:
-            with lock(s.d):
-                deliver(s.d, s.prov, s.wfd, s.msg, s.first, s.first - 1)
-        except OSError:
-            pass   # the CLI died before reading: the close-out types that turn
-        s.acked(s.first)
-        if s.poster is None:   # MSG first, then the mail
-            s.poster = threading.Thread(target=s.post, daemon=True)
-            s.poster.start()
-
-    def letgo(s, rfd):   # the CLI is gone: no reader, so a send finds the seat gone; the post thread's fd goes under the lock
+    def letgo(s, rfd):   # the CLI is gone: no reader, so a send finds the seat gone; the writer goes under the lock.
+        # MSG, when a stop came before the loop delivered it, is marked first: the close-out types its turn
+        s.send_msg(5)
         os.close(rfd)
         with lock(s.d):
             os.close(s.wfd)
@@ -733,10 +775,9 @@ class Seat:
             if os.path.lexists(f):
                 os.remove(f)
             os.mkfifo(f, 0o600)
-        rfd = os.open(f, os.O_RDONLY | os.O_NONBLOCK)   # the reader first, so neither open blocks
-        s.wfd = os.open(f, os.O_WRONLY)                  # the wrapper holds a writer: no EOF until it lets go
-        os.set_blocking(rfd, True)
-        return rfd
+        s.rfd = os.open(f, os.O_RDONLY | os.O_NONBLOCK)   # the reader first, so neither open blocks
+        s.wfd = os.open(f, os.O_WRONLY)                    # the wrapper holds a writer: no EOF until it lets go
+        return s.rfd
 
     def run(s):
         d, h = s.d, s.h
@@ -754,19 +795,20 @@ class Seat:
             p = reaped(s.limit() - time.time(), argv, stdin=subprocess.PIPE,
                        stdout=subprocess.PIPE, stderr=ef, cwd=h['cwd'], env=dict(os.environ, **env))
         s.W = W = Wire(s.prov, s.first - 1, h.get('session'), s.put, s.pending)
-        s.t = threading.Thread(target=s.first_turn, daemon=True)
-        s.t.start()
         rc = s.pump(p, W, rfd)
         s.letgo(rfd)
-        s.t.join(5)
         return s.close_out(s.cut(rc), W)
 
     def pump(s, p, W, rfd):   # the CLI's stdout -> events; in.fifo's whole records -> its stdin, until a stop closes it
         fd, buf, gone, closed = p.stdout.fileno(), b'', None, None
-        ibuf, obuf, cin = b'', b'', p.stdin.fileno()
+        obuf, cin = b'', p.stdin.fileno()
         os.set_blocking(cin, False)   # a CLI that is not reading never stalls its own stdout
         with open(J(s.d, 'stream.jsonl'), 'ab') as raw:
             while True:
+                if closed is None:
+                    s.tick()
+                    obuf += b''.join(ln + b'\n' for ln in s.inq)
+                    s.inq = []
                 if s.halt and closed is None:   # a stop: the close Rpc.close makes -- stdin EOF, then TERM at 2 s and KILL
                     closed, obuf = time.time(), b''   # at 4 s for the seat's groups (the reaper sits in the wrapper's own)
                     p.stdin.close()
@@ -774,8 +816,7 @@ class Seat:
                     term(seat_groups([os.getpid()]), signal.SIGTERM if time.time() - closed < 4 else signal.SIGKILL)
                 r, w, _ = select.select([fd] if closed else [fd, rfd], [cin] if obuf else [], [], 1.0)
                 if rfd in r:
-                    *done, ibuf = (ibuf + os.read(rfd, 65536)).split(b'\n')
-                    obuf += b''.join(ln + b'\n' for ln in whole(s.d, done))
+                    s.read_fifo()
                 if w:
                     try:
                         obuf = obuf[os.write(cin, obuf):]
@@ -855,7 +896,6 @@ class Seat:
             push(d, h, n, 'turn_end', status, text or reason or reset)
 
     def close_out(s, rc, W=None):   # the open turn, then every turn delivered and never answered, closes; then the exit
-        s.done = True
         if W and W.cur:
             s.finish([W.cut()], rc)
         st = State(s.d).read()
@@ -888,7 +928,7 @@ class Seat:
         return 142 if s.late else 143 if s.halt else rc   # 143, as the reaper's alarm and a TERM would; else the CLI's own
 
     def queued(s):
-        s.buf, deadline = b'', s.limit()
+        deadline = s.limit()
         # THE POLITE CLOSE (every JSON-RPC wire), at the deadline and at a stop alike: the wrapper ends the agent itself, with
         # Rpc.close (stdin EOF first, TERM only after its grace) -- opencode keeps a turn's execution claim on a TERM and
         # releases it on a polite close (opencode 2.0.22); codex's app-server reaps its commands on EOF, which an interrupt
@@ -899,24 +939,24 @@ class Seat:
         seat, why = acp.launch(s.prov, s.h, wrap, log, J(s.d, 'stderr.log')) if s.fam == 'acp' else s.codex(wrap, log)
         if why:
             return s.early(*why, seat=seat)
-        s.rfd, s.q = s.fifo(), queue.Queue()
+        s.fifo()
+        s.q = queue.Queue()
         worker = threading.Thread(target=s.turns, args=(seat,), daemon=True)
         if s.fam == 'acp':
             worker.start()
-        s.t = threading.Thread(target=s.first_turn, daemon=True)
-        s.t.start()
         while not s.halt and seat.proc.poll() is None and time.time() < deadline:
+            s.tick()
+            lines, s.inq = s.inq, []
+            for ln in lines:
+                s.q.put(ln) if s.fam == 'acp' else s.rpc_turn(seat, ln)
             if select.select([s.rfd], [], [], 0.5)[0]:
-                *done, s.buf = (s.buf + os.read(s.rfd, 65536)).split(b'\n')
-                for ln in whole(s.d, done):
-                    s.q.put(ln) if s.fam == 'acp' else s.rpc_turn(seat, ln)
+                s.read_fifo()
         s.late = seat.proc.poll() is None and time.time() >= deadline   # set BEFORE the close the turn reads it in
         if seat.proc.poll() is None and s.W and s.W.tid:   # the agent outlived the loop: the deadline or a stop ends it
             try:
                 seat._request('turn/interrupt', {'threadId': s.W.session, 'turnId': s.W.tid}, timeout=5)
             except acp.AcpError:
                 pass
-        s.t.join(5)   # MSG reaches in.fifo before the wrapper lets go of it (a stop at launch skips the loop)
         s.letgo(s.rfd)
         rc = s.cut(rcode(seat.close(2)))   # close() frees a prompt whose pipe an escaped child still holds
         while not s.q.empty():        # delivered, never run: the close-out types them

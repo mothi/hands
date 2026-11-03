@@ -1112,6 +1112,33 @@ STUB
   stub_run mail "$MB" "from the driver" >/dev/null 2>&1; R142=$?; until_file "$MB/turn-2/envelope.json"
   t 142 "DRIVER MAIL: hands.sh mail to a live seat (rc 0) is delivered by its wrapper as 'MAIL from driver', and answered as the next turn -- no seat has to read its inbox" \
     sh -c "[ $R142 -eq 0 ] && [ \"\$(cat '$MB/turn-2/result.txt')\" = \"\$(printf 'MAIL from driver:\nfrom the driver')\" ]"
+  # 207: THE WRAPPER NEVER WAITS FOR THE DELIVERY LOCK: a sender may hold it while it writes a record bigger than the
+  # pipe into in.fifo, which only the wrapper's loop drains. With driver mail pending, the wrapper tries the lock, finds
+  # it held, and keeps reading: the 1 MB write completes, and the mail is delivered once the lock is free.
+  # Falsification: take the lock with a blocking flock -> the loop stops, the write never completes (its alarm fires)
+  CL_STUB_MODE=echo stub_run start --cwd "$SB/tmp" --out "$SB/m207" claude:sonnet "$SB/q.md" >/dev/null 2>&1
+  stub_run wait "$SB/m207" --timeout 10 >/dev/null 2>&1
+  M207="$(cd "$SB/m207" && pwd -P)"
+  python3 - "$M207" >"$SB/m207.out" 2>&1 <<'PY207'
+import fcntl, json, os, signal, sys, time
+d = sys.argv[1]
+lock = open(os.path.join(d, 'events.jsonl'), 'ab')
+fcntl.flock(lock, fcntl.LOCK_EX)
+with open(os.path.join(d, 'inbox.jsonl'), 'a') as f:
+    f.write(json.dumps({'t': 'x', 'from': 'driver', 'text': 'pending'}) + '\n')
+time.sleep(2)   # the wrapper sees the mail and tries the lock
+signal.alarm(10)
+fd = os.open(os.path.join(d, 'in.fifo'), os.O_WRONLY | os.O_NONBLOCK)
+os.set_blocking(fd, True)
+data = b'\n' + b'x' * (1 << 20) + b'\n'   # not a record: the wrapper drops it, typed
+while data:
+    data = data[os.write(fd, data):]
+print('written')
+PY207
+  until_file "$M207/turn-2/envelope.json"
+  stub_run stop "$SB/m207" >/dev/null 2>&1
+  t 207 "THE WRAPPER NEVER WAITS FOR THE DELIVERY LOCK: while a sender holds it and writes 1 MB into in.fifo, the wrapper keeps draining the pipe (the write completes), and the pending driver mail is delivered after, as turn 2" \
+    sh -c "grep -qx written '$SB/m207.out' && [ \"\$(cat '$M207/turn-2/result.txt')\" = \"\$(printf 'MAIL from driver:\npending')\" ]"
   stub_run stop "$MB" >/dev/null 2>&1
   stub_run mail "$MB" "driver while out" >/dev/null 2>&1; R143=$?; cp "$SB/m140b.calls" "$SB/m143.calls0"
   CL_STUB_MODE=echo CL_STUB_CALLS="$SB/m140b.calls" stub_run send "$MB" "$SB/q81.md" >/dev/null 2>&1; until_file "$MB/turn-4/envelope.json"
