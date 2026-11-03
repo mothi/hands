@@ -5,7 +5,9 @@
 # P_STDIN_LOG (the message lines -- codex: every client JSON-RPC line -- appended), P_CWD_LOG (the launch cwd, appended),
 # P_STUB_CALLS (launch counter), P_STUB_REPLAY (a recorded stream, split into turns), P_STUB_PIDFILE, P_STUB_SLEEP (slow
 # mode's seconds, 2); codex: CX_REPLAY (a recorded app-server wire, {t,dir,msg} lines: the launch count names its process,
-# each opening turn/start plays its recorded turn), CX_FAIL_TEXT (the provider error text its failures carry);
+# each opening turn/start plays its recorded turn), CX_FAIL_TEXT (the provider error text its failures carry),
+# CX_ASK_DELAY (seconds each turn/start waits before its answer; a request already waiting then appends a line to
+# CX_OVERLAP_LOG);
 import json, os, signal, subprocess, sys, time
 prov = os.path.basename(sys.argv[0])
 P = {'claude': 'CL', 'codex': 'CX'}[prov]
@@ -66,7 +68,7 @@ def codex_server():   # the app-server (codex-cli 0.160 v2): one thread, th_stub
     # collaborator reports on its own thread over this connection, before the main answer / after it / and the main
     # turn/completed never comes (the cases of codex-plugin-cc's fake app-server); badline: a malformed stdout line
     import select
-    fail, st = env('FAIL_TEXT', 'stream error'), {'th': 'th_stub123', 'cur': None, 'n': 0, 'kids': [], 'total': {}}
+    fail, st = env('FAIL_TEXT', 'stream error'), {'th': 'th_stub123', 'cur': None, 'n': 0, 'kids': [], 'total': {}, 'more': False}
     st['th'], turns = recorded(env('REPLAY'), launch) if env('REPLAY') else (st['th'], None)
 
     def note(m, **p):
@@ -153,6 +155,10 @@ def codex_server():   # the app-server (codex-cli 0.160 v2): one thread, th_stub
 
     def handle(m):
         meth, i, p = m.get('method'), m.get('id'), m.get('params') or {}
+        if meth == 'turn/start' and env('ASK_DELAY'):   # did the client send more before this answer?
+            time.sleep(float(env('ASK_DELAY')))
+            if select.select([0], [], [], 0)[0] or st['more']:
+                open(env('OVERLAP_LOG'), 'a').write('turn/start %s answered with a request already waiting\n' % i)
         text = ' '.join(x.get('text', '') for x in p.get('input') or [] if isinstance(x, dict))
         cur = st['cur']
         if meth == 'initialize':
@@ -223,9 +229,10 @@ def codex_server():   # the app-server (codex-cli 0.160 v2): one thread, th_stub
                 k.kill()
             sys.exit(0)
         *lines, buf = (buf + chunk).split(b'\n')
-        for ln in lines:
+        for k, ln in enumerate(lines):
             if env('STDIN_LOG'):
                 open(env('STDIN_LOG'), 'a').write(ln.decode() + '\n')
+            st['more'] = any(x.strip() for x in lines[k + 1:]) or bool(buf.strip())
             if ln.strip():
                 handle(json.loads(ln))
 

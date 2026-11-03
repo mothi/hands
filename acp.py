@@ -6,9 +6,9 @@ codex-cli 0.160). AcpSeat is Rpc for ACP (Agent Client Protocol v1) agents (`gro
 never `authenticate` (each seat runs on its own CLI's login); launch() = recipe + handshake; translate() maps
 updates to the engine's events. seat.py drives codex's app-server on Rpc itself.
     seat, why = launch(provider, handle, wrap, log, stderr_path)   # why: a launch typed before any turn
-    res = seat.prompt(text, lambda u: emit(translate(u, n, t, wire)))  # blocks; then translate(res, n, t, wire)
+    seat.prompt(text, lambda u: emit(translate(u, n, t, wire)), done)  # done(res): translate(res, n, t, wire)
 """
-import datetime, json, os, signal, subprocess, threading, time
+import datetime, json, os, select, signal, subprocess, time
 
 STOP = {"end_turn": "ok", "cancelled": "cancelled", "max_tokens": "truncated",
         "max_turn_requests": "truncated", "refusal": "error"}   # a model's refusal mid-turn is an error (its event says so);
@@ -111,32 +111,26 @@ def _xtool(u):  # grok carries the tool's name/kind in _meta["x.ai/tool"]
     return m.get("x.ai/tool") if isinstance(m.get("x.ai/tool"), dict) else {}
 
 
-def _wait(proc, s):
-    try:
-        proc.wait(s)
-    except subprocess.TimeoutExpired:
-        pass
-
-
 class AcpError(Exception):
     """A JSON-RPC error answer, a dead agent, or a refused call."""
 
 
 class Rpc(object):
-    """One JSON-RPC agent process over stdio, in a session of its own. `env` = overrides on os.environ.
-    `log(line, direction)` is the write_raw hook: every JSON-RPC line verbatim, direction "in" (agent->client)
-    or "out". `note(method, params)` gets each notification, on the reader thread (none: dropped). A subclass
-    answers the agent's requests (_answer) and sees each of its own answered (_answered, under the lock)."""
+    """One JSON-RPC agent process over stdio, in a session of its own, driven by its owner's select loop: no threads.
+    What is sent waits in `out` until the agent's stdin takes it; each line its stdout gives is dispatched at once: an
+    answer to the callback its request named, a notification to note(method, params), an agent's request to _answer.
+    `env` = overrides on os.environ. `log(line, direction)` gets every JSON-RPC line verbatim, "in" (agent->client) or
+    "out"."""
 
     def __init__(self, argv, cwd, env=None, log=None, stderr_path=None, note=None):
         self.cwd, self.log, self.note = cwd, log, note
-        self._nid, self._pending, self._eof, self._active = 0, {}, False, None   # _active: a request(active=True)'s slot
-        self._lock, self._wlock = threading.Lock(), threading.Lock()
+        self._nid, self._pending, self._eof, self.out, self._tail = 0, {}, False, b"", b""
         self._err = open(stderr_path, "ab") if stderr_path else subprocess.DEVNULL
         self.proc = subprocess.Popen(argv, cwd=cwd, env=dict(os.environ, **(env or {})), stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=self._err, start_new_session=True)
-        self._reader = threading.Thread(target=self._read, name="rpc-reader", daemon=True)
-        self._reader.start()
+        self._in, self._out = self.proc.stdin.fileno(), self.proc.stdout.fileno()
+        os.set_blocking(self._in, False)
+        os.set_blocking(self._out, False)
 
     def _hook(self, line, direction):
         try:
@@ -144,85 +138,117 @@ class Rpc(object):
         except Exception:                                       # a failing hook never stops the wire
             pass
 
-    def _read(self):
-        for raw in self.proc.stdout:
-            line = raw.decode("utf-8", "replace").rstrip("\r\n")
-            if not line.strip():
-                continue
-            self._hook(line, "in")
+    def fds(self):
+        """What a select waits on for this agent -> (readable, writable)."""
+        return ([] if self._eof else [self._out]), ([self._in] if self.out and self._in is not None else [])
+
+    def ready(self, readable, writable):
+        """Give the agent's stdin what it takes; read its stdout and dispatch each whole line."""
+        if self.out and self._in is not None and self._in in writable:
             try:
-                msg = json.loads(line)
-            except ValueError:
-                msg = None
-            try:
-                isinstance(msg, dict) and self._dispatch(msg)   # a malformed line is logged raw and skipped
-            except Exception:                                   # a failing sink never kills the reader
+                self.out = self.out[os.write(self._in, self.out):]
+            except BlockingIOError:
                 pass
-        self._gone()
+            except OSError:                                     # the agent closed its stdin: the rest is lost with it
+                self.out = b""
+        if self._eof or self._out not in readable:
+            return
+        try:
+            chunk = os.read(self._out, 65536)
+        except BlockingIOError:
+            return
+        if chunk:
+            *lines, self._tail = (self._tail + chunk).split(b"\n")
+        else:                                                   # EOF: a last line with no newline still counts
+            lines, self._tail = [self._tail], b""
+        for raw in lines:
+            self._line(raw)
+        if not chunk:
+            self._gone()
+
+    def pump(self, timeout):
+        """One select on this agent alone (the handshake, a call): wait up to `timeout` s, then ready()."""
+        r, w = self.fds()
+        if not r and not w:
+            time.sleep(min(timeout, 0.05))
+            return
+        r, w, _ = select.select(r, w, [], timeout)
+        self.ready(r, w)
+
+    def _line(self, raw):
+        line = raw.decode("utf-8", "replace").rstrip("\r")
+        if not line.strip():
+            return
+        self._hook(line, "in")
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            return                                              # a malformed line is logged raw and skipped
+        try:
+            isinstance(msg, dict) and self._dispatch(msg)
+        except Exception:                                       # a failing callback never stops the wire
+            pass
 
     def _gone(self):
         """Nothing more will be answered: every waiting request gets msg None (a prompt -> incomplete)."""
-        with self._lock:
-            self._eof = True
-            waiting, self._pending = list(self._pending.values()), {}
-            self._answered(None)
-        for slot in waiting:
-            slot.set()
+        self._eof = True
+        waiting, self._pending = list(self._pending.values()), {}
+        for done in waiting:
+            try:
+                done(None)
+            except Exception:
+                pass
 
     def _dispatch(self, msg):
         meth, mid = msg.get("method"), msg.get("id")
         if meth is None:                                        # the answer to one of our requests
-            with self._lock:
-                slot = self._pending.pop(mid, None)
-                if slot is not None:
-                    self._answered(slot)
-            if slot is not None:
-                slot.msg = msg
-                slot.set()
-            return
+            done = self._pending.pop(mid, None)
+            return done and done(msg)
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         if mid is not None:
             return self._answer(mid, meth, params)
         if self.note is not None:
             self.note(meth, params)
 
-    def _answered(self, slot):   # one of our requests is answered (None: none will be any more)
-        pass
-
     def _answer(self, mid, meth, params):   # an agent->client request this client offers nothing for
-        self._send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "Method not found: " + str(meth)}})
+        self.send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "Method not found: " + str(meth)}})
 
-    def _send(self, obj):
+    def send(self, obj):
+        """Queue one JSON-RPC line for the agent, and give it what its stdin takes now."""
+        if self._in is None:
+            raise AcpError("agent stdin closed")
         line = json.dumps(obj, ensure_ascii=False)
-        with self._wlock:
-            self._hook(line, "out")
-            try:
-                self.proc.stdin.write(line.encode("utf-8") + b"\n")
-                self.proc.stdin.flush()
-            except (OSError, ValueError) as e:
-                raise AcpError("agent stdin closed: %s" % e)
+        self._hook(line, "out")
+        self.out += line.encode("utf-8") + b"\n"
+        self.ready([], [self._in])
 
-    def _request(self, method, params, active=False, timeout=None):
-        """One request -> its answer message; None = the agent is gone (stdout EOF, or stdin closed)."""
-        slot = threading.Event()
-        slot.msg = None
-        with self._lock:
-            if self._eof:
-                return None
-            self._nid += 1
-            mid, self._pending[self._nid] = self._nid, slot
-            if active:
-                self._active = slot
-        try:
-            self._send({"jsonrpc": "2.0", "id": mid, "method": method, "params": params})
-        except AcpError:
+    def notify(self, method, params=None):
+        self.send(dict({"jsonrpc": "2.0", "method": method}, **({"params": params} if params is not None else {})))
+
+    def request(self, method, params, done):
+        """One request; done(msg) gets its answer, or None when the agent is gone first. -> its id (None: gone)"""
+        if self._eof or self._in is None:
+            done(None)
             return None
-        if not slot.wait(timeout):
-            raise AcpError("no answer to %s within %ss" % (method, timeout))
-        return slot.msg
+        self._nid += 1
+        mid = self._nid
+        self._pending[mid] = done
+        self.send({"jsonrpc": "2.0", "id": mid, "method": method, "params": params})
+        return mid
 
-    def _rpc(self, method, params, timeout=45):   # handshake calls only; hands' spawn ACK waits up to 600 s
-        msg = self._request(method, params, timeout=timeout)
+    def call(self, method, params, timeout):
+        """A request waited for, reading the agent all the while -> its answer message; None = the agent is gone."""
+        box = []
+        mid, end = self.request(method, params, box.append), time.time() + timeout
+        while not box:
+            if time.time() >= end:
+                self._pending.pop(mid, None)
+                raise AcpError("no answer to %s within %ss" % (method, timeout))
+            self.pump(min(0.5, end - time.time()))
+        return box[0]
+
+    def ask(self, method, params, timeout=45):   # a handshake call -> its result; AcpError on an error or no answer
+        msg = self.call(method, params, timeout)
         if msg is None:
             raise AcpError("agent exited before answering %s (rc=%s)" % (method, self.proc.poll()))
         if "error" in msg:
@@ -230,25 +256,34 @@ class Rpc(object):
             raise AcpError("%s failed: %s %s" % (method, e.get("code"), e.get("message")))
         return msg.get("result") if isinstance(msg.get("result"), dict) else {}
 
+    def _wait(self, grace):   # up to `grace` s for the agent to exit, reading its stdout all the while
+        end = time.time() + grace
+        while self.proc.poll() is None and time.time() < end:
+            self.pump(min(0.1, end - time.time()))
+
     def close(self, grace=4.0):
         """stdin EOF (every agent exits on it: grok ~3.1 s, opencode ~0.05 s, codex app-server ~0.1 s), `grace`, then
-        TERM -- at last KILL -- the whole process group, so a tool's children die with the seat. Returns the exit code."""
-        try:
-            self.proc.stdin.close()
-        except (OSError, ValueError):
-            pass
-        _wait(self.proc, grace)
+        TERM -- at last KILL -- the whole process group, so a tool's children die with the seat. What the agent wrote
+        is read and dispatched first; what it left unanswered gets None. Returns the exit code."""
+        if self._in is not None:
+            self.out, self._in = b"", None
+            try:
+                self.proc.stdin.close()
+            except (OSError, ValueError):
+                pass
+        self._wait(grace)
         for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
                 os.killpg(self.proc.pid, sig)
             except (ProcessLookupError, PermissionError):
                 break                                           # the group is empty: nothing left to reap
-            _wait(self.proc, grace)
-        self._reader.join(grace)
-        if self._reader.is_alive():                             # an escaped grandchild holds the pipe open
+            self._wait(grace)
+        end = time.time() + grace                               # stdout's last lines, up to its EOF
+        while not self._eof and time.time() < end:
+            self.pump(min(0.1, end - time.time()))
+        if not self._eof:                                       # an escaped grandchild holds the pipe open
             self._gone()
-        else:
-            self.proc.stdout.close()
+        self.proc.stdout.close()
         if self._err is not subprocess.DEVNULL:
             self._err.close()
         return self.proc.poll()
@@ -259,7 +294,7 @@ class AcpSeat(Rpc):
 
     def __init__(self, argv, cwd, env=None, log=None, stderr_path=None):
         self.session_id, self.info, self.config = None, {}, []
-        self._busy, self._sink, self._turn = threading.Lock(), None, None
+        self._sink, self._turn = None, None                    # the prompt in flight
         Rpc.__init__(self, argv, cwd, env, log, stderr_path, self._update)
 
     def _update(self, meth, params):
@@ -285,10 +320,6 @@ class AcpSeat(Rpc):
         if sink is not None:
             sink(u)
 
-    def _answered(self, slot):   # the prompt answered (None: the agent is gone) -- turn over: later updates join no turn
-        if slot is None or slot is self._active:
-            self._active = self._sink = self._turn = None
-
     def _answer(self, mid, meth, params):
         """Agent->client requests. Permission: allow_once first (an always pick may persist a rule in the
         CLI's config), else the first allow option. fs/* and terminal/* were not offered at initialize."""
@@ -298,25 +329,25 @@ class AcpSeat(Rpc):
         pick = next((o for o in opts if o.get("kind") == "allow_once"), None) or \
             next((o for o in opts if str(o.get("kind", "")).startswith("allow")), None)
         out = {"outcome": "selected", "optionId": pick.get("optionId")} if pick else {"outcome": "cancelled"}
-        self._send({"jsonrpc": "2.0", "id": mid, "result": {"outcome": out}})
+        self.send({"jsonrpc": "2.0", "id": mid, "result": {"outcome": out}})
         sink, call = self._sink, params.get("toolCall") if isinstance(params.get("toolCall"), dict) else {}
         if sink is not None:
             sink({"_client": "permission", "toolCallId": call.get("toolCallId"), "outcome": out})
 
-    def _rpc(self, method, params, timeout=45):
-        r = Rpc._rpc(self, method, params, timeout)
+    def ask(self, method, params, timeout=45):
+        r = Rpc.ask(self, method, params, timeout)
         if isinstance(r.get("configOptions"), list):
             self.config = r["configOptions"]
         return r
 
     def initialize(self):
         """ACP handshake (protocolVersion 1; no fs, no terminal) -> the agent's capabilities."""
-        self.info = self._rpc("initialize", {"protocolVersion": 1, "clientCapabilities": {
+        self.info = self.ask("initialize", {"protocolVersion": 1, "clientCapabilities": {
             "fs": {"readTextFile": False, "writeTextFile": False}, "terminal": False}})
         return self.info.get("agentCapabilities") or {}
 
     def new_session(self):
-        r = self._rpc("session/new", {"cwd": self.cwd, "mcpServers": []})
+        r = self.ask("session/new", {"cwd": self.cwd, "mcpServers": []})
         if not r.get("sessionId"):
             raise AcpError("session/new answered without a sessionId")
         self.session_id = r["sessionId"]
@@ -326,7 +357,7 @@ class AcpSeat(Rpc):
         """Reattach a stored session in this (new) process: session/resume, which replays no history."""
         if "resume" not in ((self.info.get("agentCapabilities") or {}).get("sessionCapabilities") or {}):
             raise AcpError("agent does not advertise sessionCapabilities.resume")
-        self._rpc("session/resume", {"sessionId": session_id, "cwd": self.cwd, "mcpServers": []})
+        self.ask("session/resume", {"sessionId": session_id, "cwd": self.cwd, "mcpServers": []})
         self.session_id = session_id
 
     def _option(self, key):
@@ -348,34 +379,36 @@ class AcpSeat(Rpc):
         opt = self._option(key)
         if opt is None:
             return None
-        r = self._rpc("session/set_config_option", {"sessionId": self.session_id, "configId": opt["id"], "value": value})
+        r = self.ask("session/set_config_option", {"sessionId": self.session_id, "configId": opt["id"], "value": value})
         if not isinstance(r.get("configOptions"), list):
             opt["currentValue"] = value                         # an ack without state: take it at its word
         late = time.time() + 2   # opencode 2.x can reply with the OLD value, then confirm in a config update ~20 ms later
         while self.current(opt["id"]) != value and time.time() < late and not self._eof:
-            time.sleep(0.02)
+            self.pump(min(0.05, late - time.time()))
         if self.current(opt["id"]) != value:
             raise AcpError("%s=%s did not take (currentValue %r)" % (opt["id"], value, self.current(opt["id"])))
         return value
 
-    def prompt(self, text, on_update=None):
-        """session/prompt with one text block; blocks until the turn ends. on_update(u) gets, in order: a
-        turn_start record, every session update of the turn, then a tool_call_update {status: cancelled} per
-        tool call left open (grok sends no closing update after a cancel). Returns the PromptResponse result +
-        _client, sessionId, answer (Turn's rule), final; + error (a JSON-RPC error) or incomplete (the agent
-        went first). The wall clock is the caller's: close() from another thread frees a blocked prompt."""
+    def busy(self):
+        return self._turn is not None
+
+    def prompt(self, text, on_update, done):
+        """session/prompt with one text block; it returns at once, the owner's loop runs the turn. on_update(u) gets, in
+        order: a turn_start record, every session update of the turn, then a tool_call_update {status: cancelled} per
+        tool call left open (grok sends no closing update after a cancel). done(res) gets the PromptResponse result +
+        _client, sessionId, answer (Turn's rule), final; + error (a JSON-RPC error) or incomplete (the agent went first).
+        The wall clock is the caller's: close() answers a prompt still open."""
         if not self.session_id:
             raise AcpError("no session: call new_session() or resume() first")
-        if not self._busy.acquire(False):
+        if self._turn is not None:
             raise AcpError("a prompt is already running on this seat (ACP v1 has no queue)")
         turn, sink = Turn(), on_update or (lambda u: None)
         turn.calls, turn.bounded = {}, False
-        try:
-            sink({"_client": "turn_start", "sessionId": self.session_id})
-            with self._lock:
-                self._turn, self._sink = turn, sink
-            msg = self._request("session/prompt", {"sessionId": self.session_id,
-                                                   "prompt": [{"type": "text", "text": text}]}, active=True)
+        sink({"_client": "turn_start", "sessionId": self.session_id})
+        self._turn, self._sink = turn, sink
+
+        def answered(msg):   # the turn is over: later updates join no turn
+            self._turn = self._sink = None
             for cid in list(turn.calls):
                 sink({"_client": "tool_closed", "sessionUpdate": "tool_call_update", "toolCallId": cid, "status": "cancelled"})
             res = dict(msg["result"]) if msg and isinstance(msg.get("result"), dict) else {}
@@ -385,11 +418,8 @@ class AcpSeat(Rpc):
                 res["error"] = msg["error"]
             res.update(_client="turn_end", sessionId=self.session_id, answer=turn.final(),
                        final="boundary" if turn.bounded else "after-last-tool")
-            return res
-        finally:
-            with self._lock:
-                self._active = self._sink = self._turn = None
-            self._busy.release()
+            done(res)
+        self.request("session/prompt", {"sessionId": self.session_id, "prompt": [{"type": "text", "text": text}]}, answered)
 
 
 def _tool(u):

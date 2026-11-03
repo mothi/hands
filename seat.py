@@ -11,7 +11,7 @@ DIR/events.jsonl, and everything downstream of the events is one rule (Seat.fini
 Job dir: session (the handle) prompt.txt in.fifo stream.jsonl stderr.log events.jsonl inbox.jsonl outbox.jsonl
 turn-N/{result.txt,envelope.json} envelope.json result.txt driver job.log
 """
-import errno, fcntl, json, os, queue, re, select, shutil, signal, socket, stat, subprocess, sys, threading, time
+import errno, fcntl, json, os, re, select, shutil, signal, socket, stat, subprocess, sys, time
 import acp
 from acp import Turn, clip, event, now, small, usage   # the vocabulary every wire shares: one copy, in acp.py
 
@@ -183,11 +183,11 @@ def codex_open(h, rpc):   # the app-server handshake -> the seat's thread: initi
     # for a seat that has one, thread/resume (a thread has no rollout to resume before its first turn).
     # Every seat runs danger-full-access, approvals never (no one answers them).
     # Never ephemeral: a thread with no session files cannot resume. No fallback model: without one, config.toml's runs
-    rpc._rpc('initialize', {'clientInfo': {'name': 'hands', 'version': '2'}})
-    rpc._send({'jsonrpc': '2.0', 'method': 'initialized'})
+    rpc.ask('initialize', {'clientInfo': {'name': 'hands', 'version': '2'}})
+    rpc.notify('initialized')
     p = {'cwd': h['cwd'], 'sandbox': 'danger-full-access', 'approvalPolicy': 'never'}
     p.update({'model': h['model']} if h.get('model') else {})
-    r = rpc._rpc('thread/resume', dict(p, threadId=h['session'])) if h.get('session') else rpc._rpc('thread/start', dict(p, ephemeral=False))
+    r = rpc.ask('thread/resume', dict(p, threadId=h['session'])) if h.get('session') else rpc.ask('thread/start', dict(p, ephemeral=False))
     tid = (r.get('thread') or {}).get('id')
     if not tid:
         raise acp.AcpError('the app-server answered the thread without its id')
@@ -655,7 +655,7 @@ class Seat:
     """The wrapper: it outlives the CLI, owns the translation, and writes every turn's envelope."""
     def __init__(s, d, h, msg, ready):
         s.d, s.h, s.msg, s.ready, s.prov, (s.fam, s.delivery) = d, h, msg, ready, h['provider'], WIRES[h['provider']]
-        s.errs, s.mail_off, s.wfd, s.tlock, s.W = [], size(J(d, 'outbox.jsonl')), None, threading.Lock(), None
+        s.errs, s.mail_off, s.wfd, s.W = [], size(J(d, 'outbox.jsonl')), None, None
         s.seen, s.halt, s.late = -1, False, False   # halt: a stop; late: the deadline
         # inq: the records the CLI is to get next, in order (in.fifo's, then the wrapper's own); ibuf: in.fifo's torn tail;
         # sent: MSG is delivered; post: when the outbox and inbox are next looked at
@@ -853,13 +853,12 @@ class Seat:
             return
         s.feed(o, W, None)
 
-    def feed(s, o, W, rc):   # one stream object (a stdout line; an rpc notification, on the reader thread) -> its events, and
-        with s.tlock:        # the turns it closed through finish; a stream error that closed none is pushed
-            s.errs = []
-            recs = W.feed(o)
-            s.finish(recs, rc)
-            for e in s.errs if not recs else []:
-                push(s.d, s.h, e['turn'], 'error', 'stream error', e.get('text'))
+    def feed(s, o, W, rc):   # one stream object (a stdout line; an rpc notification) -> its events, and the turns it closed
+        s.errs = []          # through finish; a stream error that closed none is pushed
+        recs = W.feed(o)
+        s.finish(recs, rc)
+        for e in s.errs if not recs else []:
+            push(s.d, s.h, e['turn'], 'error', 'stream error', e.get('text'))
 
     def finish(s, recs, rc):
         """ONE rule for every wire: typed status -> turn files -> envelope -> usage + turn_end events -> push."""
@@ -940,40 +939,34 @@ class Seat:
         if why:
             return s.early(*why, seat=seat)
         s.fifo()
-        s.q = queue.Queue()
-        worker = threading.Thread(target=s.turns, args=(seat,), daemon=True)
-        if s.fam == 'acp':
-            worker.start()
+        # waiting: the lines delivered and not yet handed on -- acp: one prompt at a time (ACP v1 has no queue), turn
+        # `n` next; rpc: one turn/start at a time, each sent once the last is answered (`asked`), so it steers the turn
+        # its predecessor started
+        s.waiting, s.n, s.asked = [], s.first, False
         while not s.halt and seat.proc.poll() is None and time.time() < deadline:
             s.tick()
-            lines, s.inq = s.inq, []
-            for ln in lines:
-                s.q.put(ln) if s.fam == 'acp' else s.rpc_turn(seat, ln)
-            if select.select([s.rfd], [], [], 0.5)[0]:
+            s.waiting += s.inq
+            s.inq = []
+            if s.waiting and s.fam == 'acp' and not seat.busy():
+                s.acp_turn(seat, s.n, said(s.waiting.pop(0)))
+                s.n += 1
+            elif s.waiting and s.fam == 'rpc' and not s.asked:
+                s.rpc_turn(seat, s.waiting.pop(0))
+            r, w = seat.fds()
+            r, w, _ = select.select(r + [s.rfd], w, [], 0.5)
+            seat.ready(r, w)
+            if s.rfd in r:
                 s.read_fifo()
         s.late = seat.proc.poll() is None and time.time() >= deadline   # set BEFORE the close the turn reads it in
         if seat.proc.poll() is None and s.W and s.W.tid:   # the agent outlived the loop: the deadline or a stop ends it
             try:
-                seat._request('turn/interrupt', {'threadId': s.W.session, 'turnId': s.W.tid}, timeout=5)
+                seat.call('turn/interrupt', {'threadId': s.W.session, 'turnId': s.W.tid}, 5)
             except acp.AcpError:
                 pass
         s.letgo(s.rfd)
-        rc = s.cut(rcode(seat.close(2)))   # close() frees a prompt whose pipe an escaped child still holds
-        while not s.q.empty():        # delivered, never run: the close-out types them
-            s.q.get_nowait()
-        s.q.put(None)
-        if s.fam == 'acp':
-            worker.join()
-        s.mail()
+        rc = s.cut(rcode(seat.close(2)))   # close() answers a prompt whose pipe an escaped child still holds
+        s.mail()                           # the lines still waiting were delivered and never run: the close-out types them
         s.close_out(rc, s.W)
-
-    def turns(s, seat):   # the acp worker: one turn per queued line, in order; after a halt the rest wait for the close-out
-        n = s.first
-        for ln in iter(s.q.get, None):
-            if not s.halt:
-                s.acp_turn(seat, n, said(ln))
-            n += 1
-            s.q.task_done()
 
     def codex(s, wrap, log):   # the rpc launch: the app-server under the reaper, past its handshake -> (rpc,
         # why); its notifications reach the translator on the reader thread, a deadline's typed timeout with them
@@ -993,16 +986,19 @@ class Seat:
         # agent gone mid-delivery leaves the turn to the close-out
         inp = [{'type': 'text', 'text': said(ln)}]
         p = dict({'threadId': s.W.session, 'input': inp}, **({'effort': s.h['effort']} if s.h.get('effort') else {}))
-        r = rpc._request('turn/start', p)
+        s.asked = True
+        rpc.request('turn/start', p, s.rpc_answered)
+
+    def rpc_answered(s, r):   # turn/start's answer: the next line may go; a refusal on an idle thread is that turn, failed
+        s.asked = False
         if r is None or 'error' not in r:
             return
         e = r['error'] if isinstance(r['error'], dict) else {'message': str(r['error'])}
         why = 'turn/start refused: %s %s' % (e.get('code'), e.get('message'))
-        with s.tlock:
-            recs = s.W.start() if s.W.cur is None else None
-            s.W.ev('error', text=clip(why))
-            if recs is not None:
-                s.finish(recs + [s.W.end('error', '', None, 'none', why)], None)
+        recs = s.W.start() if s.W.cur is None else None
+        s.W.ev('error', text=clip(why))
+        if recs is not None:
+            s.finish(recs + [s.W.end('error', '', None, 'none', why)], None)
 
     def forget(s, sid, n):   # GUARD 2, ABANDONED TURNS: a turn whose agent went mid-turn other than by the
         # deadline's close (a stop -- a polite close too, kept here until a live opencode check shows it releases the claim
@@ -1017,17 +1013,19 @@ class Seat:
             s.eoff = size(J(s.d, 'stderr.log'))
             s.put(event('progress', n, text='session %s deleted (rc %s): its turn was abandoned, so nothing may resume it' % (sid, rc)))
 
-    def acp_turn(s, seat, n, text):
+    def acp_turn(s, seat, n, text):   # turn n's prompt goes out; acp_done closes the turn when the agent answers
         seen, off, t0 = set(), size(J(s.d, 'stderr.log')), time.time()
 
-        def sink(u):   # runs on acp.py's reader thread
+        def sink(u):
             for e in acp.translate(u, n, now(), s.prov):
                 if e['kind'] == 'file':   # grok reports one edit twice: one file event per call and path
                     if (e.get('call'), e.get('path')) in seen:
                         continue
                     seen.add((e.get('call'), e.get('path')))
                 s.put(e)
-        res = seat.prompt(text, sink)
+        seat.prompt(text, sink, lambda res: s.acp_done(seat, n, res, off, t0))
+
+    def acp_done(s, seat, n, res, off, t0):
         *head, end = acp.translate(res, n, now(), s.prov)
         use = ([e for e in head if e['kind'] == 'usage'] or [{}])[0]
         for e in head:

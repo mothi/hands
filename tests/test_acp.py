@@ -3,7 +3,7 @@
 --fake; hands.sh's selftest runs it as its grok and opencode stubs) replays recorded grok and
 opencode transcripts (fixtures/*-acp-*.jsonl) request by request, mapping the recorded answer ids to
 the live client's. Run: python3 tests/test_acp.py"""
-import itertools, json, os, signal, subprocess, sys, tempfile, threading, time, unittest
+import itertools, json, os, signal, subprocess, sys, tempfile, time, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # the repo root: acp.py
 import acp  # noqa: E402
@@ -185,8 +185,12 @@ class AcpTests(unittest.TestCase):
         return s
 
     def turn(self, seat, n, text, wire=None):
-        evs = []
-        res = seat.prompt(text, lambda u: evs.extend(acp.translate(u, n, None, wire)))
+        evs, box = [], []
+        seat.prompt(text, lambda u: evs.extend(acp.translate(u, n, None, wire)), box.append)
+        end = time.time() + 30
+        while not box and time.time() < end:   # the seat's owner runs the loop: here, this test
+            seat.pump(0.5)
+        res = box[0]
         return res, evs + acp.translate(res, n, None, wire)
 
     def test_grok_transcript_round_trips_and_translates(self):
@@ -252,17 +256,49 @@ class AcpTests(unittest.TestCase):
         seat = self.seat(path, "escape")
         seat.initialize()
         seat.new_session()
-        box = {}
-        th = threading.Thread(target=lambda: box.update(res=seat.prompt("x")))
-        th.start()
-        self.assertIsNotNone(seat.proc.wait(10))              # the agent is gone, its detached child is not
-        th.join(1)
-        self.assertTrue(th.is_alive(), "EOF arrived: the escape fixture did not hold the pipe")
+        box, end = [], time.time() + 10
+        seat.prompt("x", None, box.append)
+        while seat.proc.poll() is None and time.time() < end:
+            seat.pump(0.2)
+        self.assertIsNotNone(seat.proc.poll())                # the agent is gone, its detached child is not
+        for _ in range(5):
+            seat.pump(0.2)
+        self.assertEqual(box, [], "EOF arrived: the escape fixture did not hold the pipe")
         seat.close(grace=0.5)
-        th.join(5)
         with open(self.rec + ".child") as f:
             os.kill(int(f.read()), signal.SIGKILL)
-        self.assertIn("incomplete", box.get("res", {}))
+        self.assertIn("incomplete", box[0] if box else {})
+
+    def test_a_big_prompt_while_the_agent_floods_its_stdout(self):   # falsification: a blocking stdin write deadlocks
+        rows = SYN[:4] + [("in", upd(**chunk("y" * 1000)))] * 2000 + [   # 2 MB the agent writes before it reads on
+            ("out", {"id": 3, "method": "session/prompt"}),
+            ("in", {"jsonrpc": "2.0", "id": 3, "result": {"stopReason": "end_turn"}})]
+        path = os.path.join(self.tmp.name, "flood.jsonl")
+        with open(path, "w") as f:
+            f.writelines(json.dumps({"dir": d, "msg": m}) + "\n" for d, m in rows)
+        seat = self.seat(path)
+        seat.initialize()
+        seat.new_session()
+
+        def stuck(*a):
+            raise AssertionError("deadlocked: the client blocked writing while the agent blocked writing")
+        signal.signal(signal.SIGALRM, stuck)
+        signal.alarm(20)
+        try:
+            res, evs = self.turn(seat, 1, "x" * (1 << 20))   # a 1 MB prompt: more than the pipe holds
+        finally:
+            signal.alarm(0)
+        self.assertEqual(evs[-1]["status"], "ok")
+
+    def test_close_reads_to_eof_before_it_gives_up_on_an_answer(self):   # falsification: skip close's last read
+        # the agent exits at stdin EOF; a child it left (a session of its own: no TERM reaches it) answers 0.3 s later
+        child = 'import time; time.sleep(0.3); print(%r, flush=True)' % json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"ok": 1}})
+        agent = ('import subprocess, sys; sys.stdin.read(); subprocess.Popen([sys.executable, "-c", %r], '
+                 'start_new_session=True)' % child)
+        rpc, box = acp.Rpc([sys.executable, "-c", agent], self.tmp.name), []
+        rpc.request("ping", {}, box.append)
+        rpc.close(2)
+        self.assertEqual(box, [{"jsonrpc": "2.0", "id": 1, "result": {"ok": 1}}])
 
     def test_close_terms_the_process_group(self):
         path = os.path.join(self.tmp.name, "init.jsonl")

@@ -693,6 +693,16 @@ for l in open(sys.argv[1]):
   stub_run send "$SB/c117" "$SB/q81.md" >"$SB/c117.sent" 2>/dev/null; stub_run wait "$SB/c117" --timeout 30 >/dev/null 2>&1; stub_run stop "$SB/c117" >/dev/null 2>&1
   t 117 "a send WHILE a codex turn runs is STEERED into it: acked sent, expect 1, delivery steer; it reaches the one app-server as a turn/start the open turn takes, and turn 1 answers both inputs -- no second turn, nothing cancelled" \
     python3 "$SB/chk.py" steered "$SB/c117" "$SB/q81.md"
+  # 208: ONE turn/start AT A TIME: the wrapper sends a codex turn/start only once the last one is answered, so each line
+  # steers the turn its predecessor opened. The stub holds each answer 1 s and logs any request already waiting then.
+  # Falsification: send each line's turn/start as it arrives -> the send's request waits behind turn 1's answer
+  : >"$SB/c208.overlap"
+  CX_ASK_DELAY=1 CX_OVERLAP_LOG="$SB/c208.overlap" stub_run start --cwd "$SB/cxw" --out "$SB/c208" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
+  CX_ASK_DELAY=1 CX_OVERLAP_LOG="$SB/c208.overlap" stub_run send "$SB/c208" "$SB/q81.md" >/dev/null 2>&1
+  for w208 in $(seq 1 100); do [ -e "$SB/c208/turn-2/envelope.json" ] && break; sleep 0.1; done
+  stub_run stop "$SB/c208" >/dev/null 2>&1
+  t 208 "ONE turn/start AT A TIME: a send that arrives while a codex turn/start is unanswered waits for that answer -- the app-server never holds two, and both inputs are answered" \
+    sh -c "[ ! -s '$SB/c208.overlap' ] && grep -c '\"method\": \"turn/start\"' '$SB/c208/stream.jsonl' | grep -qx 2 && jq -e '.status==\"ok\"' '$SB/c208/turn-1/envelope.json' '$SB/c208/turn-2/envelope.json' >/dev/null"
   CX_STUB_MODE=stale CX_STDIN_LOG="$SB/c181.stdin" stub_run start --cwd "$SB/cxw" --out "$SB/c181" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
   stub_run send "$SB/c181" "$SB/q81.md" >"$SB/c181.sent" 2>/dev/null; stub_run wait "$SB/c181" --timeout 30 >"$SB/c181.wait" 2>/dev/null; stub_run stop "$SB/c181" >/dev/null 2>&1
   t 181 "a send its turn OUTRAN (acked expect 1 while turn 1 ran, but turn 1 ended before the app-server took it) opens turn 2, and wait follows the input there: it returns turn 2's answer, never turn 1's; the command turn 1 left running completes during turn 2, and it and its usage are strays (turn 2 carries only its own tokens)" \
