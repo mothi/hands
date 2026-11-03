@@ -54,7 +54,7 @@ Report vulnerabilities privately: see [SECURITY.md](SECURITY.md).
 
 ## Prerequisites
 
-- macOS (tested) with bash 3.2 or later, `python3` 3.7 or later, `jq`, `perl`, `curl`, and `ps`
+- macOS (tested) with bash 3.2 or later, `python3` 3.7 or later, `jq`, `curl`, and `ps`
 - at least one provider CLI, logged in with its own login:
   [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`),
   [Codex](https://github.com/openai/codex) (`codex`), Grok (`grok`), or

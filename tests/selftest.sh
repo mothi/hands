@@ -3,7 +3,7 @@
 # its id; the last line is "selftest: N passed, M failed", and the exit status is 0 only when none failed.
 # Run it from anywhere: bash tests/selftest.sh
 HANDS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/hands.sh"
-HANDS_SOURCED=1; set --; . "$HANDS"   # the functions some rows call: classify_blob, seat_box, wt_alarm
+HANDS_SOURCED=1; set --; . "$HANDS"   # the functions some rows call: classify_blob, seat_box
 
 run_selftest() {
   local HERE PASS=0 FAIL=0 SB SBP
@@ -633,7 +633,7 @@ for l in open(sys.argv[1]):
   W177="$(pgrep -f "seat.py spawn $SBP/a177 " | head -1)"; ps -A -ww -o ppid=,command= | awk -v p="${W177:-none}" '$1==p' >"$SB/a177.ps"
   stub_run stop "$SB/a177" >/dev/null 2>&1
   t 177 "NO LIMIT BY DEFAULT: a seat bought without --timeout records timeout null and runs its agent under a reaper armed with 0 (no alarm): no wall clock cuts its work" \
-    sh -c "jq -e '.timeout==null' '$SB/a177/session' >/dev/null && grep -q 'wt_alarm.* seat [^ ]*/hands.sh 0 ' '$SB/a177.ps'"
+    sh -c "jq -e '.timeout==null' '$SB/a177/session' >/dev/null && grep -q 'seat.py reap 0 ' '$SB/a177.ps'"
   # 175: an agent TERMed mid-turn from outside (a stop closes politely: it sends no TERM), answering as opencode 2.0.22
   # does: its server died first, so the open prompt gets a JSON-RPC error (-32603 ServerUnavailable), not cancelled.
   # Falsification: delete only on incomplete/cancelled (the old guard) -> no .del log.
@@ -738,7 +738,7 @@ for l in open(sys.argv[1]):
   CX_STUB_MODE=unauthorized stub_run --cwd "$SB/cxw" --out "$SB/c186" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
   t 186 "a codex turn failed with codexErrorInfo unauthorized is auth-expired (a re-login, never a reroute), though its message names no login" \
     sh -c "jq -e '.status==\"auth-expired\" and .turn==1' '$SB/c186/envelope.json' >/dev/null"
-  CX_STUB_MODE=badline PATH="$SB/bin:$PATH" TMPDIR="$SB/tmp" XDG_CACHE_HOME="$SB/cache" perl -e 'alarm 30; exec @ARGV' "$HANDS" --cwd "$SB/cxw" --out "$SB/c187" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
+  CX_STUB_MODE=badline PATH="$SB/bin:$PATH" TMPDIR="$SB/tmp" XDG_CACHE_HOME="$SB/cache" python3 -c 'import os,signal,sys; signal.alarm(30); os.execv(sys.argv[1], sys.argv[1:])' "$HANDS" --cwd "$SB/cxw" --out "$SB/c187" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
   t 187 "a MALFORMED app-server line mid-turn is kept raw in stream.jsonl and skipped: the turn still answers ok (bounded at 30 s: a reader that died on it would leave the turn hanging)" \
     sh -c "jq -e '.status==\"ok\"' '$SB/c187/envelope.json' >/dev/null && [ \"\$(cat '$SB/c187/result.txt')\" = 'stub ok' ] && jq -e -s 'map(select(.dir==\"in\" and (.msg|type)==\"string\")) | length==1' '$SB/c187/stream.jsonl' >/dev/null"
   t 146 "PRIVATE SEATS: every launch and relaunch argv opts out of the CLI's shared server -- grok agent --no-leader (no --leader/--leader-socket, no leader/serve/headless), codex --no-daemon app-server on stdio (no --remote, --remote-auth-token-env, --listen, daemon, proxy, remote-control), opencode a bare acp (its own child server; no attach flag exists)" \
@@ -823,7 +823,7 @@ STUB
     sh -c "jq -e '.session==\"th_stub123\"' '$SB/pf58/envelope.json' >/dev/null"
 
   # 76: the reaper runs on NATURAL exit too — a child the seat backgrounded and forgot
-  # dies with the seat. Falsification: drop the post-waitpid reap() → the sleeper survives.
+  # dies with the seat. Falsification: drop reap's end_group after the wait → the sleeper survives.
   : >"$SB/g76.pid"
   CL_STUB_MODE=straggler CL_STUB_PIDFILE="$SB/g76.pid" stub_run --out "$SB/g76" claude:sonnet "$SB/q.md" >/dev/null 2>&1 || true
   t 76 "a process the seat backgrounded and forgot dies WITH the seat: the wrapper reaps the seat pgroup on every exit, not only on alarm (a log stream once outlived its seat by hours)" \
@@ -842,21 +842,19 @@ STUB
   # 74: the private pgroup must not orphan on ^C — INT forwards to the group (parity
   # with the old exec form, where the foreground group carried the CLI and its children;
   # the pgroup isolation would otherwise recreate the orphan class on a different
-  # signal). The row signals the perl wrapper DIRECTLY, as a terminal ^C would.
-  # Falsification: the forwarding handlers removed → rc still 130 but the grandchild
-  # SURVIVES the INT — the second assert is the discriminating one.
-  # 74 signals the wrapper with the INT disposition a FOREGROUND shell gives it (the perl
+  # signal). The row signals the reaper DIRECTLY, as a terminal ^C would.
+  # 74 signals the reaper with the INT disposition a FOREGROUND shell gives it (the python
   # trampoline models the terminal: bash sets INT to SIG_IGN for its own `&` children, so
-  # without it this row would test the background case instead). The wrapper is located as
+  # without it this row would test the background case instead). The reaper is located as
   # the seat's PARENT, which is exact regardless of how many shells sit above it.
   # Falsification: the forwarding handlers removed -> rc still 130 but the grandchild
   # SURVIVES the INT — the second assert is the discriminating one.
   : > "$SB/t74.pid"
-  ( perl -e '$SIG{INT}="DEFAULT"; exec @ARGV' bash -c "$(declare -f wt_alarm); wt_alarm 30 sh -c 'echo \$\$ > \"$SB/t74.pid\"; exec sleep 30'" >/dev/null 2>&1; echo $? > "$SB/t74.rc" ) &
+  ( python3 -c 'import os,signal,sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvp(sys.argv[1], sys.argv[1:])' python3 "$HERE/seat.py" reap 30 sh -c 'echo $$ > "$1"; exec sleep 30' sh "$SB/t74.pid" >/dev/null 2>&1; echo $? > "$SB/t74.rc" ) &
   T74SUB=$!
   for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -s "$SB/t74.pid" ] && break; sleep 0.1; done
-  T74PERL="$(ps -o ppid= -p "$(cat "$SB/t74.pid")" 2>/dev/null | tr -d ' ')"
-  [ -n "$T74PERL" ] && kill -INT "$T74PERL" 2>/dev/null
+  T74REAPER="$(ps -o ppid= -p "$(cat "$SB/t74.pid")" 2>/dev/null | tr -d ' ')"
+  [ -n "$T74REAPER" ] && kill -INT "$T74REAPER" 2>/dev/null
   wait $T74SUB 2>/dev/null
   sleep 0.3
   t 74 "INT forwards to the seat pgroup: ^C on a sync buy still kills a shim-spawned grandchild (foreground-group parity)" \
@@ -868,13 +866,13 @@ STUB
   # teardown, and the old exec form honoured them by inheritance; catching the signal
   # anyway would make every backgrounded buy killable by a stray HUP. The seat must still
   # be alive after the ignored INT and die only at its own alarm (rc 142).
-  # Falsification: drop the SigAction check -> the seat dies on the INT and rc is 130.
+  # Falsification: drop reap's SIG_IGN check -> the seat dies on the INT and rc is 130.
   : > "$SB/t75.pid"; : > "$SB/t75.rc"
-  ( perl -e '$SIG{INT}="IGNORE"; exec @ARGV' bash -c "$(declare -f wt_alarm); wt_alarm 4 sh -c 'echo \$\$ > \"$SB/t75.pid\"; exec sleep 30'" >/dev/null 2>&1; echo $? > "$SB/t75.rc" ) &
+  ( python3 -c 'import os,signal,sys; signal.signal(signal.SIGINT, signal.SIG_IGN); os.execvp(sys.argv[1], sys.argv[1:])' python3 "$HERE/seat.py" reap 4 sh -c 'echo $$ > "$1"; exec sleep 30' sh "$SB/t75.pid" >/dev/null 2>&1; echo $? > "$SB/t75.rc" ) &
   T75SUB=$!
   for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -s "$SB/t75.pid" ] && break; sleep 0.1; done
-  T75PERL="$(ps -o ppid= -p "$(cat "$SB/t75.pid")" 2>/dev/null | tr -d ' ')"
-  [ -n "$T75PERL" ] && kill -INT "$T75PERL" 2>/dev/null
+  T75REAPER="$(ps -o ppid= -p "$(cat "$SB/t75.pid")" 2>/dev/null | tr -d ' ')"
+  [ -n "$T75REAPER" ] && kill -INT "$T75REAPER" 2>/dev/null
   sleep 0.5
   T75ALIVE=no; kill -0 "$(cat "$SB/t75.pid")" 2>/dev/null && T75ALIVE=yes
   wait $T75SUB 2>/dev/null

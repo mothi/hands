@@ -66,54 +66,6 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-# TIMEOUT KILL, group form (an orphan incident): the old one-liner
-# (perl alarm + exec) signalled only the process it exec-ed — but `codex` on PATH is an
-# npm shim that SPAWNS the vendor binary as a child, so a timed-out seat kept building
-# for 2h+ AFTER its "timeout" envelope was written (the vendor binary was
-# orphaned to ppid 1, tree edits 17 minutes post-alarm, driver misled into a rebuy).
-# Now the seat runs as the leader of its OWN process group; on alarm the whole group
-# gets TERM first (a graceful window, so a CLI can flush its session/rollout state for
-# a later resume), a <=4s drain poll, then KILL — the envelope is written only after
-# the group is dead, so "status":"timeout" is a true death certificate again.
-# rc mapping preserved: timeout=142, child killed by signal N=128+N, else the child rc.
-wt_alarm() { # $1 secs (0 = no alarm), rest argv — run argv in its own pgroup under a wall-clock alarm
-  perl -e '
-    use Errno; use POSIX ();
-    my $t = shift @ARGV;
-    my $pid = fork; defined $pid or exit 127;
-    if ($pid == 0) { setpgrp(0, 0); exec @ARGV; exit 127; }
-    # ONE reaper for every way out — alarm, forwarded signal, natural exit: TERM the seat
-    # pgroup, give it $_[0] tenths to drain, KILL the rest. The natural-exit call is what
-    # keeps a seat from leaving processes behind: a child it backgrounded and forgot dies
-    # here, not at the next reboot (a `log stream` and a probe script once outlived
-    # their seat by hours). What escapes the pgroup — launchd-owned simulators, anything the
-    # seat setsid-ed (nohup does NOT leave the group) — is the seat contract, not this.
-    sub reap { kill(15, -$pid); for (1..$_[0]) { last unless kill(0, -$pid); select(undef, undef, undef, 0.1); } kill(9, -$pid); }
-    my $to = 0;
-    $SIG{ALRM} = sub { $to++; kill(($to > 1 ? 9 : 15), -$pid); alarm 5; };
-    # forward INT/TERM/HUP to the group: the old exec-form CLI sat in the callers
-    # foreground pgroup, so ^C reached it and its shim-spawned children; the private
-    # pgroup would otherwise orphan them on ^C — the same defect on a different signal
-    # ...but NEVER catch what the caller already ignored: `nohup` (a background buy)
-    # sets HUP/INT to SIG_IGN precisely so a seat outlives a terminal
-    # teardown, and the old exec form honoured that by inheritance. A handler installed
-    # over SIG_IGN would kill the very seats those guards exist to protect.
-    my %sn = (INT => 2, TERM => 15, HUP => 1);
-    for my $s (keys %sn) { my $no = $sn{$s};
-      my $oa = POSIX::SigAction->new; POSIX::sigaction($no, undef, $oa);
-      next if defined $oa->handler && $oa->handler eq 'IGNORE';
-      $SIG{$s} = sub { reap(20); exit(128 + $no); }; }
-    alarm $t;
-    my $r;
-    do { $r = waitpid($pid, 0) } while ($r == -1 && $!{EINTR});
-    alarm 0;
-    my $st = $?;
-    if ($to) { reap(40); exit 142; }
-    reap(20);
-    exit(($st & 127) ? 128 + ($st & 127) : $st >> 8);
-  ' "$@"
-}
-
 # classify a failure blob -> "status<TAB>reset". Pure function so tests/selftest.sh can feed the
 # fixture corpus (tests/fixtures/) through the exact production regexes — ONE copy, seat.py's
 # classify(), which the persistent wrapper types its turns with. Statuses only ever
@@ -274,8 +226,8 @@ run_probe() {
 }
 
 # ---------- dispatch ----------
-# SOURCE SEAM: seat.py sources this file for wt_alarm, the ONE reaper every seat process runs under; quota.sh
-# for opencode_auth, the Go key's one path; tests/selftest.sh for the functions its rows call. A sourcing caller sets HANDS_SOURCED=1 and
+# SOURCE SEAM: quota.sh sources this file for opencode_auth, the Go key's one path; tests/selftest.sh for the
+# functions its rows call. A sourcing caller sets HANDS_SOURCED=1 and
 # `set --` first; nothing below runs.
 if [ -n "${HANDS_SOURCED:-}" ]; then return 0 2>/dev/null || exit 0; fi
 case "$VERB" in   # the seat verbs (start is the buy below)

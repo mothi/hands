@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """seat.py -- hands' engine: a seat is a job dir with a live CLI process in it. python3 stdlib only.
 
-hands.sh keeps the grammar, the SEAT BOX and the reaper (wt_alarm); seat.py runs
-everything after launch. WIRES names each provider's family and delivery; each wire translates its stream into
+hands.sh keeps the grammar and the SEAT BOX; seat.py runs everything after launch. WIRES names each provider's family and delivery; each wire translates its stream into
 DIR/events.jsonl, and everything downstream of the events is one rule (Seat.finish).
   spawn DIR MSG   detach the wrapper: it delivers MSG as the next turn and runs the seat until the CLI exits
   send DIR FILE   the next turn to the LIVE seat (rc 3: none is live -- hands.sh relaunches it)
@@ -10,6 +9,7 @@ DIR/events.jsonl, and everything downstream of the events is one rule (Seat.fini
   wait DIR [--for turn|mail|exit] [--timeout S]  |  events DIR [--follow]  |  stop DIR
   emit | classify   the envelope writer and the failure classifier, for hands.sh
   sweep           delete the jobs root's stale dirs, then print the root (every buy runs it and makes its dir there)
+  reap SECS ARGV  run ARGV in its own process group, limited to SECS seconds (0: no limit); every seat CLI runs under it
 Job dir: session (the handle) prompt.txt in.fifo stream.jsonl stderr.log events.jsonl inbox.jsonl outbox.jsonl
 turn-N/{result.txt,envelope.json} envelope.json result.txt driver job.log
 """
@@ -481,9 +481,57 @@ def term(groups, sig=signal.SIGTERM):
 INF = float('inf')   # NO LIMIT: a launch without --timeout has no deadline
 
 
-def reaped_argv(secs, argv):   # hands.sh's wt_alarm is the ONE reaper: seats and backoffs run under it
-    src = 'd=$1; shift; a=("$@"); set --; HANDS_SOURCED=1; . "$d"; wt_alarm "${a[@]}"'
-    return ['bash', '-c', src, 'seat', J(HERE, 'hands.sh'), str(0 if secs == INF else max(1, int(secs)))] + argv   # 0 = no alarm
+def reap(secs, argv):
+    """Run argv as the leader of its own process group, with a wall-clock limit of secs (0: none).
+
+    However argv ends -- by itself, at the limit, or because this process got INT, TERM or HUP -- the
+    rest of its group is ended after it: TERM, a short grace, then KILL. So a CLI that runs its real
+    binary as a child (an npm shim) or leaves a helper running leaves nothing behind. Exits 142 at the
+    limit, 128 + N when signal N ended argv or this process, else with argv's own status."""
+    try:
+        child = subprocess.Popen(argv, preexec_fn=os.setpgrp)   # Popen also puts SIGPIPE back to default
+    except OSError:
+        return 127
+    timed_out = False
+
+    def end_group(grace):
+        term([child.pid])
+        give_up = time.time() + grace
+        while time.time() < give_up:
+            child.poll()   # a leader that has exited but is not yet waited for still counts as in the group
+            try:
+                os.killpg(child.pid, 0)
+            except OSError:
+                return
+            time.sleep(0.1)
+        term([child.pid], signal.SIGKILL)
+
+    def on_signal(sig, frame):
+        end_group(2)
+        sys.exit(128 + sig)
+
+    def on_alarm(sig, frame):   # the limit: TERM the group, then KILL it every 5 s until argv is gone
+        nonlocal timed_out
+        term([child.pid], signal.SIGKILL if timed_out else signal.SIGTERM)
+        timed_out = True
+        signal.alarm(5)
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        # A signal the caller ignores stays ignored: nohup ignores HUP so that a seat outlives its terminal
+        if signal.getsignal(sig) != signal.SIG_IGN:
+            signal.signal(sig, on_signal)
+    signal.signal(signal.SIGALRM, on_alarm)
+    signal.alarm(secs)
+    status = child.wait()
+    signal.alarm(0)
+    end_group(4 if timed_out else 2)
+    if timed_out:
+        return 142
+    return 128 - status if status < 0 else status
+
+
+def reaped_argv(secs, argv):   # every seat CLI, and opencode's session delete, runs under reap
+    return [sys.executable, J(HERE, 'seat.py'), 'reap', str(0 if secs == INF else max(1, int(secs)))] + argv
 
 
 def reaped(secs, argv, **kw):
@@ -1200,6 +1248,8 @@ def main(a):
         return 0
     if cmd == 'sweep':
         return sweep()
+    if cmd == 'reap' and len(a) > 2:
+        return reap(int(a[1]), a[2:])
     if cmd not in ('spawn', 'send', 'mail', 'wait', 'events', 'stop') or len(a) < 2 or not os.path.isdir(a[1]):
         print(__doc__.strip(), file=sys.stderr)
         return 2
