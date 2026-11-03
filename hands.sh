@@ -24,12 +24,11 @@
 #   --effort <tier>     claude, codex: low|medium|high|xhigh|max, passed through (codex adds ultra where it lists it);
 #                       grok, opencode: required, a value the model lists (grok-4.6: low|medium|high|xhigh)
 #   --json-schema FILE  claude, codex: the final message follows the schema, whose status is the envelope's
-# env: HANDS_PREFLIGHT=off skips the quota check before a buy; HANDS_REPOS (default ~/dev, colon-separated)
-#   names the trees whose other repos --sandbox hides
+# env: HANDS_REPOS (default ~/dev, colon-separated) names the trees whose other repos --sandbox hides
 #
-# envelope: {"status":"ok|blocked|error|incomplete|cancelled|truncated|timeout|auth-expired|provider-quota-dead|not-installed|pool-gated|refused",
+# envelope: {"status":"ok|blocked|error|incomplete|cancelled|truncated|timeout|auth-expired|provider-quota-dead|not-installed|refused",
 #   "provider","model","effort","rc","seconds","reset","dir","usage","session","turn","delivery",...}
-#   exit 0 ok, 1 any other status, 2 refused, pool-gated or a usage error. README.md is the manual;
+#   exit 0 ok, 1 any other status, 2 refused or a usage error. README.md is the manual;
 #   CONTRIBUTING.md has the engine's rules.
 set -u
 
@@ -158,37 +157,6 @@ EOF
 }
 seat_dir() { printf 'YOUR JOB DIR: %s (your outbox: %s/outbox.jsonl).\n' "$1" "$1"; }
 
-# PRE-FLIGHT (ONE copy — run_single AND seat_send call it): one bounded board read via rearm --pre-buy before any
-# spawn — a buy into a gated pool dies TYPED pre-spend instead of spending a launch to learn it. It costs
-# one bounded gauge probe (network, zero spend). REFUSAL, never substitution: the
-# driver reroutes — the engine picks no model. The refusal's reset field carries rearm's own warn line (window name
-# included), so the driver can tell resets-soon from gated-for-the-week. Seams:
-# HANDS_PREFLIGHT=off skips (run_probe pings THROUGH a gated board by design;
-# selftest is hermetic via
-# HANDS_REARM_BIN). A missing rearm.sh skips silently: drift disables the
-# optimisation, never the buy (rearm's own doctrine).
-# GATE CLASS: refuse ONLY a `QUOTA GATE:` line — rearm
-# emits it for would-gate alone, i.e. the pool is AT its hard stop (100 non-claude) and
-# the provider itself would refuse. Every `QUOTA WARN:` line passes through to stderr
-# as advice: would-warn is a HOT pool still worth spending (a seat there may die
-# provider-quota-dead; the driver rebuys elsewhere), token-stale is a stale gauge
-# credential on a LIVE pool (rearm heals it), and UNKNOWN means the GAUGE is blind, not
-# the pool dead — one blind gauge (a stale claude reading, a dead endpoint) is not a dead pool, and gating
-# on it would refuse every candidate seat simultaneously.
-# ONE POOL: it senses only the pool it buys — rearm/quota --pools — never the whole
-# board (four gauges on every buy and relaunch; a codex buy used to sense the claude pool too).
-preflight_gate() { # $1 prov  $2 model  $3 dir — rc 0: buy; rc 2: pool-gated envelope written
-  local prov="$1" model="$2" dir="$3" rb="${HANDS_REARM_BIN:-$(dirname "$SELF")/rearm.sh}" pfw="" allw=""
-  [ "${HANDS_PREFLIGHT:-on}" != off ] && [ -f "$rb" ] || return 0
-  allw="$(bash "$rb" --pre-buy --pools "$prov" 2>/dev/null || true)"   # sense the bought pool only
-  printf '%s\n' "$allw" | grep "^QUOTA WARN: $prov " >&2 || true
-  pfw="$(printf '%s\n' "$allw" | grep "^QUOTA GATE: $prov " | head -1 || true)"
-  [ -n "$pfw" ] || return 0
-  echo "hands: $pfw" >&2
-  echo "hands: pool '$prov' is over threshold — buy another provider, or rerun with HANDS_PREFLIGHT=off to override deliberately" >&2
-  emit "$dir" pool-gated "$prov" "$model" 2 "${pfw#QUOTA GATE: } (override: HANDS_PREFLIGHT=off)"; return 2
-}
-
 # ---------- single call ----------
 run_single() { # $1 provider[:model]  $2 prompt-file
   local spec="$1" pf="$2" prov model dir jobs
@@ -220,8 +188,7 @@ run_single() { # $1 provider[:model]  $2 prompt-file
   else cp "$pf" "$dir/prompt.txt"; fi
   pf="$dir/prompt.txt"
 
-  # the provider is validated BEFORE the pre-flight: a name with no wire (a typo, an unsupported provider such as gemini)
-  # is refused here, and never senses a pool that does not exist 
+  # a name with no wire (a typo, an unsupported provider such as gemini) is refused here
   case "$prov" in
     claude|codex|grok|opencode) ;;   # seat.py owns the process, the stream and every envelope
     *) echo "hands: unknown provider '$prov' (claude|codex|grok|opencode)" >&2
@@ -234,7 +201,6 @@ run_single() { # $1 provider[:model]  $2 prompt-file
     echo "hands: opencode 2.x has no read-only mode (its plan agent still runs shell) — buy it --rw and point --cwd at a worktree or scratch dir" >&2
     emit "$dir" error "$prov" "$model" 2; return 2
   fi
-  preflight_gate "$prov" "$model" "$dir" || return 2
   seat_launch "$prov" "$model" "$dir"
 }
 
@@ -278,21 +244,17 @@ seat_send() { # $1 dir  $2 file — a live seat takes the turn now; a gone one r
   [ -f "$2" ] || { echo "hands: send file not found: $2" >&2; return 2; }
   python3 "$SEATPY" send "$dir" "$2"; rc=$?
   [ "$rc" -eq 3 ] || return "$rc"
-  # the process is gone: a relaunch is a BUY (pre-flight first) on the SAME model, effort, cwd and rw
+  # the process is gone: relaunch it on the SAME model, effort, cwd and rw
   prov="$(jq -r .provider "$dir/session")"; model="$(jq -r '.model // empty' "$dir/session")"
   EFFORT="$(jq -r '.effort // empty' "$dir/session")"; RW="$(jq -r 'if .rw then 1 else 0 end' "$dir/session")"
   [ -n "$(jq -r '.session // empty' "$dir/session")" ] || {
     echo "hands: $dir recorded no session (its seat never reached the model) — start a fresh seat" >&2
     refuse "$dir" "$prov" "$model" no-session; return 2; }
-  preflight_gate "$prov" "$model" "$dir" || return 2
   python3 "$SEATPY" spawn "$dir" "$2"
 }
 
 # ---------- probe ----------
 run_probe() {
-  # a probe is an ALIVENESS ping: it must reach the CLI even when the board is hot —
-  # the probe IS the check. Pre-flighting it would let a gated board hide a dead CLI.
-  export HANDS_PREFLIGHT=off
   # a probe is INTERNAL (an aliveness ping, rearm's heal): it never captures the driver's inbox socket, so it never pushes
   unset CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN
   local list="$1" p pf rc=0 lines jobs
@@ -354,22 +316,17 @@ run_selftest() {
   local HERE PASS=0 FAIL=0 SB
   HERE="$(cd "$(dirname "$0")" && pwd)"
   SB="$(mktemp -d "${TMPDIR:-/tmp}/hands-selftest.XXXXXX")"
-  unset CODEX_ARGV_LOG REARM_STUB_WARN  # externally-exported sentinels must not reach stub calls
+  unset CODEX_ARGV_LOG  # externally-exported sentinels must not reach stub calls
   unset ACP_REPLAY ACP_MODE ACP_REC ACP_ARGV_LOG ACP_ENV_LOG ACP_PIDFILE OC_SESSION_LOG ACP_PROBE_READ
   unset CL_ARGV_LOG CL_STUB_MODE CL_STDIN_LOG
   # PUSH SEAM: a suite run inside a Claude Code session inherits the host's inbox socket — unset,
   # so no hermetic seat ever posts to it (the push rows arm a throwaway socket of their own)
   unset CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN
-  # HERMETIC SEAM: the pre-flight would otherwise reach the REAL gauge (network)
-  # from every buy row — default it OFF for the whole suite; the pre-flight rows below arm
-  # it explicitly at a stub. Same refuse-to-spend doctrine as rearm's row 00.
-  export HANDS_PREFLIGHT=off
   # RW FENCE SEAM: the fence would otherwise refuse every legacy bare row below (they test
   # the engine's ro/rw argv branches, which the internal probe path still uses) — default it
   # OFF for the whole suite; the 69-series rows arm it ON explicitly, and 69d proves ON is
   # the live default when the env var is absent.
   export HANDS_RW_FENCE=off
-  unset HANDS_REARM_BIN 2>/dev/null || true
   # THE CALLER'S STORE SEAM: opencode resolves its store from XDG_DATA_HOME, so EVERY row -- including those that call
   # "$SELF" directly -- runs on a sandbox store, never the real one. It holds a FAKE Go key, as a real store does: a seat
   # that seeded or swapped a store from it would show (rows 39s and 19 prove a seat and the catalog run on it unchanged).
@@ -406,12 +363,10 @@ run_selftest() {
   t 03 "unknown provider exits 2"        rc_is 2 env_run --out "$SB/o3" badprov "$SB/q.md"
   t 04 "unknown provider leaves typed envelope" sh -c "jq -e '.status==\"error\" and .provider==\"badprov\"' '$SB/o3/envelope.json'"
   # 04b: an unsupported provider name such as gemini dies through the SAME unknown-provider path as any other
-  # name — no special case. PATH=/usr/bin:/bin keeps the row hermetic under falsification. The pre-flight is ON
-  # against the REAL rearm.sh + quota.sh (hermetic for a pool with no gauge: nothing is probed): the refusal comes
-  # first, so no QUOTA line is printed. Falsification: validate after the pre-flight -> "QUOTA WARN: gemini UNKNOWN".
-  HANDS_PREFLIGHT=on PATH=/usr/bin:/bin TMPDIR="$SB/tmp" XDG_CACHE_HOME="$SB/cache" "$0" --rw --out "$SB/o4b" gemini:gemini-3.8-flash-high "$SB/q.md" >/dev/null 2>"$SB/o4b.err"; G4B=$?
-  t 04b "an unsupported gemini:<model> spec is refused by the unknown-provider path BEFORE the pre-flight: rc 2, typed error envelope naming it, the provider list it prints omits gemini, and no QUOTA line" \
-    sh -c "[ $G4B -eq 2 ] && jq -e '.status==\"error\" and .provider==\"gemini\" and .model==\"gemini-3.8-flash-high\" and .rc==2' '$SB/o4b/envelope.json' >/dev/null && grep -qF \"unknown provider 'gemini' (claude|codex|grok|opencode)\" '$SB/o4b.err' && ! grep -q QUOTA '$SB/o4b.err'"
+  # name — no special case. PATH=/usr/bin:/bin keeps the row hermetic under falsification.
+  PATH=/usr/bin:/bin TMPDIR="$SB/tmp" XDG_CACHE_HOME="$SB/cache" "$0" --rw --out "$SB/o4b" gemini:gemini-3.8-flash-high "$SB/q.md" >/dev/null 2>"$SB/o4b.err"; G4B=$?
+  t 04b "an unsupported gemini:<model> spec is refused by the unknown-provider path: rc 2, typed error envelope naming it, the provider list it prints omits gemini" \
+    sh -c "[ $G4B -eq 2 ] && jq -e '.status==\"error\" and .provider==\"gemini\" and .model==\"gemini-3.8-flash-high\" and .rc==2' '$SB/o4b/envelope.json' >/dev/null && grep -qF \"unknown provider 'gemini' (claude|codex|grok|opencode)\" '$SB/o4b.err'"
   t 05 "missing prompt file exits 2"     rc_is 2 env_run --out "$SB/o5" claude "$SB/nope.md"
   # 05b: the provider names the default job dir, so a name that is not plain lowercase is refused before any dir is
   # made. Falsification: drop the check -> mkdir makes $SB/state/esc-<pid> outside the jobs root
@@ -1203,49 +1158,7 @@ for l in open(sys.argv[1]):
     sh -c "[ \"\$(cat '$SB/wire1/result.txt')\" = 'ok' ] && jq -e '.status==\"ok\" and .session==\"49c93750-efa1-4e50-9d05-6470e8eb5512\"' '$SB/wire1/envelope.json' >/dev/null"
 
 
-  # PRE-FLIGHT + RETRY + PERSISTENCE rows. Falsification matrix:
-  # pre-flight block removed → 50/53 fail · warn refused instead of bought → 50b · per-pool anchor broken → 51 · override seam
-  # broken → 53 ·
-  # typed-error guard broken → 57 · --ephemeral restored → 58.
-  cat >"$SB/bin/rearm-stub" <<'STUB'
-#!/bin/sh
-[ "${1:-}" = --pre-buy ] || { echo "rearm-stub: unexpected args: $*" >&2; exit 2; }
-if [ -n "${REARM_STUB_CALLS:-}" ]; then
-  n=$(cat "$REARM_STUB_CALLS" 2>/dev/null || echo 0); echo $((n+1)) >"$REARM_STUB_CALLS"
-fi
-[ -n "${REARM_STUB_WARN:-}" ] && printf '%s\n' "$REARM_STUB_WARN"
-exit 0
-STUB
-  chmod +x "$SB/bin/rearm-stub"
-  WGROK='QUOTA GATE: grok 100% (thr 100, weekly, gated-for-window) — route away'
-  ACP_ARGV_LOG="$SB/pf50.argv" HANDS_PREFLIGHT=on HANDS_REARM_BIN="$SB/bin/rearm-stub" REARM_STUB_WARN="$WGROK" \
-    stub_run --effort low --out "$SB/pf50" grok:grok-4.6 "$SB/q.md" >/dev/null 2>&1
-  t 50 "pre-flight: a GATED pool (QUOTA GATE — at its hard stop) is REFUSED pre-spend — typed pool-gated envelope, gate text in reset, ZERO CLI launch" \
-    sh -c "[ ! -e '$SB/pf50.argv' ] && jq -e '.status==\"pool-gated\" and (.reset|test(\"weekly\"))' '$SB/pf50/envelope.json' >/dev/null"
-  WHOT='QUOTA WARN: grok 93.0% (thr 100, weekly) — hot, buyable, may die mid-seat'
-  ACP_ARGV_LOG="$SB/pf50b.argv" HANDS_PREFLIGHT=on HANDS_REARM_BIN="$SB/bin/rearm-stub" REARM_STUB_WARN="$WHOT" \
-    stub_run --effort low --out "$SB/pf50b" grok:grok-4.6 "$SB/q.md" >/dev/null 2>"$SB/pf50b.err"
-  t 50b "pre-flight: a HOT pool (QUOTA WARN, would-warn) is BOUGHT — the buy launches, status ok, the warn line rides stderr as advice (spend to 100)" \
-    sh -c "[ -e '$SB/pf50b.argv' ] && jq -e '.status==\"ok\"' '$SB/pf50b/envelope.json' >/dev/null && grep -qF 'QUOTA WARN: grok 93.0%' '$SB/pf50b.err'"
-  ACP_ARGV_LOG="$SB/pf51.argv" HANDS_PREFLIGHT=on HANDS_REARM_BIN="$SB/bin/rearm-stub" REARM_STUB_WARN="$WGROK" \
-    stub_run --out "$SB/pf51" claude:sonnet "$SB/q.md" >/dev/null 2>&1 || true
-  t 51 "pre-flight is PER-POOL: a grok gate never blocks a claude buy" \
-    sh -c "jq -e '.status==\"ok\"' '$SB/pf51/envelope.json' >/dev/null"
-  ACP_ARGV_LOG="$SB/pf52.argv" HANDS_PREFLIGHT=on HANDS_REARM_BIN="$SB/bin/rearm-stub" \
-    stub_run --effort low --out "$SB/pf52" grok:grok-4.6 "$SB/q.md" >/dev/null 2>&1
-  t 52 "pre-flight on a CLEAN board proceeds (no warn, the buy launches)" \
-    sh -c "[ -e '$SB/pf52.argv' ] && jq -e '.status==\"ok\"' '$SB/pf52/envelope.json' >/dev/null"
-  # 50c: the pre-flight senses ONLY the bought pool, end to end through the REAL rearm.sh into a stub gauge that records
-  # its argv. Falsification: drop --pools "$prov" from preflight_gate.
-  printf '#!/bin/sh\necho "$*" >>"%s"\nprintf %s\n' "$SB/g50c.args" "'{\"pools\":[]}'" >"$SB/bin/gauge50c"; chmod +x "$SB/bin/gauge50c"
-  HANDS_PREFLIGHT=on HANDS_REARM_BIN="$HERE/rearm.sh" REARM_QUOTA_BIN="$SB/bin/gauge50c" \
-    stub_run --rw --cwd "$SB/tmp" --out "$SB/pf50c" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1 || true
-  t 50c "pre-flight senses ONLY the bought pool: a codex buy runs rearm --pre-buy whose gauge is asked for codex alone (--json --pools codex), once" \
-    sh -c "[ \"\$(cat '$SB/g50c.args')\" = '--json --pools codex' ] && jq -e '.status==\"ok\"' '$SB/pf50c/envelope.json' >/dev/null"
-  ACP_ARGV_LOG="$SB/pf53.argv" HANDS_PREFLIGHT=off HANDS_REARM_BIN="$SB/bin/rearm-stub" REARM_STUB_WARN="$WGROK" \
-    stub_run --effort low --out "$SB/pf53" grok:grok-4.6 "$SB/q.md" >/dev/null 2>&1
-  t 53 "HANDS_PREFLIGHT=off is a deliberate override (gated pool still buys)" \
-    sh -c "[ -e '$SB/pf53.argv' ] && jq -e '.status==\"ok\"' '$SB/pf53/envelope.json' >/dev/null"
+  # RETRY + PERSISTENCE rows. Falsification: --ephemeral restored → 58.
   ACP_REPLAY="$SB/grok-402.jsonl" stub_run --effort low --out "$SB/pf55" grok:grok-4.6 "$SB/q.md" >/dev/null 2>&1
   t 55 "a usage-limit error answering a live ACP prompt (a JSON-RPC error carrying the provider's 402 text — a synthetic shape, the live one is unverified) classifies provider-quota-dead, with its session" \
     sh -c "jq -e '.status==\"provider-quota-dead\" and .session==\"01a0d38a-6416-74d3-82f8-80174c82f422\"' '$SB/pf55/envelope.json' >/dev/null"
@@ -1256,24 +1169,6 @@ STUB
   CX_STDIN_LOG="$SB/pf58.stdin" stub_run --out "$SB/pf58" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1 || true
   t 58 "codex seats PERSIST sessions: thread/start asks for a persisted thread (ephemeral false, the resume substrate)" \
     sh -c "grep '\"thread/start\"' '$SB/pf58.stdin' | jq -e '.params.ephemeral==false' >/dev/null"
-  # GATE CLASS rows: only the over-threshold percent form gates; token-stale and UNKNOWN
-  # are ADVISORY (stderr) and the buy proceeds. Falsification: class-grep widened back
-  # to the bare prov anchor → 59+60 fail; advisory passthrough dropped → 59 stderr half.
-  ACP_ARGV_LOG="$SB/pf59.argv" HANDS_PREFLIGHT=on HANDS_REARM_BIN="$SB/bin/rearm-stub" \
-    REARM_STUB_WARN='QUOTA WARN: grok token-stale — run: bash /x/rearm.sh' \
-    stub_run --effort low --out "$SB/pf59" grok:grok-4.6 "$SB/q.md" >/dev/null 2>"$SB/pf59.err"
-  t 59 "token-stale is ADVISORY: the buy proceeds (a live pool with a stale gauge credential is not gated), warn echoed to stderr" \
-    sh -c "[ -e '$SB/pf59.argv' ] && jq -e '.status==\"ok\"' '$SB/pf59/envelope.json' >/dev/null && grep -q 'token-stale' '$SB/pf59.err'"
-  ACP_ARGV_LOG="$SB/pf60.argv" HANDS_PREFLIGHT=on HANDS_REARM_BIN="$SB/bin/rearm-stub" \
-    REARM_STUB_WARN='QUOTA WARN: grok UNKNOWN — route away' \
-    stub_run --effort low --out "$SB/pf60" grok:grok-4.6 "$SB/q.md" >/dev/null 2>&1
-  t 60 "UNKNOWN is ADVISORY: a blind gauge never refuses a buy (one keychain hiccup must not gate every pool)" \
-    sh -c "[ -e '$SB/pf60.argv' ] && jq -e '.status==\"ok\"' '$SB/pf60/envelope.json' >/dev/null"
-  t 61 "the pool-gated reset carries the HANDS_PREFLIGHT=off override (envelope-visible, not stderr-only)" \
-    sh -c "jq -e '.reset|test(\"override: HANDS_PREFLIGHT=off\")' '$SB/pf50/envelope.json' >/dev/null"
-  # pins: probe exemption, timeout-never-retried
-  t 63 "run_probe pings THROUGH a gated board (the probe IS the aliveness check)" \
-    sh -c "HANDS_PREFLIGHT=on HANDS_REARM_BIN='$SB/bin/rearm-stub' REARM_STUB_WARN='QUOTA GATE: grok 100% (thr 100, weekly, gated-for-window) — route away' PATH='$SB/bin:$PATH' TMPDIR='$SB/tmp' XDG_CACHE_HOME='$SB/cache' '$0' --probe grok 2>/dev/null | grep -q '\"status\":\"ok\",\"provider\":\"grok\"'"
 
   # THE RW FENCE rows. Every row runs against the stub PATH so a
   # mutated (guard-removed) run reaches only the stub — hermetic even under falsification.
@@ -1410,13 +1305,6 @@ STUB
     sh -c "awk 'p==\"--resume\"{print;exit}{p=\$0}' '$SB/p82.argv' | grep -qx sess-stub && awk 'p==\"--model\"{print;exit}{p=\$0}' '$SB/p82.argv' | grep -qx sonnet && awk 'p==\"--effort\"{print;exit}{p=\$0}' '$SB/p82.argv' | grep -qx high && grep -qx bypassPermissions '$SB/p82.argv' && [ \"\$(cat '$SB/p82.cwd')\" = \"\$(cd '$SB/tmp' && pwd -P)\" ] && grep -q '^turn 1 pid' '$SB/p81/turn-3/result.txt' && jq -e '.turn==3 and .status==\"ok\" and .session==\"sess-stub\"' '$SB/p81/envelope.json' >/dev/null && jq -e '.status==\"spawned\" and .expect==3' '$SB/p82.ack' >/dev/null"
   t 154 "CLAUDE SEATS REFUSE CROSS-SESSION MESSAGES: every claude launch, a start (ro) and a relaunch (rw), carries exactly ONE --settings, {\"crossSessionInbound\":\"refuse\",\"disableAllHooks\":true} -- seat mail goes through hands' inbox, never the host socket" \
     python3 "$SB/chk.py" settings "$SB/g49.argv" "$SB/p82.argv"
-  CL_ARGV_LOG="$SB/p121a.argv" HANDS_PREFLIGHT=on HANDS_REARM_BIN="$SB/bin/rearm-stub" \
-    REARM_STUB_WARN='QUOTA GATE: claude 90% (thr 90, weekly, gated-for-window) — route away' stub_run send "$SB/p81" "$SB/q81.md" >"$SB/p121a.out" 2>/dev/null; R121=$?
-  CL_STUB_MODE=count CL_ARGV_LOG="$SB/p121b.argv" HANDS_PREFLIGHT=on HANDS_REARM_BIN="$SB/bin/rearm-stub" \
-    REARM_STUB_WARN='QUOTA WARN: claude 85.0% (thr 90, weekly) — hot, buyable' stub_run send "$SB/p81" "$SB/q81.md" >/dev/null 2>"$SB/p121b.err"
-  stub_run wait "$SB/p81" >/dev/null 2>&1; stub_run stop "$SB/p81" >/dev/null 2>&1
-  t 121 "a send that RELAUNCHES is a buy, pre-flight first: a GATED pool refuses it (rc 2, the pool-gated envelope printed, no CLI launch); a HOT one (QUOTA WARN) resumes it — turn 4 ok on the recorded session, the warn on stderr" \
-    sh -c "[ $R121 -eq 2 ] && [ ! -e '$SB/p121a.argv' ] && jq -e '.status==\"pool-gated\"' '$SB/p121a.out' >/dev/null && [ -e '$SB/p121b.argv' ] && grep -qF 'QUOTA WARN: claude 85.0%' '$SB/p121b.err' && jq -e '.turn==4 and .status==\"ok\" and .session==\"sess-stub\"' '$SB/p81/envelope.json' >/dev/null"
   CL_STUB_MODE=count stub_run start --rw --cwd "$SB/tmp" --out "$SB/p98" claude:sonnet "$SB/q.md" >/dev/null 2>&1
   stub_run wait "$SB/p98" >/dev/null 2>&1; stub_run stop "$SB/p98" >/dev/null 2>&1
   CL_STUB_MODE=newsid stub_run send "$SB/p98" "$SB/q81.md" >/dev/null 2>&1
@@ -2020,12 +1908,10 @@ assert os.path.islink(os.path.join(r, "20250101-000000-codex-5")) and sorted(os.
 real = sys.argv[3].split()
 assert len(real) == 2 and any(x.startswith("probe-") for x in real) and not set(real) & n, (real, n)
 assert len([x for x in n if re.fullmatch(r"\d{8}-\d{6}-codex-\d+", x) and not x.startswith("2025")]) == 1, n' "$R189" "$SB/t189" "$REAL189"
-  # 191: A RESUME IS USE. A send that finds no live wrapper touches the seat's dir
-  # (seat.py send, never creating anything) before the relaunch's pre-flight (seconds of gauge reads), so a concurrent
-  # buy's sweep in that window keeps it. Here the pre-flight IS such a
-  # sweep (a rearm stub running seat.py sweep) over a stopped seat whose every file is 31 days old: the seat survives and
-  # turn 2 answers. Falsification: drop send's utime -> the sweep deletes the seat mid-resume and the send fails
-  printf 'python3 %s sweep >/dev/null\n' "'$HERE/seat.py'" >"$SB/rearm-sweep"
+  # 191: A RESUME IS USE. A send that finds no live wrapper touches the seat's dir (seat.py send, rc 3, creating
+  # nothing) before the relaunch, so a buy's sweep in between keeps it. Here every file of a stopped seat is 31 days
+  # old, a sweep runs right after that touch, and the relaunch answers turn 2. Falsification: drop send's utime -> the
+  # sweep deletes the seat and the relaunch fails
   cat >"$SB/age.py" <<'PY'
 import os, sys, time
 old = time.time() - float(sys.argv[1]) * 86400   # every entry under each path, and the path, aged argv[1] days
@@ -2037,10 +1923,12 @@ for root in sys.argv[2:]:
 PY
   XDG_STATE_HOME="$SB/st191" stub_run --rw --cwd "$SB/tmp" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
   D191="$(ls -d "$SB"/st191/hands/*-codex-* 2>/dev/null | head -1)"; python3 "$SB/age.py" 31 "$D191"
-  XDG_STATE_HOME="$SB/st191" HANDS_PREFLIGHT=on HANDS_REARM_BIN="$SB/rearm-sweep" stub_run send "$D191" "$SB/q81.md" >/dev/null 2>&1
+  XDG_STATE_HOME="$SB/st191" python3 "$HERE/seat.py" send "$D191" "$SB/q81.md" >/dev/null 2>&1; R191=$?
+  XDG_STATE_HOME="$SB/st191" python3 "$HERE/seat.py" sweep >/dev/null 2>&1
+  XDG_STATE_HOME="$SB/st191" stub_run send "$D191" "$SB/q81.md" >/dev/null 2>&1
   stub_run wait "$D191" --timeout 30 >/dev/null 2>&1; stub_run stop "$D191" >/dev/null 2>&1
-  t 191 "A RESUME IS USE: a send relaunching a stopped seat whose files are all 31 days old, while a sweep runs in its pre-flight, keeps the seat and turn 2 answers ok" \
-    sh -c "[ -n '$D191' ] && [ -d '$D191' ] && jq -e '.status==\"ok\"' '$D191/turn-2/envelope.json' >/dev/null"
+  t 191 "A RESUME IS USE: a send to a stopped seat whose files are all 31 days old touches it (rc 3: no live seat), a sweep right after keeps it, and the relaunch answers turn 2 ok" \
+    sh -c "[ $R191 -eq 3 ] && [ -n '$D191' ] && [ -d '$D191' ] && jq -e '.status==\"ok\"' '$D191/turn-2/envelope.json' >/dev/null"
   # 192: THE SWEEP UNDER THE LOCK, in-process on seat.py's own sweep(), each case
   # forced at its worst moment: (a) a write that lands after the first judgment, before the lock, keeps the dir (judged
   # again under the lock); (b) a relaunch opening job.log by the dir's path while the delete runs finds no dir (renamed out

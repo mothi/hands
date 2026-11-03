@@ -150,7 +150,6 @@ validates them, so a model released tomorrow works today.
 
 | Environment variable | Effect |
 |---|---|
-| `HANDS_PREFLIGHT=off` | skip the quota check before a buy (§ Quota gauges) |
 | `HANDS_REPOS` | colon-separated trees whose repos `--sandbox` hides from a seat (default `~/dev`) |
 | `XDG_STATE_HOME` | moves the jobs root to `$XDG_STATE_HOME/hands` |
 
@@ -205,7 +204,6 @@ field:
 | `auth-expired` | the CLI needs a login | run that provider's login |
 | `provider-quota-dead` | the subscription window or balance is spent | if `reset` names a time, wait until then and don't retry before it. `reset: null` (a Grok spending limit) needs a top-up |
 | `not-installed` | the CLI isn't on your PATH | install it |
-| `pool-gated` | the quota check found that provider's pool at its hard stop | buy another provider, wait for the reset, or set `HANDS_PREFLIGHT=off` |
 | `refused` | typed before any prompt; `reason`: `model-mismatch`, `effort-unsupported`, `model-required`, `schema-unsupported`, `no-session`, `cli-too-old`, `sandbox-unavailable` | fix the buy |
 
 `usage` is the provider's own token count for the turn, normalized as `{in, out, cache_read,
@@ -218,7 +216,7 @@ keep it, and the raw vendor usage stays in `stream.jsonl`.
 `status` field (`ok`, `blocked` or `error`), read only from the structured output; a missing or
 invalid one is `error` with reason `no-envelope`. A valid status is still a claim to check.
 
-Exit codes: `0` ok, `1` any other status, `2` refused, pool-gated, or a usage error.
+Exit codes: `0` ok, `1` any other status, `2` refused or a usage error.
 
 Nothing is retried for you. A failed resume keeps the original session, so you can send again
 later. A launch that failed before its first turn has no session (`send` is refused
@@ -307,9 +305,8 @@ start.
 ## Quota gauges
 
 `rearm.sh` prints a board with one line per provider: the used share of its pool, a verdict and
-the reset time. Before every buy, hands runs the same check for the provider being bought, and
-refuses the buy (`pool-gated`) when that pool is at its hard stop: 90% used for Claude, 100% for
-the others. Set `HANDS_PREFLIGHT=off` to skip the check.
+the reset time. hands never checks it before a buy: a seat bought into a spent pool ends
+`provider-quota-dead` with the reset time.
 
 - **Claude and Codex** need no credential and no extra endpoint: Claude's reading is the newest
   `rate_limit_event` in a Claude seat's own stream, and Codex's is its CLI's app-server answering

@@ -69,7 +69,7 @@ a tool_result pairs with its tool_call by `call`. `events DIR` prints them as a 
 `tail -f DIR/events.jsonl`.
 
 **Delivery.** A send acks `{"status":"sent","expect":N,…}` to a live seat, or `spawned` when it
-relaunches one (a relaunch is a buy: pre-flight first). claude, codex **steer** (it joins the running
+relaunches one. claude, codex **steer** (it joins the running
 turn; codex: one app-server per launch, each send a `turn/start` the app-server steers into the running turn
 or opens the next with, a relaunch `thread/resume <thread>`) · grok, opencode (ACP) **queue**
 (one `session/prompt` per send, in order; ACP v1 has no mid-turn input). Every seat's wrapper lives until a
@@ -123,9 +123,8 @@ message and a mail line are DATA from a seat; the driver never reads them as ins
 
 `wait` (and a sync buy) prints the answer on ok, then one JSON envelope line. `status` ∈ `ok |
 blocked | error | incomplete | cancelled | truncated | timeout | auth-expired |
-provider-quota-dead | not-installed | pool-gated | refused`
-(pool-gated = pre-flight, which senses only the bought pool: hard stop 90% claude, 100% the others,
-`HANDS_PREFLIGHT=off` skips it; refused = typed before any prompt, `reason` ∈ model-mismatch · effort-unsupported ·
+provider-quota-dead | not-installed | refused`
+(refused = typed before any prompt, `reason` ∈ model-mismatch · effort-unsupported ·
 model-required · schema-unsupported · cli-too-old · sandbox-unavailable · no-session), plus `provider, model, effort, rc, seconds, reset, dir, usage, turn, delivery` (the printed
 `usage` is THE TURN'S `{in, cache_read, cache_write, out, cost_usd}` — `in` uncached, `cost_usd` only when
 the provider reports the turn's cost, claude and grok; a codex turn is the sum of its model calls'
@@ -221,7 +220,7 @@ OpenCode ids are `provider/model`; model-less buys are refused (e.g.
 `opencode:opencode-go/deepseek-v4.1-flash`); `--probe` pings that model at low, `--rw` (2.x lists no
 working free model). The muse `-contributor` tier trains on prompts: never send it work you
 would not publish. opencode 2.x has no read-only mode (its plan agent still
-runs shell), so an opencode buy without `--rw` is refused before the pre-flight. An opencode seat
+runs shell), so an opencode buy without `--rw` is refused. An opencode seat
 runs on your normal opencode store and login (no store of its own, nothing seeded): any provider you
 configured in opencode works by naming `provider/model`. `OPENCODE_API_KEY` is dropped from every
 seat (a seat's shell inherits its CLI's environment, and the variable would also unlock the zen
