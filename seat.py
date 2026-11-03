@@ -49,17 +49,17 @@ def size(p):
         return 0
 
 
-def opened(path, flags, dir_fd=None):   # THE open of a file a seat could touch (a job dir's mail and events, a peer's
-    # inbox): never through a symlink, and only a regular file (O_NONBLOCK: a FIFO planted there never blocks the open)
-    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644, dir_fd=dir_fd)
+def opened(path, flags):   # THE open of a file a seat could touch (a job dir's mail and events): never through a
+    # symlink, and only a regular file (O_NONBLOCK: a FIFO planted there never blocks the open)
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644)
     if not stat.S_ISREG(os.fstat(fd).st_mode):
         os.close(fd)
         raise OSError(errno.EINVAL, 'not a regular file', path)
     return fd
 
 
-def append(path, obj, dir_fd=None):   # one write() per line on an O_APPEND fd: concurrent writers never interleave
-    fd = opened(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, dir_fd)
+def append(path, obj):   # one write() per line on an O_APPEND fd: concurrent writers never interleave
+    fd = opened(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
     try:
         os.write(fd, (json.dumps(obj, ensure_ascii=False) + '\n').encode())
     finally:
@@ -79,16 +79,6 @@ def jload(path):
             return json.load(f)
     except (OSError, ValueError):
         return None
-
-
-def read_handle(path, dir_fd=None):   # THE handle reader: a regular DIR/session holding a JSON object for a provider
-    # this engine runs, else None
-    try:
-        with os.fdopen(opened(path, os.O_RDONLY, dir_fd), 'rb') as f:
-            h = json.loads(f.read(1 << 16))
-    except (OSError, ValueError):
-        return None
-    return h if isinstance(h, dict) and h.get('provider') in WIRES else None
 
 
 def jparse(line):
@@ -171,9 +161,9 @@ def launch(h):   # claude: one process for the whole seat -> (argv, env)
     if schema:
         with open(schema) as f:
             schema = f.read()
-    # Every seat runs bypassPermissions: full access, as the caller. Background tasks OFF: a turn left waiting on one parks. ONE settings source,
-    # --settings: the seat refuses other sessions' cross-session messages (its own inbox socket stays bound and
-    # drops them); seat-to-seat mail goes through hands' inbox.jsonl, never the host socket.
+    # Every seat runs bypassPermissions: full access, as the caller. Background tasks OFF: a turn left waiting on one
+    # parks. ONE settings source, --settings: the seat refuses other sessions' cross-session messages (its own inbox
+    # socket stays bound and drops them).
     # LEAN (measured on paired haiku buys, prefix 36693 -> 33998 tokens): --strict-mcp-config, no host
     # MCP servers (their tool schemas cost every call); --exclude-dynamic-system-prompt-sections, cwd, env and git
     # status move into the first message, so the system prompt is shared across folders; auto-memory OFF, no
@@ -616,7 +606,7 @@ def deliver(d, prov, fd, text, expect, turn, **mail):   # THE delivery (send, MS
         data = data[os.write(fd, data):]
 
 
-def label(o):   # an inbox line as its seat reads it: the sender (driver, a seat's job dir, hands), the mail id, the text
+def label(o):   # an inbox line as its seat reads it: the sender (the driver's `hands.sh mail`), the mail id, the text
     return 'MAIL from %s%s:\n%s' % (o.get('from') or 'driver', ' (id %s)' % o['id'] if o.get('id') else '', o.get('text'))
 
 
@@ -635,7 +625,7 @@ class Seat:
     def __init__(s, d, h, msg, ready):
         s.d, s.h, s.msg, s.ready, s.prov, (s.fam, s.delivery) = d, h, msg, ready, h['provider'], WIRES[h['provider']]
         s.errs, s.mail_off, s.wfd, s.mlock, s.tlock, s.W = [], size(J(d, 'outbox.jsonl')), None, threading.Lock(), threading.Lock(), None
-        s.mail_n, s.seen, s.poster, s.done, s.halt = since(J(d, 'outbox.jsonl'), 0, s.mail_off).count('\n'), -1, None, False, False
+        s.seen, s.poster, s.done, s.halt = -1, None, False, False
 
     def put(s, e):
         append(J(s.d, 'events.jsonl'), e)
@@ -652,51 +642,14 @@ class Seat:
     def pending(s):
         return State(s.d).read().expect > s.W.turn
 
-    def mail(s):   # each new outbox line -> one push to the driver; a line addressed to a seat's job dir is routed there too
+    def mail(s):   # each new outbox line -> one push to the driver
         with s.mlock:   # (the post thread and the wrapper's last flush both call it)
             text, s.mail_off = tail(J(s.d, 'outbox.jsonl'), s.mail_off)
-            n0, s.mail_n = s.mail_n, s.mail_n + text.count('\n')
         turn = State(s.d).read().turn if text else 0   # the turn the mail arrived in
-        for n, ln in enumerate(text.split('\n')[:-1], n0 + 1):   # LF only, as State.read; n = the outbox line number
-            if not ln.strip():
-                continue
-            o = jparse(ln)
-            o = o if isinstance(o, dict) else {'to': '?', 'text': o}
-            to, body = o.get('to'), str(o.get('text'))
-            push(s.d, s.h, turn, 'mail', 'mail to %s' % to, body)
-            if isinstance(to, str) and to not in ('driver', '?'):
-                s.route(to, '%s:%d' % (s.d, n), body, turn)
-
-    def route(s, to, mid, text, turn):   # seat mail: the addressed seat's inbox, which ITS wrapper delivers; never a launch.
-        # The address is resolved FIRST (realpath: /var/... and /private/var/... name one seat on macOS) and judged as the
-        # dir it names, and that dir is checked before the line is written: it holds a hands
-        # handle and its inbox is a regular file (opened(): never a link). A link names nothing a seat could not address by
-        # its real path. The check and the write go through ONE open of the dir: a path swapped after the resolve still
-        # lands only beside a handle
-        r, why = os.path.realpath(to) if os.path.isabs(to) else '', None
-        try:
-            if not r:
-                raise OSError('not an absolute path')
-            fd = os.open(r, os.O_RDONLY | os.O_DIRECTORY | os.O_NONBLOCK)
-            try:
-                peer = read_handle('session', fd)
-                if not peer:
-                    raise OSError('no hands session handle in it')
-                append('inbox.jsonl', {'t': now(), 'from': s.d, 'id': mid, 'text': text}, fd)
-            finally:
-                os.close(fd)
-        except (OSError, ValueError) as e:
-            why = ('unknown-seat', '%s is not a seat job dir: %s' % (to, e))
-        if not why and r != s.d and not wrappers(r):
-            why = ('seat-gone', '%s has no live seat: the mail waits in its inbox until that seat runs again (a driver '
-                   'send relaunches it)' % r)
-        if why:   # typed back to the sender (an event, and a hands line in its own inbox) and to the driver
-            append(J(s.d, 'events.jsonl'), event('error', turn, text='mail %s: %s' % (mid, why[1]), mail=mid, to=to, reason=why[0]))
-            try:   # its own inbox, opened like any: a linked one takes nothing, and the error still reaches the driver
-                append(J(s.d, 'inbox.jsonl'), {'t': now(), 'from': 'hands', 'id': mid, 'text': 'your mail was not delivered (%s): %s' % why})
-            except OSError:
-                pass
-            push(s.d, s.h, turn, 'error', 'mail %s' % why[0], '%s: %s' % (mid, why[1]))
+        for ln in text.split('\n')[:-1]:   # LF only, as State.read
+            if ln.strip():
+                o = jparse(ln)
+                push(s.d, s.h, turn, 'mail', 'mail to driver', str(o.get('text') if isinstance(o, dict) else o))
 
     def inbox(s):   # each inbox line not yet delivered -> the conversation, through THE delivery (a send's), in order, once
         f = J(s.d, 'inbox.jsonl')
@@ -719,7 +672,7 @@ class Seat:
                     return   # its reader died mid-write: the close-out types that turn
                 st.read()
 
-    def post(s):   # the post thread: route the outbox and deliver the inbox, every second, until the wrapper closes out
+    def post(s):   # the post thread: push the outbox and deliver the inbox, every second, until the wrapper closes out
         while not s.done:
             s.mail()
             s.inbox()
@@ -1275,7 +1228,7 @@ def main(a):
     if cmd == 'spawn' and a[1] != d:   # the wrapper is found by its argv: that argv carries the canonical dir
         os.execv(sys.executable, [sys.executable, J(HERE, 'seat.py'), 'spawn', d] + a[2:])
     h = jload(J(d, 'session'))
-    if cmd == 'mail':   # the driver's line; the seat's live wrapper delivers it like a seat's mail
+    if cmd == 'mail':   # the driver's line; the seat's live wrapper delivers it
         if len(a) < 3:
             return 2
         try:   # opened like any engine append: never through a link the seat planted

@@ -144,11 +144,9 @@ fix ships a test that fails with the fix reverted — show both runs. Shut down 
 you booted. Put your report IN the final message, never before a later verification
 step. If a file you must edit is not yours, stop and report BLOCKED with the handoff as
 your first line — never "done".
-MAIL. To message the driver, append one JSON line {"to":"driver","text":"..."} to the
-outbox.jsonl in your job dir (the last line of this prompt names it); to message another
-seat, put that seat's job dir in "to" (the driver sees a copy of every mail). Mail to you
-arrives as a message that starts "MAIL from" and its sender: the driver, a seat's job dir,
-or hands (a mail of yours that was not delivered).
+MAIL. To message the driver, append one JSON line {"text":"..."} to the outbox.jsonl in
+your job dir (the last line of this prompt names it). Mail from the driver arrives as a
+message that starts "MAIL from driver".
 EOF
 }
 seat_dir() { printf 'YOUR JOB DIR: %s (your outbox: %s/outbox.jsonl).\n' "$1" "$1"; }
@@ -759,13 +757,6 @@ def disabled(feature, *argvs):   # every codex argv disables the feature as a RO
     return bool(pre) and all(any(a[i:i + 2] == ['--disable', feature] for i in range(len(a))) for a in pre)
 def marks(d):   # the delivery markers that carry an inbox line: [(inbox line, sender, mail id)]
     return [(e['inbox'], e.get('sender'), e.get('mail')) for e in evs(d) if e['kind'] == 'progress' and e.get('inbox')]
-def trapped(d, n, to, *gone):   # d's mail line n, to `to`, was refused and typed back to the sender -- ONE unknown-seat error
-    d = os.path.realpath(d)     # event naming it, ONE hands notice in its inbox, delivered once -- and no path in gone exists
-    mid = '%s:%s' % (d, n)
-    err = [e for e in evs(d) if e['kind'] == 'error' and e.get('mail') == mid]
-    return (len(err) == 1 and (err[0]['reason'], err[0]['to']) == ('unknown-seat', to) and not any(os.path.lexists(g) for g in gone)
-            and len([x for x in inbox(d) if (x.get('from'), x.get('id')) == ('hands', mid)]) == 1
-            and [m[1:] for m in marks(d)].count(('hands', mid)) == 1)
 def gone(d, *pids):   # within 5 s: no wrapper of job dir d and none of pids left running. A zombie is dead (kill -0 still
     # answers for one until it is reaped), and a process mid-exit gets the moment it needs on a loaded machine
     mine = re.compile(r'seat\.py spawn \S*/%s ' % re.escape(os.path.basename(d)))
@@ -777,49 +768,19 @@ def gone(d, *pids):   # within 5 s: no wrapper of job dir d and none of pids lef
             return True
         time.sleep(0.1)
     return False
-def aliased(a, b, addr):   # A mailed B by an ALIAS of B's dir (not its realpath): delivered once to B, no error back to A
-    a, b = os.path.realpath(a), os.path.realpath(b)
-    ib = inbox(b)
-    return (addr != os.path.realpath(addr) == b and len(ib) == 1 and (ib[0]['from'], ib[0]['id'], ib[0]['text']) == (a, a + ':1', 'via alias')
-            and marks(b) == [(1, a, a + ':1')] and result(b, 2) == 'MAIL from %s (id %s:1):\nvia alias' % (a, a)
-            and not [e for e in evs(a) if e['kind'] == 'error'])
-def drained(fifo):   # a held FIFO's buffer is empty: nothing was written into it
-    fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
-    try:
-        return os.read(fd, 65536) == b''
-    except BlockingIOError:
-        return True
-    finally:
-        os.close(fd)
 def result(d, n):
     return open(J(d, 'turn-%s' % n, 'result.txt')).read()
-def seatmail(a, b, log):   # A -> B: one inbox line {from A, id A:1}, delivered ONCE as a labelled message, the driver copied
-    a, b = os.path.realpath(a), os.path.realpath(b)
-    ib = inbox(b)
-    return (len(ib) == 1 and (ib[0]['from'], ib[0]['id'], ib[0]['text']) == (a, a + ':1', 'hello B') and isinstance(ib[0].get('t'), str)
-            and result(b, 2) == 'MAIL from %s (id %s:1):\nhello B' % (a, a) and marks(b) == [(1, a, a + ':1')]
-            and len(pushes(log, a, 'mail to ' + b)) == 1 and '\n'.join(pushes(log, a, 'mail to ' + b)[0][2][4:]) == 'hello B')
-def badmail(a, log):   # a bad address: a typed error event, a hands line in the sender's own inbox (delivered to it), a push
-    a = os.path.realpath(a)
-    err = [e for e in evs(a) if e['kind'] == 'error' and e.get('mail') == a + ':2']
-    ib = [x for x in inbox(a) if x.get('from') == 'hands']
-    return (len(err) == 1 and (err[0]['reason'], err[0]['to']) == ('unknown-seat', '/nonexistent/seat') and len(ib) == 1 and ib[0]['id'] == a + ':2'
-            and result(a, 2).startswith('MAIL from hands (id %s:2):\nyour mail was not delivered (unknown-seat)' % a)
-            and len(pushes(log, a, 'mail unknown-seat')) == 1)
-def regone(a, b, calls0, calls, rc):   # a gone receiver: seat-gone back to A, NO launch; the line waits; a relaunch delivers it
-    a, b = os.path.realpath(a), os.path.realpath(b)   # (and the driver's) ONCE, after the send's own message; a 2nd restart: none
-    err = [e for e in evs(a) if e['kind'] == 'error' and e.get('mail') == a + ':3']
-    m = [x[0] for x in marks(b)]
-    want = {4: 'turn two\n', 5: 'MAIL from %s (id %s:3):\nwhile you were out' % (a, a), 6: 'MAIL from driver:\ndriver while out', 7: 'turn two\n'}
-    return (len(err) == 1 and err[0]['reason'] == 'seat-gone' and result(a, 3).startswith('MAIL from hands (id %s:3):\nyour mail was not delivered (seat-gone)' % a)
-            and rc == '1' and open(calls0).read().strip() == '1' and open(calls).read().strip() == '3'
-            and m == [1, 2, 3, 4] and len(inbox(b)) == 4 and all(result(b, n) == t for n, t in want.items())
-            and not os.path.exists(J(b, 'turn-8')))
-def busymail(a, c, calls, stdin):   # a mail to a BUSY codex seat joins its running turn (steered in) and never cancels it
-    a, c, es = os.path.realpath(a), os.path.realpath(c), evs(c)
+def regone(b, calls0, calls, rc):   # driver mail to a gone seat: rc 1, NO launch; the line waits; a relaunch delivers it
+    b = os.path.realpath(b)            # ONCE, after the send's own message; a second restart delivers none
+    want = {3: 'turn two\n', 4: 'MAIL from driver:\ndriver while out', 5: 'turn two\n'}
+    return (rc == '1' and open(calls0).read().strip() == '1' and open(calls).read().strip() == '3'
+            and [x[0] for x in marks(b)] == [1, 2] and len(inbox(b)) == 2 and all(result(b, n) == t for n, t in want.items())
+            and not os.path.exists(J(b, 'turn-6')))
+def busymail(c, calls, stdin):   # driver mail to a BUSY codex seat joins its running turn (steered in) and never cancels it
+    c, es = os.path.realpath(c), evs(c)
     at = lambda f: next((i for i, e in enumerate(es) if f(e)), -1)
     mark, end1 = at(lambda e: e['kind'] == 'progress' and e.get('inbox') == 1), at(lambda e: e['kind'] == 'turn_end' and e['turn'] == 1)
-    e1, mail = json.load(open(J(c, 'turn-1', 'envelope.json'))), 'MAIL from %s (id %s:4):\nwhile you work' % (a, a)
+    e1, mail = json.load(open(J(c, 'turn-1', 'envelope.json'))), 'MAIL from driver:\nwhile you work'
     steer = [p for m, p in rpcin(stdin)[0] if m == 'turn/start'][1:]
     return (-1 < mark < end1 and (e1['status'], e1['rc']) == ('ok', 0) and result(c, 1).endswith(' | ' + mail)
             and [(e['turn'], e['status']) for e in es if e['kind'] == 'turn_end'] == [(1, 'ok')] and open(calls).read().strip() == '1'
@@ -1250,7 +1211,7 @@ STUB
   stub_run wait "$SB/p81" >/dev/null 2>&1; stub_run stop "$SB/p81" >/dev/null 2>&1
   t 82 "send to a DEAD seat resumes the recorded session on the SAME model, effort and permissions in the SAME canonical cwd (claude --resume): a new process answers turn 3" \
     sh -c "awk 'p==\"--resume\"{print;exit}{p=\$0}' '$SB/p82.argv' | grep -qx sess-stub && awk 'p==\"--model\"{print;exit}{p=\$0}' '$SB/p82.argv' | grep -qx sonnet && awk 'p==\"--effort\"{print;exit}{p=\$0}' '$SB/p82.argv' | grep -qx high && grep -qx bypassPermissions '$SB/p82.argv' && [ \"\$(cat '$SB/p82.cwd')\" = \"\$(cd '$SB/tmp' && pwd -P)\" ] && grep -q '^turn 1 pid' '$SB/p81/turn-3/result.txt' && jq -e '.turn==3 and .status==\"ok\" and .session==\"sess-stub\"' '$SB/p81/envelope.json' >/dev/null && jq -e '.status==\"spawned\" and .expect==3' '$SB/p82.ack' >/dev/null"
-  t 154 "CLAUDE SEATS REFUSE CROSS-SESSION MESSAGES: every claude launch, a start and a relaunch, carries exactly ONE --settings, {\"crossSessionInbound\":\"refuse\",\"disableAllHooks\":true} -- seat mail goes through hands' inbox, never the host socket" \
+  t 154 "CLAUDE SEATS REFUSE CROSS-SESSION MESSAGES: every claude launch, a start and a relaunch, carries exactly ONE --settings, {\"crossSessionInbound\":\"refuse\",\"disableAllHooks\":true} -- driver mail goes through hands' inbox, never the host socket" \
     python3 "$SB/chk.py" settings "$SB/g49.argv" "$SB/p82.argv"
   CL_STUB_MODE=count stub_run start --cwd "$SB/tmp" --out "$SB/p98" claude:sonnet "$SB/q.md" >/dev/null 2>&1
   stub_run wait "$SB/p98" >/dev/null 2>&1; stub_run stop "$SB/p98" >/dev/null 2>&1
@@ -1312,7 +1273,7 @@ PY
   CLAUDE_CODE_MESSAGING_SOCKET="$SB/d.sock" CLAUDE_CODE_MESSAGING_TOKEN=tok-stub CL_STUB_MODE=park CL_STUB_PIDFILE="$SB/p89b.pid" \
     stub_run start --cwd "$SB/tmp" --out "$SB/p89b" claude:sonnet "$SB/q.md" >/dev/null 2>&1
   for i in $(seq 1 50); do [ -s "$SB/p89b.pid" ] && break; sleep 0.1; done
-  echo '{"to":"driver","text":"hi from the seat"}' >>"$SB/p89b/outbox.jsonl"
+  echo '{"text":"hi from the seat"}' >>"$SB/p89b/outbox.jsonl"
   for i in $(seq 1 40); do grep -q ' mail ' "$SB/push.log" 2>/dev/null && break; sleep 0.1; done
   t 89b "MAIL PUSH: a line the seat appends to its outbox.jsonl posts one push 'claude:sonnet t1 mail to driver: <text>' (the dir, the id, the text) while the turn is still running" \
     python3 "$SB/chk.py" push "$SB/push.log" "$SB/p89b" 'mail to driver' 1 'claude:sonnet t1 mail to driver: hi from the seat' 'hi from the seat'
@@ -1439,42 +1400,31 @@ STUB
   wait $S139A $S139B; stub_run wait "$SB/p139" --timeout 10 >/dev/null 2>&1; stub_run stop "$SB/p139" >/dev/null 2>&1
   t 139 "TWO SENDS RACING TO A GONE SEAT RELAUNCH IT ONCE: one CLI launch answers both (turns 2 and 3 on one new pid), one send acks spawned and the other sent" \
     python3 "$SB/chk.py" relaunch1 "$SB/p139" "$SB/p139.calls" "$SB/p139.s1" "$SB/p139.s2"
-  # SEAT-TO-SEAT MAIL (140-144): a seat addresses a peer by its job dir; the sender's wrapper appends
-  # {t, from, id} to the peer's inbox and pushes the driver a copy; every wrapper delivers its inbox (driver mail too)
-  # through THE delivery a send uses (steer/queue, never a cancel), once -- the marker names the inbox line.
-  python3 "$SB/sockserv.py" "$SB/m.sock" "$SB/mpush.log" "$SB/m.noreply" >/dev/null 2>&1 & MSOCK=$!
-  for i in $(seq 1 50); do [ -S "$SB/m.sock" ] && break; sleep 0.1; done
+  # DRIVER MAIL (142-144): hands.sh mail appends a driver line to the seat's inbox.jsonl, and the seat's wrapper delivers
+  # it through THE delivery a send uses (steer/queue, never a cancel), once -- the marker names the inbox line.
   : >"$SB/m140b.calls"
-  CLAUDE_CODE_MESSAGING_SOCKET="$SB/m.sock" CLAUDE_CODE_MESSAGING_TOKEN=tok-stub CL_STUB_MODE=echo stub_run start --cwd "$SB/tmp" --out "$SB/m140a" claude:sonnet "$SB/q.md" >/dev/null 2>&1
   CL_STUB_MODE=echo CL_STUB_CALLS="$SB/m140b.calls" stub_run start --cwd "$SB/tmp" --out "$SB/m140b" claude:sonnet "$SB/q.md" >/dev/null 2>&1
-  stub_run wait "$SB/m140a" --timeout 10 >/dev/null 2>&1; stub_run wait "$SB/m140b" --timeout 10 >/dev/null 2>&1
-  MA="$(cd "$SB/m140a" && pwd -P)"; MB="$(cd "$SB/m140b" && pwd -P)"
+  stub_run wait "$SB/m140b" --timeout 10 >/dev/null 2>&1
+  MB="$(cd "$SB/m140b" && pwd -P)"
   until_file() { local i; for i in $(seq 1 100); do [ -e "$1" ] && return 0; sleep 0.1; done; return 1; }
-  printf '{"to":"%s","text":"hello B"}\n' "$MB" >>"$MA/outbox.jsonl"; until_file "$MB/turn-2/envelope.json"
-  t 140 "SEAT MAIL A->B: A's outbox line addressed to B's job dir lands in B's inbox as {t, from: A's dir, id: <A dir>:1, text}, B's wrapper delivers it ONCE (one marker naming inbox line 1) as a message labelled with its sender and id, B answers it as its next turn, and the driver gets a copy (one 'mail to <B dir>' push)" \
-    python3 "$SB/chk.py" seatmail "$MA" "$MB" "$SB/mpush.log"
-  printf '{"to":"/nonexistent/seat","text":"lost"}\n' >>"$MA/outbox.jsonl"; until_file "$MA/turn-2/envelope.json"
-  t 141 "a mail to an UNKNOWN address is typed back to the sender and the driver: an error event (reason unknown-seat, the mail id, the address), a hands line in A's own inbox that A receives as a labelled message, and one 'mail unknown-seat' push" \
-    python3 "$SB/chk.py" badmail "$MA" "$SB/mpush.log"
-  stub_run mail "$MB" "from the driver" >/dev/null 2>&1; R142=$?; until_file "$MB/turn-3/envelope.json"
-  t 142 "DRIVER MAIL takes the same path: hands.sh mail to a live seat (rc 0) is delivered by its wrapper as 'MAIL from driver', and answered as the next turn -- no seat has to read its inbox" \
-    sh -c "[ $R142 -eq 0 ] && [ \"\$(cat '$MB/turn-3/result.txt')\" = \"\$(printf 'MAIL from driver:\nfrom the driver')\" ]"
+  stub_run mail "$MB" "from the driver" >/dev/null 2>&1; R142=$?; until_file "$MB/turn-2/envelope.json"
+  t 142 "DRIVER MAIL: hands.sh mail to a live seat (rc 0) is delivered by its wrapper as 'MAIL from driver', and answered as the next turn -- no seat has to read its inbox" \
+    sh -c "[ $R142 -eq 0 ] && [ \"\$(cat '$MB/turn-2/result.txt')\" = \"\$(printf 'MAIL from driver:\nfrom the driver')\" ]"
   stub_run stop "$MB" >/dev/null 2>&1
-  printf '{"to":"%s","text":"while you were out"}\n' "$MB" >>"$MA/outbox.jsonl"; until_file "$MA/turn-3/envelope.json"
   stub_run mail "$MB" "driver while out" >/dev/null 2>&1; R143=$?; cp "$SB/m140b.calls" "$SB/m143.calls0"
-  CL_STUB_MODE=echo CL_STUB_CALLS="$SB/m140b.calls" stub_run send "$MB" "$SB/q81.md" >/dev/null 2>&1; until_file "$MB/turn-6/envelope.json"
+  CL_STUB_MODE=echo CL_STUB_CALLS="$SB/m140b.calls" stub_run send "$MB" "$SB/q81.md" >/dev/null 2>&1; until_file "$MB/turn-4/envelope.json"
   stub_run stop "$MB" >/dev/null 2>&1
-  CL_STUB_MODE=echo CL_STUB_CALLS="$SB/m140b.calls" stub_run send "$MB" "$SB/q81.md" >/dev/null 2>&1; until_file "$MB/turn-7/envelope.json"; sleep 1.5
+  CL_STUB_MODE=echo CL_STUB_CALLS="$SB/m140b.calls" stub_run send "$MB" "$SB/q81.md" >/dev/null 2>&1; until_file "$MB/turn-5/envelope.json"; sleep 1.5
   stub_run stop "$MB" >/dev/null 2>&1
-  t 143 "a GONE receiver: the mail is typed back to A (seat-gone) and to the driver's mail (rc 1), and launches nothing; both lines wait in B's inbox, and B's next launch delivers each ONCE after the send's own message (turns 4-6); a second restart re-delivers none (turn 7 is the send alone) -- delivered = a marker names the inbox line" \
-    python3 "$SB/chk.py" regone "$MA" "$MB" "$SB/m143.calls0" "$SB/m140b.calls" "$R143"
+  t 143 "a GONE seat: driver mail to it is rc 1 and launches nothing; the line waits in its inbox, and the next launch delivers it ONCE after the send's own message (turns 3-4); a second restart re-delivers none (turn 5 is the send alone) -- delivered = a marker names the inbox line" \
+    python3 "$SB/chk.py" regone "$MB" "$SB/m143.calls0" "$SB/m140b.calls" "$R143"
   : >"$SB/m144.calls"
   CX_STUB_MODE=slow CX_STUB_SLEEP=4 CX_STUB_CALLS="$SB/m144.calls" CX_STDIN_LOG="$SB/m144.stdin" stub_run start --cwd "$SB/cxw" --out "$SB/m144" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
   MC="$(cd "$SB/m144" && pwd -P)"
-  printf '{"to":"%s","text":"while you work"}\n' "$MC" >>"$MA/outbox.jsonl"; until_file "$MC/turn-1/envelope.json"
-  stub_run stop "$MC" >/dev/null 2>&1; stub_run stop "$MA" >/dev/null 2>&1; kill "$MSOCK" 2>/dev/null
-  t 144 "a mail to a BUSY steered seat (codex, mid-turn) joins its turn: its marker lands before turn 1 ends, the labelled text reaches the one app-server as a turn/start the open turn takes, and turn 1 ends ok (rc 0) answering its prompt and the mail -- no second turn, nothing cancelled" \
-    python3 "$SB/chk.py" busymail "$MA" "$MC" "$SB/m144.calls" "$SB/m144.stdin"
+  stub_run mail "$MC" "while you work" >/dev/null 2>&1; until_file "$MC/turn-1/envelope.json"
+  stub_run stop "$MC" >/dev/null 2>&1
+  t 144 "driver mail to a BUSY steered seat (codex, mid-turn) joins its turn: its marker lands before turn 1 ends, the labelled text reaches the one app-server as a turn/start the open turn takes, and turn 1 ends ok (rc 0) answering its prompt and the mail -- no second turn, nothing cancelled" \
+    python3 "$SB/chk.py" busymail "$MC" "$SB/m144.calls" "$SB/m144.stdin"
   # VERSION FLOOR (seat.py FLOOR): every launch, start or relaunch, reads its CLI's --version before anything runs
   CL_VERSION='2.1.282 (Claude Code)' CL_STUB_CALLS="$SB/v147c.calls" stub_run start --cwd "$SB/tmp" --out "$SB/v147c" claude:sonnet "$SB/q.md" >"$SB/v147c.ack" 2>/dev/null; echo $? >"$SB/v147c.rc"
   ACP_VERSION='grok 1.0.45' ACP_ARGV_LOG="$SB/v147g.calls" stub_run start --effort low --cwd "$SB/tmp" --out "$SB/v147g" grok:grok-4.6 "$SB/q.md" >"$SB/v147g.ack" 2>/dev/null; echo $? >"$SB/v147g.rc"
@@ -1500,35 +1450,24 @@ STUB
     sh -c "python3 '$SB/chk.py' disabled hooks '$SB/h159a.argv' '$SB/h159b.argv' && for f in '$SB/g49.argv' '$SB/p82.argv'; do [ \"\$(grep -c -- --settings \"\$f\")\" = 1 ] && awk 'p==\"--settings\"{print;exit}{p=\$0}' \"\$f\" | jq -e '.disableAllHooks==true' >/dev/null || exit 1; done && sed -n 6p '$SB/a100.env' | grep -qx hooks=0,0"
   t 170 "NO SEAT USES THE USER'S CODEX MEMORIES: every codex launch disables memories as a root option, a launch and a relaunch" \
     python3 "$SB/chk.py" disabled memories "$SB/h159a.argv" "$SB/h159b.argv"
-  # 164: the engine's other opens of a seat's own mail files never follow a link either (the suite
-  # plants the links): the outbox read, the sender's notice, the driver's mail. Falsification: read the outbox with a
-  # plain open (the linked file's line is routed), drop O_NOFOLLOW (the victim is written), let the notice raise (the post
-  # thread dies: the next mail is never typed), let the driver's mail raise (rc 1)
-  CL_STUB_MODE=echo stub_run start --cwd "$SB/tmp" --out "$SB/n164" claude:sonnet "$SB/q.md" >/dev/null 2>&1
+  # 164: the engine's opens of a seat's own mail files never follow a link (the suite plants the links): the outbox read
+  # and the driver's mail. Falsification: read the outbox with a plain open (the linked file's line is pushed), let the
+  # driver's mail follow the link (the victim is written) or raise (rc 1)
+  python3 "$SB/sockserv.py" "$SB/n164.sock" "$SB/n164push.log" "$SB/n164.noreply" >/dev/null 2>&1 & NSOCK=$!
+  for i in $(seq 1 50); do [ -S "$SB/n164.sock" ] && break; sleep 0.1; done
+  CLAUDE_CODE_MESSAGING_SOCKET="$SB/n164.sock" CLAUDE_CODE_MESSAGING_TOKEN=tok-stub CL_STUB_MODE=echo \
+    stub_run start --cwd "$SB/tmp" --out "$SB/n164" claude:sonnet "$SB/q.md" >/dev/null 2>&1
   stub_run wait "$SB/n164" --timeout 10 >/dev/null 2>&1
   N164="$(cd "$SB/n164" && pwd -P)"; echo keep >"$SB/v164"; : >"$SB/v164.out"
   rm "$N164/outbox.jsonl"; ln -s "$SB/v164.out" "$N164/outbox.jsonl"
-  printf '{"to":"/nonexistent/leak","text":"LEAKED"}\n' >>"$SB/v164.out"; sleep 2.5
+  printf '{"text":"LEAKED"}\n' >>"$SB/v164.out"; sleep 2.5
   rm "$N164/outbox.jsonl" "$N164/inbox.jsonl"; ln -s "$SB/v164" "$N164/inbox.jsonl"
-  printf '{"to":"/nonexistent/c","text":"c"}\n{"to":"/nonexistent/d","text":"d"}\n' >"$N164/outbox.jsonl"
-  for i in $(seq 1 50); do [ "$(jq -s '[.[] | select(.kind=="error" and .mail)] | length' "$N164/events.jsonl")" -ge 2 ] && break; sleep 0.1; done
+  printf '{"text":"after the link"}\n' >"$N164/outbox.jsonl"
+  for i in $(seq 1 50); do grep -q 'after the link' "$SB/n164push.log" 2>/dev/null && break; sleep 0.1; done
   stub_run mail "$N164" "through a link" >/dev/null 2>"$SB/n164.err"; R164=$?
-  stub_run stop "$N164" >/dev/null 2>&1
-  t 164 "NO LINK IN A JOB DIR: a seat's outbox.jsonl swapped for a link is never read (its line is not routed), a notice to a linked own inbox is not written through it (the error still typed, the next mail still routed), and the driver's mail to a linked inbox is refused (rc 2) -- the victim untouched" \
-    sh -c "[ $R164 = 2 ] && [ \"\$(cat '$SB/v164')\" = keep ] && jq -e -s '[.[] | select(.kind==\"error\" and .mail) | .to] == [\"/nonexistent/c\", \"/nonexistent/d\"]' '$N164/events.jsonl' >/dev/null"
-  # 171: AN ALIAS IS ONE SEAT. macOS hands out TMPDIR as /var/..., an alias of /private/var/... where the seat's job dir
-  # (canonical from its first line on) lives; a seat mailing the alias reached nobody (unknown-seat). The address is
-  # resolved first, then judged (160-164 hold on the resolved dir). B's address here is the suite's own TMPDIR form;
-  # the row refuses to pass if that is already canonical. Falsification: refuse a non-canonical address (unknown-seat),
-  # or skip the resolve (B's live wrapper is not found: a false seat-gone back to A).
-  CL_STUB_MODE=echo stub_run start --cwd "$SB/tmp" --out "$SB/m171a" claude:sonnet "$SB/q.md" >/dev/null 2>&1
-  CL_STUB_MODE=echo stub_run start --cwd "$SB/tmp" --out "$SB/m171b" claude:sonnet "$SB/q.md" >/dev/null 2>&1
-  stub_run wait "$SB/m171a" --timeout 10 >/dev/null 2>&1; stub_run wait "$SB/m171b" --timeout 10 >/dev/null 2>&1
-  printf '{"to":"%s","text":"via alias"}\n' "$SB/m171b" >>"$(cd "$SB/m171a" && pwd -P)/outbox.jsonl"
-  for i in $(seq 1 100); do [ -e "$SB/m171b/turn-2/envelope.json" ] && break; sleep 0.1; done; sleep 0.5
-  stub_run stop "$SB/m171a" >/dev/null 2>&1; stub_run stop "$SB/m171b" >/dev/null 2>&1
-  t 171 "AN ALIAS IS ONE SEAT: A mails B by B's dir in the TMPDIR form macOS hands out (/var/..., an alias of B's canonical /private/var/... dir) -- the line lands in B's inbox once, B's live wrapper delivers it as turn 2, and A gets no error (neither unknown-seat nor seat-gone)" \
-    python3 "$SB/chk.py" aliased "$SB/m171a" "$SB/m171b" "$SB/m171b"
+  stub_run stop "$N164" >/dev/null 2>&1; kill "$NSOCK" 2>/dev/null
+  t 164 "NO LINK IN A JOB DIR: a seat's outbox.jsonl swapped for a link is never read (its line is never pushed; the next real line is), and the driver's mail to a linked inbox is refused (rc 2) -- the victim untouched" \
+    sh -c "[ $R164 = 2 ] && [ \"\$(cat '$SB/v164')\" = keep ] && ! grep -q LEAKED '$SB/n164push.log' && grep -q 'after the link' '$SB/n164push.log'"
   CX_STUB_MODE=nofinal stub_run --out "$SB/p94" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
   t 94 "an answer FOLLOWED by a tool call is voided, never promoted: narration before a tool is no report (the turn fails closed: error, reason empty)" \
     sh -c "jq -e '.status==\"error\" and .reason==\"empty\"' '$SB/p94/envelope.json' >/dev/null && [ ! -e '$SB/p94/result.txt' ] && jq -e -s 'map(select(.kind==\"tool_call\" and .call==\"exec-5\")) | length==1' '$SB/p94/events.jsonl' >/dev/null"

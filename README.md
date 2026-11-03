@@ -219,18 +219,13 @@ Every buy's prompt starts with the **seat contract** (`seat_box()` in `hands.sh`
 text for every seat, telling it how to report and how to mail. The seat's own job-dir line comes
 last, after your task, so seats given one task share a prompt prefix.
 
-- **Seat to driver:** a seat appends `{"to":"driver","text":...}` to `DIR/outbox.jsonl`.
+- **Seat to driver:** a seat appends `{"text":...}` to `DIR/outbox.jsonl`.
   `wait DIR --for mail` returns on it, and a push carries it.
-- **Seat to seat:** a seat puts another seat's job dir in `to`. Its wrapper appends the line to
-  that seat's `inbox.jsonl`, and that seat's wrapper delivers it as `MAIL from <dir>`, exactly
-  once. Mail never launches a seat: to an address that isn't a live seat, the sender gets a typed
-  error (`unknown-seat` or `seat-gone`) and the line waits in that inbox for the seat's next
-  launch.
-- **Driver to seat:** `hands.sh mail DIR TEXT`.
+- **Driver to seat:** `hands.sh mail DIR TEXT`. The seat's wrapper delivers each line exactly
+  once, as `MAIL from driver`. Mail never launches a seat: to a seat with no live wrapper, the
+  line waits in its inbox for the next launch.
 
-The wrapper that routes mail checks every address: it resolves
-the path, requires a `session` file that is a hands handle, and opens inboxes and outboxes
-without following links, regular files only.
+The engine opens inboxes and outboxes without following links, regular files only.
 
 **Push (Claude Code).** When the host session exports its inbox socket
 (`CLAUDE_CODE_MESSAGING_SOCKET` and `_TOKEN`, as Claude Code does), every `start` and `send`
@@ -239,8 +234,7 @@ line 1 `provider:model tN status: <clip>`, line 2 the job dir, line 3 the id `<d
 the seat's text (up to 4,000 characters) marked as data. Each push's outcome is a progress event
 in `events.jsonl` (`posted` or `failed`); the host sends no reply, so delivery itself can't be
 observed. Without a socket, use `wait`. A `--probe` never pushes. Claude seats run with
-`crossSessionInbound: refuse`, so other sessions can't message them; seat-to-seat mail goes
-through `inbox.jsonl` only.
+`crossSessionInbound: refuse`, so other sessions can't message them.
 
 ## Hooks and memories
 
