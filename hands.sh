@@ -31,7 +31,7 @@ set -u
 
 # NO SEAT INHERITS THE DRIVER'S MESSAGING SOCKET/TOKEN: a process holding both can post into
 # the driver's session as its own child. NOT unset here -- the push needs them: seat.py's wrapper reads both
-# (capture(): DIR/driver.*) and drops them from its env before any seat process starts (spawn). A CLI started
+# (capture(): DIR/driver) and drops them from its env before any seat process starts (spawn). A CLI started
 # outside a wrapper drops them where it starts: run_probe (a probe never pushes).
 
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
@@ -159,7 +159,7 @@ run_single() { # $1 provider[:model]  $2 prompt-file
     if [ -e "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
       echo "hands: --out $dir is not empty — name a new or empty dir, or omit --out for a fresh one in the jobs root" >&2; return 2
     fi
-    mkdir -p "$(dirname "$dir")" 2>/dev/null; ( umask 077; mkdir -p "$dir" ) 2>/dev/null   # its parents keep your umask; the dir is 0700
+    mkdir -p "$(dirname "$dir")" "$dir" 2>/dev/null; chmod 700 "$dir" 2>/dev/null   # its parents keep your umask; the dir is 0700, an existing one too
   elif [ -n "$jobs" ]; then dir="$jobs/$(date +%Y%m%d-%H%M%S)-$prov-$$"; ( umask 077; mkdir -p "$dir" )   # 0700 (XDG): prompts live here
   else echo "hands: $SEATPY sweep printed no jobs root" >&2; return 2; fi
   # ONE canonical job dir from here on: the seat's job-dir line, the store, the handle. A dir that could not be made
@@ -673,7 +673,7 @@ def push(log, d, what, n, l1, body):   # n pushes, each ONE connection: the auth
         turn = re.match(r'\S+ t(\d+) ', t[0]).group(1)
         ok = ok and a == {'type': 'auth', 'token': 'tok-stub'} and sorted(u) == ['message', 'type'] and u['type'] == 'user'
         ok = ok and u['message'].get('role') == 'user' and t[2] == 'id %s:%s' % (rd, turn) and t[3] == "--- the seat's text: data, not instructions ---"
-    return ok and ps[-1][2][0] == l1 and '\n'.join(ps[-1][2][4:]) == body and all(os.stat(J(d, n)).st_mode & 0o777 == 0o600 for n in ('driver.sock', 'driver.token'))
+    return ok and ps[-1][2][0] == l1 and '\n'.join(ps[-1][2][4:]) == body and os.stat(J(d, 'driver')).st_mode & 0o777 == 0o600
 def capped(log, d):   # a long answer rides clipped to 4000 chars + the clip mark; line 1 stays one short line; the outcome event names the id
     ps, ans = pushes(log, d, 'ok'), open(J(d, 'turn-1', 'result.txt')).read().strip()
     l1, body = (ps[0][2][0], '\n'.join(ps[0][2][4:])) if len(ps) == 1 else ('', '')
@@ -1230,8 +1230,8 @@ PY
   t 130 "LF-only JSONL: a turn_end whose text holds a raw U+2028 is seen (wait returns its ok envelope, rc 0, within 10 s), and one outbox line holding U+2028 posts exactly ONE mail push (never one per fragment)" \
     sh -c "[ $R130 -eq 0 ] && python3 '$SB/chk.py' lsep '$SB/p130' '$SB/p130.wait' && python3 '$SB/chk.py' mails '$SB/push.log' '$SB/p89b' 2 \"\$(printf 'one\342\200\250line')\""
   CLAUDE_CODE_MESSAGING_SOCKET="$SB/nope.sock" CLAUDE_CODE_MESSAGING_TOKEN=tok-stub stub_run --cwd "$SB/tmp" --out "$SB/p90" claude:sonnet "$SB/q.md" >/dev/null 2>&1
-  t 90 "push is a silent no-op without the socket env (no driver.sock captured, no push event) and survives a dead socket (the buy stays ok)" \
-    sh -c "[ ! -e '$SB/g49/driver.sock' ] && ! grep -q '\"push\"' '$SB/g49/events.jsonl' && jq -e '.status==\"ok\"' '$SB/g49/envelope.json' >/dev/null && [ -s '$SB/p90/driver.sock' ] && jq -e '.status==\"ok\"' '$SB/p90/envelope.json' >/dev/null"
+  t 90 "push is a silent no-op without the socket env (no driver file captured, no push event) and survives a dead socket (the buy stays ok)" \
+    sh -c "[ ! -e '$SB/g49/driver' ] && ! grep -q '\"push\"' '$SB/g49/events.jsonl' && jq -e '.status==\"ok\"' '$SB/g49/envelope.json' >/dev/null && [ -s '$SB/p90/driver' ] && jq -e '.status==\"ok\"' '$SB/p90/envelope.json' >/dev/null"
   # 132: push records its outcome as a progress event -- never swallowed silently
   printf '{"type":"result","delivered":false,"reason":"held for approval"}\n' >"$SB/d.reply"
   CLAUDE_CODE_MESSAGING_SOCKET="$SB/d.sock" CLAUDE_CODE_MESSAGING_TOKEN=tok-stub stub_run --cwd "$SB/tmp" --out "$SB/p132" claude:sonnet "$SB/q.md" >/dev/null 2>&1
@@ -1262,16 +1262,16 @@ STUB
       shim_run --effort low --cwd "$SB/tmp" --out "$SB/e153-${w%%:*}" "$w" "$SB/q.md" >/dev/null 2>&1; done
   for i in $(seq 1 30); do [ "$(grep -c 'e153-' "$SB/push.log" 2>/dev/null)" -ge 4 ] && break; sleep 0.1; done
   # 153: THE PUSH SURVIVES THE STRIP. Falsification: put main's top-of-file unset back in this file -> no capture, no push
-  t 153 "THE DRIVER'S INBOX STAYS THE WRAPPER'S: with the socket and token exported to the buy, every wire's wrapper -- stdin (claude), rpc (codex), ACP (grok, opencode) -- captures both (driver.sock = the exported socket) and its turn_end push reaches the socket (the seat sees neither name: row 168)" \
-    sh -c "for c in claude codex grok opencode; do [ \"\$(cat '$SB'/e153-\$c/driver.sock)\" = '$SB/d.sock' ] || exit 1; done && python3 '$SB/chk.py' push '$SB/push.log' '$SB/e153-claude' ok 1 'claude:sonnet t1 ok: bg=1 mem=1 turn=1' 'bg=1 mem=1 turn=1' && python3 '$SB/chk.py' push '$SB/push.log' '$SB/e153-codex' ok 1 'codex:gpt-5.6-terra t1 ok: stub ok' 'stub ok' && python3 '$SB/chk.py' push '$SB/push.log' '$SB/e153-grok' ok 1 'grok:grok-4.6 t1 ok: PONG' 'PONG' && python3 '$SB/chk.py' push '$SB/push.log' '$SB/e153-opencode' ok 1 'opencode:opencode-go/deepseek-v4.1-flash t1 ok: PONG' 'PONG'"
+  t 153 "THE DRIVER'S INBOX STAYS THE WRAPPER'S: with the socket and token exported to the buy, every wire's wrapper -- stdin (claude), rpc (codex), ACP (grok, opencode) -- captures both (DIR/driver's line 1 = the exported socket) and its turn_end push reaches the socket (the seat sees neither name: row 168)" \
+    sh -c "for c in claude codex grok opencode; do [ \"\$(head -1 '$SB'/e153-\$c/driver)\" = '$SB/d.sock' ] || exit 1; done && python3 '$SB/chk.py' push '$SB/push.log' '$SB/e153-claude' ok 1 'claude:sonnet t1 ok: bg=1 mem=1 turn=1' 'bg=1 mem=1 turn=1' && python3 '$SB/chk.py' push '$SB/push.log' '$SB/e153-codex' ok 1 'codex:gpt-5.6-terra t1 ok: stub ok' 'stub ok' && python3 '$SB/chk.py' push '$SB/push.log' '$SB/e153-grok' ok 1 'grok:grok-4.6 t1 ok: PONG' 'PONG' && python3 '$SB/chk.py' push '$SB/push.log' '$SB/e153-opencode' ok 1 'opencode:opencode-go/deepseek-v4.1-flash t1 ok: PONG' 'PONG'"
   # 156: PROBES NEVER PUSH. A probe is internal: with the stub socket exported, its job dir captures no socket and the socket
-  # receives nothing from it. Falsification: drop run_probe's unset -> driver.sock captured, a 'probe-' push logged.
+  # receives nothing from it. Falsification: drop run_probe's unset -> a driver file captured, a 'probe-' push logged.
   ( export CLAUDE_CODE_MESSAGING_SOCKET="$SB/d.sock" CLAUDE_CODE_MESSAGING_TOKEN=tok-stub; mkdir -p "$SB/tmp156"
     PATH="$SB/bin:$PATH" TMPDIR="$SB/tmp156" XDG_STATE_HOME="$SB/tmp156" XDG_CACHE_HOME="$SB/cache" "$0" --probe claude >"$SB/p156.out" 2>&1
     PATH="$SB/bin:$PATH" TMPDIR="$SB/tmp156" XDG_STATE_HOME="$SB/tmp156" XDG_CACHE_HOME="$SB/cache" "$0" --probe codex >>"$SB/p156.out" 2>&1 ) || true
   sleep 0.5
   t 156 "PROBES NEVER PUSH: --probe claude and --probe codex with the driver socket + token exported answer ok, capture no socket in their job dirs, and post nothing to it" \
-    sh -c "[ \"\$(grep -c '\"status\":\"ok\"' '$SB/p156.out')\" = 2 ] && ls -d '$SB'/tmp156/hands/probe-*-claude '$SB'/tmp156/hands/probe-*-codex >/dev/null && [ -z \"\$(find '$SB/tmp156' -name 'driver.*')\" ] && ! grep -q 'probe-' '$SB/push.log'"
+    sh -c "[ \"\$(grep -c '\"status\":\"ok\"' '$SB/p156.out')\" = 2 ] && ls -d '$SB'/tmp156/hands/probe-*-claude '$SB'/tmp156/hands/probe-*-codex >/dev/null && [ -z \"\$(find '$SB/tmp156' -name driver)\" ] && ! grep -q 'probe-' '$SB/push.log'"
   stub_run mail "$SB/p89b" hello there >/dev/null 2>&1
   t 91 "MAIL: hands.sh mail appends one {t, from: driver, text} line to the seat's inbox.jsonl" \
     sh -c "tail -1 '$SB/p89b/inbox.jsonl' | jq -e '.from==\"driver\" and .text==\"hello there\" and (.t|type==\"string\")' >/dev/null"
@@ -1300,7 +1300,7 @@ STUB
     stub_run wait "$SB/s169-$c" --timeout 30 >/dev/null 2>&1; stub_run stop "$SB/s169-$c" >/dev/null 2>&1; unset ACP_REPLAY; done
   for i in $(seq 1 30); do [ "$(grep -c 's169-' "$SB/push.log" 2>/dev/null)" -ge 4 ] && break; sleep 0.1; done
   t 169 "no relaunched seat inherits the driver's messaging socket/token, and its push survives: a send to each provider's GONE seat, its caller exporting both, relaunches a CLI that sees neither name; the relaunching wrapper captured the socket and its turn 2 push reaches it" \
-    sh -c "for c in claude codex grok opencode; do grep -q \"^== \$c \" '$SB/env169.log' && [ \"\$(cat '$SB'/s169-\$c/driver.sock)\" = '$SB/d.sock' ] || exit 1; done; grep -qx PATH '$SB/env169.log' && ! grep -q '^CLAUDE_CODE_MESSAGING_' '$SB/env169.log' && python3 '$SB/chk.py' push '$SB/push.log' '$SB/s169-claude' ok 1 'claude:sonnet t2 ok: bg=1 mem=1 turn=1' 'bg=1 mem=1 turn=1' && python3 '$SB/chk.py' push '$SB/push.log' '$SB/s169-codex' ok 1 'codex:gpt-5.6-terra t2 ok: stub ok' 'stub ok' && python3 '$SB/chk.py' push '$SB/push.log' '$SB/s169-grok' ok 1 'grok:grok-4.6 t2 ok: PONG' 'PONG' && python3 '$SB/chk.py' push '$SB/push.log' '$SB/s169-opencode' ok 1 'opencode:opencode-go/deepseek-v4.1-flash t2 ok: PONG' 'PONG'"
+    sh -c "for c in claude codex grok opencode; do grep -q \"^== \$c \" '$SB/env169.log' && [ \"\$(head -1 '$SB'/s169-\$c/driver)\" = '$SB/d.sock' ] || exit 1; done; grep -qx PATH '$SB/env169.log' && ! grep -q '^CLAUDE_CODE_MESSAGING_' '$SB/env169.log' && python3 '$SB/chk.py' push '$SB/push.log' '$SB/s169-claude' ok 1 'claude:sonnet t2 ok: bg=1 mem=1 turn=1' 'bg=1 mem=1 turn=1' && python3 '$SB/chk.py' push '$SB/push.log' '$SB/s169-codex' ok 1 'codex:gpt-5.6-terra t2 ok: stub ok' 'stub ok' && python3 '$SB/chk.py' push '$SB/push.log' '$SB/s169-grok' ok 1 'grok:grok-4.6 t2 ok: PONG' 'PONG' && python3 '$SB/chk.py' push '$SB/push.log' '$SB/s169-opencode' ok 1 'opencode:opencode-go/deepseek-v4.1-flash t2 ok: PONG' 'PONG'"
   kill "$SOCKPID" 2>/dev/null
   # THE VIEW (135-136): `events DIR` renders; the raw stream is `tail -f DIR/events.jsonl`. Recorded live streams:
   for c in grok claude opencode; do mkdir -p "$SB/v-$c"; cp "$HERE/fixtures/$c-events-sample.jsonl" "$SB/v-$c/events.jsonl"
@@ -1453,16 +1453,16 @@ STUB
   stub_run wait "$SB/w199" --timeout 10 >"$SB/w199.wait" 2>/dev/null; echo $? >"$SB/w199.rc"
   t 199 "WAIT AFTER A WRAPPER DIED MID-TURN: incomplete, reason wrapper-gone, the sent turn (2), rc 1 -- never turn 1's ok answer" \
     sh -c "[ -n '$W199' ] && [ \"\$(cat '$SB/w199.rc')\" = 1 ] && jq -e '.status==\"incomplete\" and .reason==\"wrapper-gone\" and .turn==2' '$SB/w199.wait' >/dev/null"
-  # 200: the driver files are written 0600 through the no-link open (opened()): a link planted at either name (a
-  # seat can, in its own dir) takes nothing at the next capture, a relaunching send. Falsification: open
-  # driver.token without O_NOFOLLOW -> the victim holds the token
+  # 200: the driver file is written 0600 through the no-link open (opened()): a link planted there (a seat can, in
+  # its own dir) takes nothing at the next capture, a relaunching send. Falsification: open driver without
+  # O_NOFOLLOW -> the victim holds the token
   CLAUDE_CODE_MESSAGING_SOCKET="$SB/nosock200" CLAUDE_CODE_MESSAGING_TOKEN=tok-200 stub_run --cwd "$SB/tmp" --out "$SB/p200" claude:sonnet "$SB/q.md" >/dev/null 2>&1
-  printf keep >"$SB/v200"; for n in driver.sock driver.token; do rm -f "$SB/p200/$n"; ln -s "$SB/v200" "$SB/p200/$n"; done
+  printf keep >"$SB/v200"; rm -f "$SB/p200/driver"; ln -s "$SB/v200" "$SB/p200/driver"
   CLAUDE_CODE_MESSAGING_SOCKET="$SB/nosock200" CLAUDE_CODE_MESSAGING_TOKEN=tok-200 stub_run send "$SB/p200" "$SB/q81.md" >/dev/null 2>&1
   stub_run wait "$SB/p200" --timeout 20 >/dev/null 2>&1; stub_run stop "$SB/p200" >/dev/null 2>&1
-  t 200 "CAPTURE NEVER WRITES THROUGH A LINK: links planted at driver.sock and driver.token stay links and the file they name is untouched" \
-    sh -c "[ \"\$(cat '$SB/v200')\" = keep ] && [ -L '$SB/p200/driver.sock' ] && [ -L '$SB/p200/driver.token' ]"
-  rm -f "$SB/p200/driver.sock" "$SB/p200/driver.token"   # no planted link outlives its row (157 reads every driver.sock)
+  t 200 "CAPTURE NEVER WRITES THROUGH A LINK: a link planted at DIR/driver stays a link and the file it names is untouched" \
+    sh -c "[ \"\$(cat '$SB/v200')\" = keep ] && [ -L '$SB/p200/driver' ]"
+  rm -f "$SB/p200/driver"   # no planted link outlives its row (157 reads every driver file)
   # 201: the sweep never crosses into another filesystem: a stale job dir with a mount in it (lstat's st_dev differs,
   # forced in-process) is not stale. Falsification: drop the st_dev check -> stale() says True
   mkdir -p "$SB/t201"
@@ -1492,7 +1492,8 @@ assert not seat.stale(p, cut)' "$HERE" "$SB/t201/20250101-000000-codex-9"
   ( cd "$SB/tmp" && XDG_STATE_HOME=rel188 HOME="$SB/h188r" PATH="$SB/bin:$PATH" TMPDIR="$SB/tmp" XDG_CACHE_HOME="$SB/cache" \
     "$SELF" --cwd "$SB/tmp" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1 )
   stub_run --cwd "$SB/tmp" --out "$SB/o188/x" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
-  t 188 "THE JOBS ROOT: a buy without --out lands in \$XDG_STATE_HOME/hands (unset or relative: HOME/.local/state/hands), one dir named <date>-<time>-<provider>-<pid>, the root and the dir 0700, the seat answered ok; an --out dir is 0700, its parent keeps the caller's umask; nothing in this suite landed in \$TMPDIR/hands or in a relative root" \
+  mkdir -p "$SB/o188e"; chmod 755 "$SB/o188e"; stub_run --cwd "$SB/tmp" --out "$SB/o188e" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
+  t 188 "THE JOBS ROOT: a buy without --out lands in \$XDG_STATE_HOME/hands (unset or relative: HOME/.local/state/hands), one dir named <date>-<time>-<provider>-<pid>, the root and the dir 0700, the seat answered ok; an --out dir is 0700 (an existing empty one too), its parent keeps the caller's umask; nothing in this suite landed in \$TMPDIR/hands or in a relative root" \
     python3 -c 'import os, re, sys, json
 for r in sys.argv[1:4]:
     n = os.listdir(r)
@@ -1504,24 +1505,26 @@ u = os.umask(0); os.umask(u)
 q = os.path.join(sys.argv[4], "x")
 assert os.stat(sys.argv[4]).st_mode & 0o777 == 0o777 & ~u, oct(os.stat(sys.argv[4]).st_mode)
 assert os.stat(q).st_mode & 0o777 == 0o700, (q, oct(os.stat(q).st_mode))
-assert not os.path.exists(sys.argv[5]) and not os.path.exists(sys.argv[6])' "$SB/st188/hands" "$SB/h188/.local/state/hands" \
-      "$SB/h188r/.local/state/hands" "$SB/o188" "$SB/tmp/hands" "$SB/tmp/rel188"
+assert not os.path.exists(sys.argv[5]) and not os.path.exists(sys.argv[6])
+assert os.stat(sys.argv[7]).st_mode & 0o777 == 0o700, oct(os.stat(sys.argv[7]).st_mode)' "$SB/st188/hands" "$SB/h188/.local/state/hands" \
+      "$SB/h188r/.local/state/hands" "$SB/o188" "$SB/tmp/hands" "$SB/tmp/rel188" "$SB/o188e"
   # 189: THE RETENTION. Every buy sweeps the jobs root first: a dir hands.sh named there, with
   # nothing in it written in 30 days, no repository in it and its job.log lock free, is deleted; a dir with one file
   # written 29 days ago deep in a turn dir, one whose lock a live process holds (a wrapper holds it for its whole life),
   # one --out-style name, one holding a .git and a link to an old dir elsewhere all stay, and the link's target gains
   # nothing. Falsification, each alone: a sweep that deletes nothing (the old dirs stay); the top dir's mtime alone (the
   # 29-day dir goes); no lock (the locked dir goes); no name check (keepme goes); no repository check (it goes); a naming
-  # change NAMED misses (the real dirs stay); follow a link (it is hidden as .<name>, never to return)
+  # change NAMED misses (the real dirs stay); follow a link (it is hidden as .<name>, never to return); take a CLAUDE.md
+  # for a repository (codex-6 stays)
   R189="$SB/st189/hands"; mkdir -p "$SB/t189"
   # a buy's dir and a probe's, as hands.sh names them today: the sweep's NAMED must take both
   # (a naming change that NAMED misses would leave every dir unswept)
   XDG_STATE_HOME="$SB/st189" stub_run --cwd "$SB/tmp" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
   XDG_STATE_HOME="$SB/st189" stub_run --probe claude >/dev/null 2>&1
   REAL189="$(ls "$R189" | tr '\n' ' ')"
-  for n in 20250101-000000-codex-1 probe-1-claude 20250101-000000-codex-2 20250101-000000-codex-3 keepme 20250101-000000-codex-4; do
+  for n in 20250101-000000-codex-1 probe-1-claude 20250101-000000-codex-2 20250101-000000-codex-3 keepme 20250101-000000-codex-4 20250101-000000-codex-6; do
     mkdir -p "$R189/$n/turn-1"; echo '{"provider":"codex","cwd":"/"}' >"$R189/$n/session"; echo x >"$R189/$n/turn-1/result.txt"; : >"$R189/$n/job.log"; done
-  mkdir -p "$R189/20250101-000000-codex-4/.git"; echo ref >"$R189/20250101-000000-codex-4/.git/HEAD"
+  mkdir -p "$R189/20250101-000000-codex-4/.git"; echo ref >"$R189/20250101-000000-codex-4/.git/HEAD"; echo x >"$R189/20250101-000000-codex-6/CLAUDE.md"
   echo t >"$SB/t189/session"; ln -s "$SB/t189" "$R189/20250101-000000-codex-5"
   python3 -c 'import os, sys, time
 old, young = time.time() - 31 * 86400, time.time() - 29 * 86400
@@ -1537,11 +1540,11 @@ fcntl.flock(fd, fcntl.LOCK_EX); open(sys.argv[2], "w").close(); time.sleep(60)' 
   for i in $(seq 1 50); do [ -e "$SB/h189.ready" ] && break; sleep 0.1; done
   XDG_STATE_HOME="$SB/st189" stub_run --cwd "$SB/tmp" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
   kill "$H189" 2>/dev/null; wait "$H189" 2>/dev/null
-  t 189 "THE RETENTION: a buy sweeps the jobs root first -- an engine-named dir (a real buy's and a real probe's, as hands.sh names them; hand-named ones) with nothing written in 30 days goes; one with a file written 29 days ago deep in it, one whose job.log lock is held, an --out-style name, one holding a .git and a link to an old dir elsewhere stay (the target gains nothing); the buy's own dir is made" \
+  t 189 "THE RETENTION: a buy sweeps the jobs root first -- an engine-named dir (a real buy's and a real probe's, as hands.sh names them; hand-named ones; one holding a CLAUDE.md) with nothing written in 30 days goes; one with a file written 29 days ago deep in it, one whose job.log lock is held, an --out-style name, one holding a .git and a link to an old dir elsewhere stay (the target gains nothing); the buy's own dir is made" \
     python3 -c 'import os, re, sys
 r, t = sys.argv[1], sys.argv[2]
 n = set(os.listdir(r))
-assert not {"20250101-000000-codex-1", "probe-1-claude"} & n, n
+assert not {"20250101-000000-codex-1", "probe-1-claude", "20250101-000000-codex-6"} & n, n
 assert {"20250101-000000-codex-2", "20250101-000000-codex-3", "keepme", "20250101-000000-codex-4", "20250101-000000-codex-5"} <= n, n
 assert os.path.islink(os.path.join(r, "20250101-000000-codex-5")) and sorted(os.listdir(t)) == ["session"], os.listdir(t)
 real = sys.argv[3].split()
@@ -1650,7 +1653,7 @@ PY
   # captures a socket only where its row exported a STUB one (under $SB). Falsification: drop the top unset and run the
   # suite with a fake socket exported -> job dirs capture the outer path.
   t 157 "HERMETIC SUITE: every driver socket any seat captured in this run is a stub under the sandbox -- none from the env the suite was started in" \
-    sh -c "for f in \$(find '$SB' -name driver.sock); do case \"\$(cat \"\$f\")\" in '$SB'/*) ;; *) exit 1;; esac; done"
+    sh -c "for f in \$(find '$SB' -name driver -type f); do case \"\$(head -1 \"\$f\")\" in '$SB'/*) ;; *) exit 1;; esac; done"
   wait "$A202" 2>/dev/null
   t 202 "A SLOW LAUNCH ACKS: an ACP launch whose handshake takes 70 s (past a minute, each call within its bound) acks spawned while its wrapper runs, never 'never delivered'" \
     jq -e '.status=="spawned"' "$SB/a202.ack"

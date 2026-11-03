@@ -16,8 +16,8 @@ Read README § Security model before you run a seat. In short:
   read-only mode. Nothing stops a seat from reading your files, running any command, or
   reaching the network.
 - hands stores no credentials of its own. Each CLI uses its own login. While a seat lives, its
-  job dir holds the host session's push socket path and token (`driver.sock`, `driver.token`,
-  mode 0600). A seat can read them.
+  job dir holds the host session's push socket path and token (`driver`, mode 0600). A seat
+  can read it.
 
 In scope: mail that reaches a file it shouldn't, a job dir or temp file that another local user can read or
 replace, credentials that leak into process arguments, logs or job dirs, and the sweep deleting

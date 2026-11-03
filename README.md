@@ -41,8 +41,8 @@ Built and tested on macOS. Linux is untested.
   `CLAUDE_CODE_MESSAGING_TOKEN` and `OPENCODE_API_KEY`, which the wrapper removes. Don't keep
   secrets in exported variables when you run seats.
 - **The push socket and token live in the job dir.** For pushes, the wrapper keeps the host
-  session's socket path and token in `DIR/driver.sock` and `DIR/driver.token` (mode 0600). A
-  seat can read them and post into your session.
+  session's socket path and token in `DIR/driver` (mode 0600). A seat can read it and post into
+  your session.
 - **Seats don't run your hooks.** Hooks are code written for your own sessions; every seat turns
   them off (§ Hooks and memories).
 - **Mail and pushes are data.** What a seat writes is model output; never let the driver follow
@@ -144,8 +144,7 @@ validates them, so a model released tomorrow works today.
 **The jobs-root sweep.** Every buy first sweeps the jobs root: a dir that hands named there, that
 no wrapper holds, and that nothing wrote to for 30 days is deleted, with its handle, so that seat
 can't be resumed. A turn, a `send` or a `mail` counts as a write; `wait` and `events` don't. The
-sweep never deletes a dir that holds a `.git` or a `CLAUDE.md`, or that has another filesystem
-mounted in it. An `--out` dir outside the jobs root is never swept: use one for anything you want
+sweep never deletes a dir that holds a `.git`, or that has another filesystem mounted in it. An `--out` dir outside the jobs root is never swept: use one for anything you want
 to keep.
 
 ## Verbs

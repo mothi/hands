@@ -41,8 +41,8 @@ A seat is its job dir (`--out DIR`, else a fresh dir in the jobs root,
 `$XDG_STATE_HOME/hands` when that is absolute, else `~/.local/state/hands`; mode 0700, it survives a reboot; an
 `--out` dir must be new or empty) — the only state; no daemon, no registry. Every buy first sweeps the jobs root: a dir hands named there that no wrapper holds (its `job.log`
 lock is free) and nothing wrote to in 30 days is deleted, with its handle — so a seat idle that long cannot be
-resumed (a turn, a `send` or a `mail` is a write; `wait` and `events` are not); a dir holding a `.git` or
-`CLAUDE.md`, or a mount, is never deleted. An `--out` dir outside the jobs root is never swept. `DIR/session` is the handle (provider, model, effort, cwd, timeout,
+resumed (a turn, a `send` or a `mail` is a write; `wait` and `events` are not); a dir holding a `.git`
+or a mount is never deleted. An `--out` dir outside the jobs root is never swept. `DIR/session` is the handle (provider, model, effort, cwd, timeout,
 native session id): a `send` to a gone seat relaunches from it, resuming the same
 session on the same model, effort and cwd. The dir also holds `prompt.txt` (the exact seat
 input), `stream.jsonl` (the raw stream), `stderr.log`, `events.jsonl`, the mail files,
@@ -99,8 +99,8 @@ in events.jsonl: posted = the host took the bytes (whether it delivered or held 
 observable on the socket), failed = no connection or a write error, with the `error`.
 No socket: `wait`. No seat CLI or tool process inherits `CLAUDE_CODE_MESSAGING_SOCKET`/`_TOKEN`: the
 wrapper reads both, then drops them before any seat process starts (so hands.sh never unsets them first: that
-would end the push). The wrapper keeps both in `DIR/driver.sock` and `DIR/driver.token` (0600) for its pushes, and a seat
-runs as you: it can read them and post into the driver's session. The env strip only raises the bar (claude seats'
+would end the push). The wrapper keeps both in `DIR/driver` (0600) for its pushes, and a seat
+runs as you: it can read it and post into the driver's session. The env strip only raises the bar (claude seats'
 `crossSessionInbound: refuse`, below, guards the other direction). A `--probe` is internal and captures no socket: it never pushes. Every selftest unsets both names. claude seats
 launch with `--settings '{"crossSessionInbound":"refuse","disableAllHooks":true}'` (their one settings source): other
 sessions' messages are dropped. A pushed
