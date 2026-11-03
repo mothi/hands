@@ -10,7 +10,7 @@ model catalogs keep only OpenCode's own providers; MCP server names became `mcp-
 plan tiers and some quota values were re-valued. Structure, ids, event order, statuses and usage are
 otherwise as recorded. New recordings get the same treatment (see CONTRIBUTING.md).
 
-**Error wording.** `--selftest` asserts that each provider error string classifies to its typed
+**Error wording.** `tests/selftest.sh` asserts that each provider error string classifies to its typed
 status. When a provider changes its wording, add the new error text here the day it is found.
 
 | fixture | origin | read by |

@@ -13,8 +13,8 @@ provider is one entry in the wire table (`WIRES` in `seat.py`), not a flag.
 Run all three suites before a commit. Each must print `0 failed` and exit 0:
 
 ```bash
-bash ./hands.sh --selftest
-python3 test_acp.py
+bash tests/selftest.sh
+python3 tests/test_acp.py
 bash ./quota.sh --selftest
 ```
 
@@ -31,7 +31,7 @@ clone or a `git worktree`.
 
 ## Fixtures
 
-`fixtures/` holds recorded provider output that the suites replay (see `fixtures/README.md`).
+`tests/fixtures/` holds recorded provider output that the suites replay (see `tests/fixtures/README.md`).
 When a provider changes its error wording or stream shape, add the new recording the same
 day. Before you commit one, strip it of personal data: home paths, user and host names, account
 and session ids, emails, tokens, local timestamps, and anything else that is yours.

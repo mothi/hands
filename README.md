@@ -67,7 +67,7 @@ later. Older CLIs may not speak the same wire.
 
 ```bash
 git clone https://github.com/mothi/hands ~/src/hands
-bash ~/src/hands/hands.sh --selftest          # hermetic: stub CLIs, no network, no spend
+bash ~/src/hands/tests/selftest.sh           # hermetic: stub CLIs, no network, no spend
 
 # optional: make it a skill your agent can call
 mkdir -p ~/.claude/skills ~/.agents/skills
@@ -310,13 +310,15 @@ seat), and the exact command is shown before it runs.
 ```
 hands/
 ├── SKILL.md        the short guide agent hosts read
-├── hands.sh        the command line, the seat contract, --selftest
+├── hands.sh        the command line and the seat contract
 ├── seat.py         the engine: the wire table, the wrapper, the verbs, the envelope writer
 ├── acp.py          the ACP client (Grok, OpenCode) and the event vocabulary all wires share
 ├── quota.sh        the quota board behind hands.sh quota (--json, --selftest)
-├── test_acp.py     the ACP suite
-├── test-stub.py    a stand-in for the claude and codex CLIs, used by the suites
-└── fixtures/       recorded provider output the suites replay
+└── tests/
+    ├── selftest.sh     the hermetic suite for hands.sh and seat.py
+    ├── test_acp.py     the ACP suite
+    ├── test-stub.py    a stand-in for the claude and codex CLIs, used by the suites
+    └── fixtures/       recorded provider output the suites replay
 ```
 
 ## Design

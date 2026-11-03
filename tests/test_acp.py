@@ -2,10 +2,10 @@
 """Hermetic tests for acp.py, zero model calls. A fake ACP agent (this file re-run with
 --fake; hands.sh's selftest runs it as its grok and opencode stubs) replays recorded grok and
 opencode transcripts (fixtures/*-acp-*.jsonl) request by request, mapping the recorded answer ids to
-the live client's. Run: python3 test_acp.py"""
+the live client's. Run: python3 tests/test_acp.py"""
 import itertools, json, os, signal, subprocess, sys, tempfile, threading, time, unittest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # the repo root: acp.py
 import acp  # noqa: E402
 
 # HERMETIC: a run inside a Claude Code session inherits the driver's inbox socket — dropped for the whole module, so no

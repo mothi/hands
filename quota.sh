@@ -349,7 +349,7 @@ PY
 
 # ---------- selftest: hermetic — PATH stubs for curl and the codex app-server (+ credential tripwires), HOME, TMPDIR and XDG_STATE_HOME sandbox
 run_selftest() {
-  local SB PASS=0 FAIL=0 FX="$HERE/fixtures"
+  local SB PASS=0 FAIL=0 FX="$HERE/tests/fixtures"
   SB="$(mktemp -d "${TMPDIR:-/tmp}/quota-selftest.XXXXXX")"
   # HERMETIC: a suite run inside a Claude Code session inherits the driver's inbox socket — unset suite-wide, so
   # nothing this suite starts can capture it (heals once posted into the live session)
