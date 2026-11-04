@@ -19,11 +19,21 @@ The grok and opencode endpoints are undocumented and may change. Their token goe
 stdin, never on its command line. Raw replies are never printed or stored: only the numbers
 below leave this file, and a provider's error text is masked before it is shown.
 """
-import datetime, glob, json, os, re, signal, subprocess, sys, threading, time
+import datetime
+import glob
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
 
+import wires
 from seat import JOBS
 
-POOLS = ('claude', 'codex', 'grok', 'opencode')
+POOLS = tuple(wires.PROVIDERS)
 REFRESH = 'refresh: hands.sh --probe claude'
 
 
@@ -31,7 +41,7 @@ class Unknown(Exception):
     """A pool that cannot be read; the message says why."""
 
 
-def iso(epoch):
+def iso_time(epoch):
     return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).isoformat()
 
 
@@ -42,37 +52,40 @@ def window(name, used, resets):
     return {'name': name, 'used_pct': used, 'resets_at': resets}
 
 
-def span(minutes):
-    """A window's length as a label: 300 -> 5h, 10080 -> week, 1440 -> 1d."""
+def window_label(minutes):
+    """A window's length as a label: 300 -> 5h, 1440 -> 1d, 10080 -> week."""
     if minutes == 10080:
         return 'week'
-    return '%dh' % (minutes // 60) if minutes < 1440 else '%dd' % (minutes // 1440)
+    if minutes < 1440:
+        return '%dh' % (minutes // 60)
+    return '%dd' % (minutes // 1440)
 
 
-def parse(body):
-    """The reply as a JSON object, checked."""
+def parse_reply(body):
+    """The reply as a JSON object, checked for an error."""
     try:
         reply = json.loads(body)
     except ValueError:
         reply = None
     if not isinstance(reply, dict):
         raise Unknown('the reply is not JSON')
-    return checked(reply)
+    return raise_if_error(reply)
 
 
-def checked(reply):
-    """reply, unless it is an error: then Unknown, carrying the provider's own message."""
+def raise_if_error(reply):
+    """The reply, unless it is an error: then Unknown, with the provider's own message."""
     error = reply.get('error')
     if isinstance(error, dict):
-        error = next((v for v in (error.get('message'), error.get('type'))
-                      if isinstance(v, str) and v), 'the provider answered with an error')
+        messages = (error.get('message'), error.get('type'))
+        error = next((m for m in messages if isinstance(m, str) and m),
+                     'the provider answered with an error')
     if error:
         raise Unknown(error if isinstance(error, str) else 'the provider answered with an error')
     return reply
 
 
-def curl(url, token, *headers):
-    """GET url with a bearer token. The token goes to curl on stdin: ps shows argv to every user."""
+def fetch(url, token, *headers):
+    """GET url with a bearer token. The token goes to curl on stdin: ps shows argv to all."""
     argv = ['curl', '-sS', '--max-time', '20', url, '-H', '@-']
     for header in headers:
         argv += ['-H', header]
@@ -86,8 +99,8 @@ def curl(url, token, *headers):
     return done.stdout
 
 
-def login(path, find):
-    """The token find() picks out of the CLI's own JSON login file at path."""
+def read_login(path, find):
+    """The token find() picks out of a CLI's own JSON login file."""
     try:
         with open(path) as f:
             value = find(json.load(f))
@@ -98,12 +111,12 @@ def login(path, find):
     return value
 
 
-def read_claude():
-    """The newest rate_limit_event in the claude job streams, with its age.
+# ---------------------------------------------------------------------------------------------
+# One reader per provider
 
-    A window that has reset since the event was written is dropped: its number is no longer true.
-    five_hour and seven_day are the account's windows. Any other key (fable streams carry
-    seven_day_overage_included) limits one model, so it is listed apart as a model limit."""
+
+def read_claude():
+    """The newest rate_limit_event in the claude job streams, with its age."""
     now = time.time()
     streams = []
     for path in glob.glob(os.path.join(JOBS, '*', 'stream.jsonl')):
@@ -124,7 +137,7 @@ def read_claude():
                 event = json.loads(line)
             except ValueError:
                 continue
-            # Only a line's own top-level object counts: a seat quoting an event is text
+            # Only a line's own top-level object counts: a seat that quotes an event is text.
             info = event.get('rate_limit_info') if isinstance(event, dict) else None
             if isinstance(info, dict) and isinstance(info.get('unifiedWindows'), dict):
                 return claude_windows(info['unifiedWindows'], int(now - written), now)
@@ -132,19 +145,24 @@ def read_claude():
 
 
 def claude_windows(windows, age, now):
+    """The reading's windows. One that has reset since the reading is dropped: its number is no
+    longer true. five_hour and seven_day are the account's windows; any other key (fable's
+    seven_day_overage_included) limits one model, and is listed apart as a model limit."""
     names = {'seven_day': 'week', 'five_hour': '5h'}
-    reset, found, model_limits = [], [], []
-    for key, w in windows.items():
-        if not isinstance(w, dict):
+    reset = []
+    found = []
+    model_limits = []
+    for key, value in windows.items():
+        if not isinstance(value, dict):
             continue
         name = names.get(key, key[:40])
-        resets = w.get('resetsAt')
+        resets = value.get('resetsAt')
         if isinstance(resets, (int, float)) and resets <= now:
             reset.append(name)
             continue
-        used = w.get('utilization')
+        used = value.get('utilization')
         used = None if used is None else round(used * 100, 1)
-        resets = iso(resets) if isinstance(resets, (int, float)) else None
+        resets = iso_time(resets) if isinstance(resets, (int, float)) else None
         if key in names:
             found.append(window(name, used, resets))
         elif used is not None:
@@ -163,9 +181,9 @@ def claude_windows(windows, age, now):
 def read_codex():
     """One account/rateLimits/read to the codex CLI's own app-server, which keeps its own login.
 
-    stdin stays open until the answer (the app-server drops a read in flight at stdin EOF). The
-    CLI runs in its own process group, and one 20 s deadline, its exit included, kills the
-    group."""
+    stdin stays open until the answer: the app-server drops a read in flight when stdin ends.
+    The CLI runs in its own process group, and one 20 s deadline, its exit included, kills
+    the group."""
     try:
         cli = subprocess.Popen(['codex', '--no-daemon', 'app-server'], stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -175,11 +193,12 @@ def read_codex():
     deadline = threading.Timer(20, kill_group, (cli.pid,))
     deadline.daemon = True
     deadline.start()
+    hello = {'clientInfo': {'name': 'hands-quota', 'version': '1'}}
+    messages = ({'id': 1, 'method': 'initialize', 'params': hello},
+                {'method': 'initialized'},
+                {'id': 2, 'method': 'account/rateLimits/read'})
     try:
-        for message in ({'id': 1, 'method': 'initialize',
-                         'params': {'clientInfo': {'name': 'hands-quota', 'version': '1'}}},
-                        {'method': 'initialized'},
-                        {'id': 2, 'method': 'account/rateLimits/read'}):
+        for message in messages:
             cli.stdin.write((json.dumps(message) + '\n').encode())
         cli.stdin.flush()
     except OSError:
@@ -200,18 +219,23 @@ def read_codex():
     cli.wait()
     deadline.cancel()
     if 'result' not in answer and not answer.get('error'):
-        why = 'killed at the 20 s deadline' if cli.returncode == -9 else 'rc %s' % cli.returncode
+        if cli.returncode == -9:
+            why = 'killed at the 20 s deadline'
+        else:
+            why = 'rc %s' % cli.returncode
         raise Unknown('codex app-server gave no answer (%s)' % why)
-    reply = checked(answer.get('result', answer))
+    reply = raise_if_error(answer.get('result', answer))
     found = []
-    for key in ('primary', 'secondary'):   # these have swapped meanings: go by the length
-        w = (reply.get('rateLimits') or {}).get(key)
-        if isinstance(w, dict):
-            minutes, resets = w.get('windowDurationMins'), w.get('resetsAt')
-            name = span(minutes) if isinstance(minutes, int) else key
-            resets = iso(resets) if isinstance(resets, (int, float)) else None
-            found.append((minutes if isinstance(minutes, int) else 0,
-                          window(name, w.get('usedPercent'), resets)))
+    for key in ('primary', 'secondary'):   # their meanings have swapped: go by the length
+        value = (reply.get('rateLimits') or {}).get(key)
+        if not isinstance(value, dict):
+            continue
+        minutes = value.get('windowDurationMins')
+        resets = value.get('resetsAt')
+        name = window_label(minutes) if isinstance(minutes, int) else key
+        resets = iso_time(resets) if isinstance(resets, (int, float)) else None
+        length = minutes if isinstance(minutes, int) else 0
+        found.append((length, window(name, value.get('usedPercent'), resets)))
     return {'windows': [w for _, w in sorted(found, key=lambda f: -f[0]) if w]}
 
 
@@ -224,41 +248,51 @@ def kill_group(pid):
 
 def read_grok():
     path = os.path.expanduser('~/.grok/auth.json')
-    key = login(path, lambda auth: next(iter(auth.values()))['key'])
-    reply = parse(curl('https://cli-chat-proxy.grok.com/v1/billing?format=credits', key,
-                       'x-grok-client-mode: build'))
+    key = read_login(path, lambda auth: next(iter(auth.values()))['key'])
+    reply = parse_reply(fetch('https://cli-chat-proxy.grok.com/v1/billing?format=credits', key,
+                              'x-grok-client-mode: build'))
     config = reply.get('config') or {}
     used = config.get('creditUsagePercent')
-    # The gateway leaves out a zero value: a new billing period has no creditUsagePercent at all.
+    # The gateway leaves out a zero, so a new billing period has no creditUsagePercent at all.
     # That reads as 0 only while the period's end is there to show the reply is a real one.
     if used is None and config.get('billingPeriodEnd'):
         used = 0.0
-    return {'windows': [w for w in [window('week', used, config.get('billingPeriodEnd'))] if w]}
+    found = window('week', used, config.get('billingPeriodEnd'))
+    return {'windows': [found] if found else []}
 
 
 def read_opencode():
     data = os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
     path = os.path.join(data, 'opencode', 'auth.json')
-    key = login(path, lambda auth: auth['opencode-go']['key'])
-    usage = parse(curl('https://opencode.ai/zen/go/v1/usage', key)).get('usage') or {}
+    key = read_login(path, lambda auth: auth['opencode-go']['key'])
+    usage = parse_reply(fetch('https://opencode.ai/zen/go/v1/usage', key)).get('usage') or {}
     found = []
-    for key, name in (('monthly', 'month'), ('weekly', 'week'), ('rolling', 'rolling')):
-        w = usage.get(key)
-        if isinstance(w, dict):
-            found.append(window(name, w.get('percent'), w.get('resetsAt')))
+    for field, name in (('monthly', 'month'), ('weekly', 'week'), ('rolling', 'rolling')):
+        value = usage.get(field)
+        if isinstance(value, dict):
+            found.append(window(name, value.get('percent'), value.get('resetsAt')))
     return {'windows': [w for w in found if w]}
 
 
-READERS = {'claude': read_claude, 'codex': read_codex, 'grok': read_grok, 'opencode': read_opencode}
+READERS = {
+    'claude': read_claude,
+    'codex': read_codex,
+    'grok': read_grok,
+    'opencode': read_opencode,
+}
+
+
+# ---------------------------------------------------------------------------------------------
+# The board
 
 
 def mask(text):
-    """Hide anything that looks like a credential (sk-..., or any run of 40+ token characters)."""
+    """Hide anything that looks like a credential (sk-..., or a run of 40+ token characters)."""
     return re.sub(r'sk-[A-Za-z0-9_-]{8,}|[A-Za-z0-9_-]{40,}', '…', text)[:200]
 
 
 def read(pool):
-    """One pool's reading. Any failure, a crash on an odd reply included, makes only it unknown."""
+    """One pool's reading. Any failure, even a crash on an odd reply, makes only it unknown."""
     try:
         reading = READERS[pool]()
         if not reading['windows']:
@@ -271,12 +305,12 @@ def read(pool):
     return {'pool': pool, 'status': 'unknown', 'why': why, 'windows': []}
 
 
-def number(pct):
-    return '%g%%' % pct
+def percent(value):
+    return '%g%%' % value
 
 
-def until(resets_at):
-    """'resets in 3d' for an ISO time in the future, else ''."""
+def resets_in(resets_at):
+    """' (resets in 3d)' for an ISO time in the future, else ''."""
     try:
         when = datetime.datetime.fromisoformat(resets_at.replace('Z', '+00:00'))
         left = int(when.timestamp() - time.time())
@@ -294,23 +328,24 @@ def until(resets_at):
 def ago(seconds):
     if seconds < 120:
         return '%ds' % seconds
-    return '%dm' % (seconds // 60) if seconds < 7200 else '%dh' % (seconds // 3600)
+    if seconds < 7200:
+        return '%dm' % (seconds // 60)
+    return '%dh' % (seconds // 3600)
 
 
-def line(reading):
+def board_line(reading):
     """One board line: the pool, each window longest first, then how old the reading is."""
     if reading['status'] != 'ok':
         return '%-9s unknown: %s' % (reading['pool'], reading['why'])
-    parts = ['%s %s%s' % (w['name'], number(w['used_pct']), until(w['resets_at']))
+    parts = ['%s %s%s' % (w['name'], percent(w['used_pct']), resets_in(w['resets_at']))
              for w in reading['windows']]
-    parts += ['%s %s (one model)' % (m['name'], number(m['used_pct']))
+    parts += ['%s %s (one model)' % (m['name'], percent(m['used_pct']))
               for m in reading.get('model_limits', [])]
     text = '%-9s %s' % (reading['pool'], ', '.join(parts))
     if 'age_s' in reading:
         reset = reading.get('reset_since')
-        text += '; read %s ago%s; %s' % (ago(reading['age_s']),
-                                         ', before the %s reset' % '+'.join(reset) if reset else '',
-                                         REFRESH)
+        before = ', before the %s reset' % '+'.join(reset) if reset else ''
+        text += '; read %s ago%s; %s' % (ago(reading['age_s']), before, REFRESH)
     return text
 
 
@@ -324,10 +359,10 @@ def main(args):
             print('quota: unknown argument %s (ignored; see --help)' % arg, file=sys.stderr)
     readings = [read(pool) for pool in pools]
     if '--json' in args:
-        print(json.dumps({'read_at': iso(time.time()), 'pools': readings}, indent=1))
+        print(json.dumps({'read_at': iso_time(time.time()), 'pools': readings}, indent=1))
     else:
         for reading in readings:
-            print(line(reading))
+            print(board_line(reading))
     return 0
 
 
