@@ -10,20 +10,21 @@ provider is one entry in the provider table (`PROVIDERS` in `wires.py`), not a f
 
 ## Every change is tested
 
-Run all three suites before a commit. Each must print `0 failed` and exit 0:
+Run all four suites before a commit. Each must print `0 failed` and exit 0:
 
 ```bash
-bash tests/selftest.sh
-python3 tests/test_acp.py
-python3 tests/test_quota.py
+python3 tests/test_wires.py   # the clients and translators on their own (seconds)
+python3 tests/test_cli.py     # hands.py end to end (about a minute)
+python3 tests/test_seat.py    # the wrapper against stub CLIs (about four minutes)
+python3 tests/test_quota.py   # the quota board
 ```
 
-They are hermetic: stub CLIs stand in for the real ones, and nothing touches the network or
-spends quota. The hands suite takes a few minutes and needs `bash` and `jq`. A row that cannot
-run on this machine prints `skip`.
+They are hermetic: the stub CLIs in `tests/stubs` stand in for the real ones, and nothing
+touches the network or spends quota. To run one test, name it:
+`python3 tests/test_seat.py CodexSeats.test_one_app_server_serves_every_turn`.
 
-A new behavior lands with a selftest row, and the row must be able to fail: revert the fix alone,
-run the suite, and see that row go red. A row nobody has seen fail proves nothing.
+A new behavior lands with a test, and the test must be able to fail: revert the fix alone, run
+the test, and see it go red. A test nobody has seen fail proves nothing.
 
 Don't edit the checkout your live seats run from: a running wrapper starts new `seat.py`
 processes from the files on disk, so a half-made edit can break a live seat. Work in a separate
@@ -38,7 +39,7 @@ and session ids, emails, tokens, local timestamps, and anything else that is you
 
 ## Engine rules
 
-- **One seat contract.** `seat_box()` in `hands.sh` is the only copy of the text every seat
+- **One seat contract.** `SEAT_BOX` in `hands.py` is the only copy of the text every seat
   receives first. A seat's prompt is that box, a blank line, the task file, a blank line, and its
   job-dir line; the job dir's `prompt.txt` is exactly that input.
 - **The job dir is the only state.** No daemon, no registry, no cache file. A relaunch reads the
@@ -50,5 +51,4 @@ and session ids, emails, tokens, local timestamps, and anything else that is you
 
 ## Pull requests
 
-Describe what changed and why, name the selftest rows you added, and confirm all three suites
-pass. Report security issues privately (see `SECURITY.md`), not in a public issue.
+Describe what changed and why, name the tests you added, and confirm all four suites pass. Report security issues privately (see `SECURITY.md`), not in a public issue.

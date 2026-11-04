@@ -67,7 +67,7 @@ later. Older CLIs may not speak the same wire.
 
 ```bash
 git clone https://github.com/mothi/hands ~/src/hands
-bash ~/src/hands/tests/selftest.sh           # hermetic: stub CLIs, no network, no spend
+python3 ~/src/hands/tests/test_cli.py        # hermetic: stub CLIs, no network, no spend
 
 # optional: make it a skill your agent can call
 mkdir -p ~/.claude/skills ~/.agents/skills
@@ -75,8 +75,8 @@ ln -sfn ~/src/hands ~/.claude/skills/hands   # Claude Code
 ln -sfn ~/src/hands ~/.agents/skills/hands   # Codex
 ```
 
-The selftest takes a few minutes and prints `selftest: N passed, 0 failed`. Rows that need a
-macOS tool, or that would launch a real CLI found in `/usr/bin`, print `skip` instead.
+It takes about a minute and prints `test_cli: N passed, 0 failed`. A test that would launch a
+real CLI found in `/usr/bin` is skipped. CONTRIBUTING.md lists the other suites.
 
 ## Quickstart
 
@@ -207,7 +207,7 @@ later. A launch that failed before its first turn has no session (`send` is refu
 
 ## Mail and push
 
-Every buy's prompt starts with the **seat contract** (`seat_box()` in `hands.sh`): the same
+Every buy's prompt starts with the **seat contract** (`SEAT_BOX` in `hands.py`): the same
 text for every seat, telling it how to report and how to mail. The seat's own job-dir line comes
 last, after your task, so seats given one task share a prompt prefix.
 
@@ -305,23 +305,39 @@ seat), and the exact command is shown before it runs.
 | results gone after a month | the sweep deleted the idle dir; pass `--out` outside the jobs root for keepers |
 | Claude warns "workspace not trusted" in `stderr.log` | harmless; trust the dir once interactively to silence it |
 
-## Repository layout
+## How it works
+
+A seat is three processes: a wrapper, the provider's CLI, and a small reaper between them that
+ends the CLI's whole process group when the CLI goes. Starting one:
 
 ```
-hands/
-├── SKILL.md        the short guide agent hosts read
-├── hands.sh        the launcher: runs hands.py
-├── hands.py        the command line: flags, the job dir and its handle, the seat box, the probe
-├── seat.py         the engine: the wrapper, the verbs, the envelope writer
-├── wires.py        the provider table: each CLI's launch, handshake and translation, the JSON-RPC client
-├── quota.py        the quota board behind hands.sh quota
-└── tests/
-    ├── selftest.sh     the hermetic suite for hands.py and seat.py
-    ├── test_acp.py     the ACP suite
-    ├── test_quota.py   the quota suite
-    ├── test-stub.py    a stand-in for the claude and codex CLIs, used by the suites
-    └── fixtures/       recorded provider output the suites replay
+hands.sh start codex task.md
+└─ hands.py   makes the job dir, writes prompt.txt and the handle (DIR/session),
+   │          then runs `seat.py spawn`
+   └─ seat.py spawn ── forks ──► the wrapper (seat.py, detached; it holds DIR/job.log's lock)
+      │                          ├─ wires.launch(): the CLI under `seat.py reap`, and its handshake
+      │                          ├─ one select loop: in.fifo and inbox.jsonl in,
+      │                          │  the CLI's output out to events.jsonl
+      │                          └─ each turn's end: turn-N/result.txt, envelope.json, a push
+      └─ prints {"status":"spawned",...} once the wrapper has the first message
 ```
+
+`send` writes the next message into `DIR/in.fifo` for the live wrapper, or starts a new wrapper
+on the recorded session when the old one is gone. `stop` signals the wrapper, which closes its
+CLI the way a deadline does and writes the last envelopes.
+
+| File | What it holds |
+|---|---|
+| `hands.sh` | the launcher: runs `hands.py` |
+| `hands.py` | the command line and its flags, the job dir and its handle, the seat contract (`SEAT_BOX`), the verbs, the events view, the probe and the 30-day sweep |
+| `seat.py` | the wrapper: its loop, deliveries and the delivery lock, closing turns into envelopes, pushes to the driver, failure types, and the reaper |
+| `wires.py` | the provider table (`PROVIDERS`), each CLI's command and handshake, the JSON-RPC and ACP clients, and the translators that turn each CLI's output into events |
+| `quota.py` | the quota board behind `hands.sh quota` |
+| `SKILL.md` | the short guide agent hosts read |
+| `tests/` | `test_cli.py` (hands.py end to end), `test_seat.py` (the wrapper against stub CLIs), `test_wires.py` (the clients and translators on their own), `test_quota.py`, the `stubs/` and `harness.py` they share, and `fixtures/`, recorded provider output |
+
+To follow one seat through the code, read `main()`, `buy()` and `launch()` in `hands.py`, then
+`spawn()` and `Wrapper.run()` in `seat.py`, then `launch()` in `wires.py`.
 
 ## Design
 
