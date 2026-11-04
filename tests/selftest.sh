@@ -385,9 +385,9 @@ def steady(here, sh, *dirs):   # the view is a pure function of the events: the 
     import hands
     for d in dirs:
         a, b = [subprocess.run([sh, 'events', d], capture_output=True).stdout.decode() for _ in (1, 2)]
-        v = hands.View()
+        v = hands.EventView()
         lines = open(J(d, 'events.jsonl'), 'rb').read().decode().split('\n')[:-1]
-        if not (a and a == b == ''.join(v.feed(ln + '\n') for ln in lines) + v.close()):
+        if not (a and a == b == ''.join(v.feed(ln + '\n') for ln in lines) + v.flush()):
             return False
     return True
 def lateinput(out):   # opencode names a tool's input only in a later update: its call line, then ONE ↳ line with it
@@ -1293,14 +1293,14 @@ PY207
 sys.path.insert(0, sys.argv[1]); import hands
 p = sys.argv[2]; os.makedirs(os.path.join(p, "mnt")); old = time.time() - 31 * 86400
 for q in (os.path.join(p, "mnt"), p): os.utime(q, (old, old))
-cut = time.time() - hands.KEEP
-assert hands.stale(p, cut)
+cut = time.time() - hands.IDLE_LIMIT
+assert hands.is_stale(p, cut)
 real = os.lstat
 def lstat(q, *a, **k):
     r = real(q, *a, **k)
     return os.stat_result((r[0], r[1], r[2] + 1) + tuple(r[3:])) if q.endswith("/mnt") else r
 hands.os.lstat = lstat
-assert not hands.stale(p, cut)' "$HERE" "$SB/t201/20250101-000000-codex-9"
+assert not hands.is_stale(p, cut)' "$HERE" "$SB/t201/20250101-000000-codex-9"
   # 188: THE JOBS ROOT. A buy without --out makes its dir in $XDG_STATE_HOME/hands,
   # else HOME/.local/state/hands (unset, or relative: XDG ignores a relative value) -- never in $TMPDIR, which macOS
   # wipes at boot and prunes after 3 days -- named <date>-<time>-<provider>-<pid>, root and dir 0700 (XDG; prompts live
