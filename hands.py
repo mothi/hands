@@ -309,6 +309,8 @@ def run_verb(args):
         return wait(job_dir, handle, mode, timeout) if mode in ('turn', 'mail', 'exit') else 2
     if verb == 'events':
         return events(job_dir, '--follow' in args)
+    if verb != 'stop':
+        return 2
     rc = stop(job_dir)
     envelope = seat.read_json(os.path.join(job_dir, 'envelope.json'))
     if envelope:

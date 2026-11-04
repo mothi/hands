@@ -2,6 +2,8 @@
 """Tests for wires.py with no seat around it: the ACP and JSON-RPC clients against the stub
 agent (tests/stubs/grok) replaying recorded grok and opencode transcripts, and the translators,
 usage normalizer and command builders on their own. Run: python3 tests/test_wires.py"""
+import contextlib
+import io
 import itertools
 import json
 import os
@@ -270,6 +272,27 @@ class AcpClient(unittest.TestCase):
         client.request('ping', {}, answers.append)
         client.close(2)
         self.assertEqual(answers, [answer(1, result={'ok': 1})])
+
+    def test_a_step_past_its_end_returns_at_once(self):
+        client = wires.Rpc([sys.executable, '-c', 'import sys; sys.stdin.read()'], self.tmp.name)
+        self.addCleanup(client.close, 0.5)
+        client.step(-0.001)   # the clock passed the caller's end between its check and this call
+
+    def test_a_failing_callback_is_logged_and_the_wire_reads_on(self):
+        said = []
+
+        def on_message(message):
+            said.append(message)
+            if len(said) == 1:
+                raise RuntimeError('the first line fails')
+
+        client = wires.Cli([sys.executable, '-c', 'print("one"); print("two")'], self.tmp.name,
+                           on_message=on_message)
+        log = io.StringIO()
+        with contextlib.redirect_stderr(log):
+            client.close(2)
+        self.assertEqual(said, ['one', 'two'])
+        self.assertIn('RuntimeError: the first line fails', log.getvalue())
 
     def test_close_terms_the_process_group(self):
         rows = [('out', {'id': 1, 'method': 'initialize'}),

@@ -19,6 +19,7 @@ import select
 import signal
 import subprocess
 import time
+import traceback
 
 
 # ---------------------------------------------------------------------------------------------
@@ -248,6 +249,7 @@ class Cli:
 
     def step(self, timeout):
         """Wait up to `timeout` seconds for this CLI alone, then on_ready()."""
+        timeout = max(0, timeout)   # the clock may pass the caller's end before this call
         readable, writable = self.fds()
         if not readable and not writable:
             time.sleep(min(timeout, 0.05))
@@ -262,8 +264,8 @@ class Cli:
         self._log(line, 'in')
         try:
             self.on_line(line)
-        except Exception:   # a failing callback never stops the wire
-            pass
+        except Exception:   # a failing callback never stops the wire; its traceback is logged
+            traceback.print_exc()
 
     def on_line(self, line):
         message = parse_json(line)

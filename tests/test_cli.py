@@ -15,7 +15,7 @@ import time
 import unittest
 
 import harness
-from harness import envelope, events, read_json, read_text, result, wait_until
+from harness import envelope, events, read_text, wait_until
 
 import hands
 import seat

@@ -72,18 +72,19 @@ def open_regular(path, flags):
 
 
 def append_json(path, value):
-    """Append one JSON line in a single write, so concurrent writers never interleave."""
+    """Append one JSON line in a single write, so concurrent writers never interleave. Text
+    that is not valid UTF-8 (half an emoji a CLI cut) is written with '?' in its place."""
     fd = open_regular(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
     try:
-        os.write(fd, (json.dumps(value, ensure_ascii=False) + '\n').encode())
+        os.write(fd, (json.dumps(value, ensure_ascii=False) + '\n').encode('utf-8', 'replace'))
     finally:
         os.close(fd)
 
 
 def write_atomic(path, text):
-    """Replace a file's whole content at once, by rename."""
+    """Replace a file's whole content at once, by rename (as UTF-8, as append_json writes)."""
     temporary = '%s.tmp%d' % (path, os.getpid())
-    with open(temporary, 'w') as f:
+    with open(temporary, 'w', encoding='utf-8', errors='replace') as f:
         f.write(text)
     os.replace(temporary, path)
 
@@ -487,8 +488,7 @@ class Wrapper:
         self.fifo_reader = None
         self.fifo_writer = None             # held open, so in.fifo never reads end of file
         self.fifo_partial = b''             # the start of an in.fifo line not yet ended
-        self.incoming = []                  # delivered records, in order
-        self.waiting = []                   # records not yet handed to the CLI
+        self.waiting = []                   # delivered records not yet handed to the CLI
         self.next_acp_turn = 0
         self.turn_start_pending = False     # codex: a turn/start not answered yet
 
@@ -548,8 +548,6 @@ class Wrapper:
         self.open_fifo()
         while not self.stopping and cli.proc.poll() is None and time.time() < ends_at:
             self.tick()
-            self.waiting += self.incoming
-            self.incoming = []
             self.hand_on(cli)
             readable, writable = cli.fds()
             readable, writable, _ = select.select(readable + [self.fifo_reader], writable, [], 0.5)
@@ -565,6 +563,9 @@ class Wrapper:
                                                        'turnId': translator.turn_id}, 5)
             except wires.WireError:
                 pass
+        # A stop that came before the first message was delivered marks it now, so the close-out
+        # types its turn.
+        self.send_first_message(5)
         self.release_fifo()
         rc = self.closing_rc(exit_code(cli.close(2)))
         self.push_outbox()
@@ -637,14 +638,11 @@ class Wrapper:
             if not chunk:
                 return
             *lines, self.fifo_partial = (self.fifo_partial + chunk).split(b'\n')
-            self.incoming.extend(whole_records(self.job_dir, lines))
+            self.waiting.extend(whole_records(self.job_dir, lines))
 
     def release_fifo(self):
-        """The CLI is done: close in.fifo, so a send finds the seat gone.
-
-        If a stop came before the first message was delivered, it is marked now, so the
-        close-out types its turn. The writer closes under the lock, between deliveries."""
-        self.send_first_message(5)
+        """The CLI is done: close in.fifo, so a send finds the seat gone. The writer closes
+        under the lock, between deliveries."""
         os.close(self.fifo_reader)
         with delivery_lock(self.job_dir):
             os.close(self.fifo_writer)
@@ -667,7 +665,7 @@ class Wrapper:
     def queue_own(self, text, expect, turn, **mail):
         """The wrapper's own delivery (the first message, the inbox), under the lock."""
         mark_delivery(self.job_dir, text, expect, turn, **mail)
-        self.incoming.append(fifo_record(self.provider, text))
+        self.waiting.append(fifo_record(self.provider, text))
 
     def send_first_message(self, wait):
         """Deliver the first message once the lock is free, trying for `wait` s -> whether sent."""
@@ -706,8 +704,11 @@ class Wrapper:
             return
         with lock:
             self.inbox_size = file_size(inbox)
-            with open(inbox, 'rb') as f:
-                lines = f.read(self.inbox_size).split(b'\n')[:-1]
+            try:   # never through a link the seat planted
+                with os.fdopen(open_regular(inbox, os.O_RDONLY), 'rb') as f:
+                    lines = f.read(self.inbox_size).split(b'\n')[:-1]
+            except OSError:
+                return
             state = SeatState(self.job_dir).read()
             for number, line in enumerate(lines, 1):
                 mail = parse_json(line.decode('utf-8', 'replace'))
@@ -1041,8 +1042,8 @@ def send(job_dir, handle, message_file):
                                     'delivery': delivery}))
                     return 0
         time.sleep(0.2)
-    print('seat.py: %s has a live wrapper but no reader (a replay backoff?) -- send again shortly'
-          % job_dir, file=sys.stderr)
+    print('seat.py: %s has a live wrapper that is not reading (it is starting or closing) -- '
+          'send again shortly' % job_dir, file=sys.stderr)
     return 1
 
 

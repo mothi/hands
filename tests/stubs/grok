@@ -13,7 +13,7 @@ STUB_MODE:
   die         exit 1 after the last segment
   stubborn    ignore stdin EOF; start a child in this process group; on a TERM, exit 0
   escape      as die, but a detached child keeps stdout open, so the client never sees EOF
-  slow        each prompt answers 2 s late
+  slow        each prompt answers STUB_SLEEP seconds late (default 2)
   termcancel  on a TERM or stdin EOF, answer the open prompt 'cancelled', then exit (opencode 2.x)
   termerror   on a TERM, answer the open prompt with the error opencode 2.0.22 sends when its
               server died first, then exit 1
@@ -112,7 +112,7 @@ class Agent:
             if got.get('method') == 'session/prompt':
                 self.open_prompt = got['id']
                 if MODE == 'slow':
-                    time.sleep(2)
+                    time.sleep(float(stub.setting('SLEEP', 2)))
             self.play(rows)
         if MODE in ('die', 'escape'):
             return 1

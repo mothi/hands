@@ -17,8 +17,8 @@ import time
 import unittest
 
 import harness
-from harness import (GROK_SESSION, OPENCODE_SESSION, envelope, events, first_index, read_json,
-                     read_text, result, turn_ends, wait_until)
+from harness import (GROK_SESSION, OPENCODE_SESSION, envelope, events, first_index, read_text,
+                     result, turn_ends, wait_until)
 
 import seat
 import wires
@@ -456,6 +456,22 @@ class AcpClose(SeatChecks):
         SB.stop(job)
         self.assertIsNone(harness.handle(job)['timeout'])
         self.assertTrue(any('seat.py reap 0 ' in line for line in children), children)
+
+    def test_driver_mail_to_a_busy_seat_waits_behind_its_turn(self):
+        job, _ = SB.start('acp-mail', GROK, '--effort', 'low', '--cwd', SB.path('tmp'),
+                          STUB_MODE='slow', STUB_SLEEP='4')
+        SB.hands('mail', job, 'while you work')
+        self.assertTrue(file_exists(job, 'turn-2', 'envelope.json'))
+        SB.stop(job)
+        found = events(job)
+        marker = first_index(found, lambda e: e['kind'] == 'progress' and e.get('inbox') == 1)
+        end_1 = first_index(found, lambda e: e['kind'] == 'turn_end' and e['turn'] == 1)
+        self.assertTrue(-1 < marker < end_1)
+        self.assertEqual(found[marker]['expect'], 2)   # it queues: the next turn answers it
+        self.assertEqual(turn_ends(job), [(1, 'ok'), (2, 'ok')])
+        prompts = [p['prompt'][0]['text'] for m, p in agent(job).messages()
+                   if m == 'session/prompt']
+        self.assertEqual(prompts[1], 'MAIL from driver:\nwhile you work')
 
     def test_a_send_while_a_turn_runs_queues_behind_it(self):
         job, _ = SB.start('acp-queue', GROK, '--effort', 'low', '--cwd', SB.path('tmp'),
@@ -970,6 +986,29 @@ class ClaudeSeats(SeatChecks):
         self.assertIn('resets 6:20am', envelope(SB.path('claude-fail-quota'))['reset'])
         self.assertEqual(statuses['authfail'][0], 'auth-expired')
 
+    def test_a_deadline_mid_turn_is_a_timeout_that_keeps_its_session(self):
+        for mode in ('park', 'deaf'):   # deaf ignores the TERM too: only the KILL ends it
+            job, _ = SB.buy('claude-deadline-' + mode, CLAUDE, '--timeout', '3',
+                            '--cwd', SB.path('tmp'), STUB_MODE=mode)
+            end = envelope(job)
+            self.assertEqual((end['status'], end['rc'], end['session'], end['turn']),
+                             ('timeout', 142, 'sess-stub', 1), mode)
+            self.assertGone(job, agent(job).pid)
+
+    def test_half_an_emoji_in_an_answer_still_lands(self):
+        # a CLI that cuts a string mid-emoji escapes half of it, which no UTF-8 file can hold
+        replay = SB.write('half-emoji.jsonl',
+                          '{"type":"system","subtype":"init","session_id":"sess-stub"}\n'
+                          '{"type":"result","subtype":"success","is_error":false,'
+                          '"result":"cut \\ud83d here","session_id":"sess-stub"}\n')
+        job, _ = SB.start('claude-surrogate', CLAUDE, '--cwd', SB.path('tmp'), STUB_MODE='replay',
+                          STUB_REPLAY=replay)
+        waited = SB.wait(job, '--timeout', '10')
+        SB.stop(job)
+        self.assertEqual((waited.rc, envelope(job)['status']), (0, 'ok'))
+        self.assertEqual(result(job, 1), 'cut ? here')
+        self.assertEqual(turn_ends(job), [(1, 'ok')])
+
     def test_a_line_separator_inside_a_turn_end_is_no_line_break(self):
         task = SB.write('separator.md', 'echo a b\n')
         job, _ = SB.start('claude-separator', CLAUDE, '--cwd', SB.path('tmp'), task=task,
@@ -1361,7 +1400,8 @@ class Pushes(unittest.TestCase):
         job, _ = SB.start('push-links', CLAUDE, '--cwd', SB.path('tmp'), STUB_MODE='echo',
                           **self.driver_env())
         SB.wait(job, '--timeout', '10')
-        victim = SB.write('victim', 'keep')
+        planted = '{"t":"x","from":"driver","text":"THROUGH A LINK"}\n'
+        victim = SB.write('victim', planted)
         linked_outbox = SB.write('linked-outbox', '')
         outbox, inbox = os.path.join(job, 'outbox.jsonl'), os.path.join(job, 'inbox.jsonl')
         os.unlink(outbox)
@@ -1376,9 +1416,11 @@ class Pushes(unittest.TestCase):
             f.write('{"text":"after the link"}\n')
         self.assertTrue(self.wait_for_push(job, 'mail to driver'))
         mailed = SB.hands('mail', job, 'through a link')
+        time.sleep(1.5)   # one more pass of the wrapper's inbox check
         SB.stop(job)
         self.assertEqual(mailed.rc, 2)
-        self.assertEqual(read_text(victim), 'keep')
+        self.assertEqual(read_text(victim), planted)   # never written through the link
+        self.assertFalse([e for e in events(job) if e.get('inbox')])   # nor read through it
         bodies = ['\n'.join(p[2][4:]) for p in self.socket.pushes(job, 'mail to driver')]
         self.assertEqual(bodies, ['after the link'])   # the linked file's line never went out
 
