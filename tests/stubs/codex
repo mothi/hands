@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""A stub codex CLI: `codex app-server`, JSON-RPC on stdin and stdout, as codex-cli 0.160 speaks it.
+
+One thread, th_stub123 (a resume answers the thread it names). A turn/start opens a turn, or,
+while one is open, steers its input into it. turn/interrupt ends the open turn. At stdin EOF it
+kills the commands it started and exits 0. Each turn reports two model calls (`last`) that sum to
+in 10, cached 4, out 3, reasoning 1, under a thread total that keeps growing.
+
+STUB_MODE picks how each turn goes:
+  ok           (the default) answers 'stub ok'
+  slow         answers after STUB_SLEEP seconds (default 2): 'turn N pid P: <inputs>'
+  stale        as slow, but a send that arrives late opens the next turn, and a command turn 1
+               left running completes inside it
+  park         runs a command in a session of its own that never finishes
+  parkexit     as park, and a TERM makes it exit 0 (as codex 0.160 did)
+  files        two file changes and a failed command, then a final answer
+  nofinal      an answer, then a command after it
+  subagent     a collaborator works on its own thread before the main answer
+  latesub      ...after the main answer
+  nomain       ...and the main turn/completed never comes
+  badline      a malformed stdout line mid-turn
+  quota        a retry notice, then the turn fails with the usage-limit error (STUB_FAIL_TEXT)
+  notice       a retry notice, then an ok answer
+  noticedeath  one model call's usage, an error notice, then the process dies
+  quoted       an ok answer quoting STUB_FAIL_TEXT
+  quotedfail   that answer, and the turn fails with another error
+  unauthorized the turn fails with codexErrorInfo unauthorized
+  refuse       every turn/start is answered with an error (STUB_FAIL_TEXT)
+  badresume    thread/resume is answered with an error
+STUB_REPLAY plays a recorded app-server wire instead: launch N plays the Nth process recorded in
+it, one recorded turn per opening turn/start. STUB_ASK_DELAY holds each turn/start's answer that
+many seconds, and logs 'overlap' when another request was already waiting by then.
+"""
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+
+import stub
+
+MODE = stub.setting('MODE', 'ok')
+FAIL_TEXT = stub.setting('FAIL_TEXT', 'stream error')
+TWO_CALLS = (
+    {'inputTokens': 6, 'cachedInputTokens': 2, 'outputTokens': 2, 'reasoningOutputTokens': 1,
+     'totalTokens': 8},
+    {'inputTokens': 4, 'cachedInputTokens': 2, 'outputTokens': 1, 'reasoningOutputTokens': 0,
+     'totalTokens': 5},
+)
+
+
+def recorded_process(path, number):
+    """Process `number` of a recorded wire -> (its thread, [the notifications of each turn]).
+
+    A turn starts at a turn/start whose answer names a turn not seen before and runs to the next
+    one. The recording's other client lines and every answer are dropped: the stub answers
+    itself."""
+    with open(path) as f:
+        rows = [json.loads(line) for line in f]
+    processes = []
+    for row in rows:
+        if row['dir'] == 'out' and row['msg'].get('method') == 'initialize':
+            processes.append([])
+        processes[-1].append(row)
+    rows = processes[min(number, len(processes)) - 1]
+    methods = {r['msg'].get('id'): r['msg'].get('method') for r in rows if r['dir'] == 'out'}
+    thread = next(r['msg']['result']['thread']['id'] for r in rows
+                  if r['dir'] == 'in' and 'thread' in (r['msg'].get('result') or {}))
+    seen = set()
+    opening = set()
+    for row in rows:
+        if row['dir'] != 'in':
+            continue
+        turn = ((row['msg'].get('result') or {}).get('turn') or {}).get('id')
+        if turn and methods.get(row['msg'].get('id')) == 'turn/start' and turn not in seen:
+            seen.add(turn)
+            opening.add(row['msg']['id'])
+    turns = []
+    for row in rows:
+        message = row['msg']
+        if (row['dir'] == 'out' and message.get('id') in opening
+                and message.get('method') == 'turn/start'):
+            turns.append([])
+        elif row['dir'] == 'in' and 'method' in message and 'id' not in message and turns:
+            turns[-1].append(message)
+    return thread, turns
+
+
+def message(text, item_id='msg_9'):
+    return {'type': 'agentMessage', 'id': item_id, 'text': text, 'phase': 'final_answer'}
+
+
+def command(item_id='exec-5', exit_code=0):
+    return {'type': 'commandExecution', 'id': item_id, 'command': 'ls',
+            'status': 'completed' if exit_code == 0 else 'failed', 'exitCode': exit_code,
+            'aggregatedOutput': '' if exit_code == 0 else 'ls: x: No such file'}
+
+
+def file_change(item_id, *paths):
+    changes = [{'path': p, 'kind': {'type': 'add'}, 'diff': '+x'} for p in paths]
+    return {'type': 'fileChange', 'id': item_id, 'status': 'completed', 'changes': changes}
+
+
+class Server:
+    def __init__(self):
+        self.thread = 'th_stub123'
+        self.recorded_turns = None
+        if stub.setting('REPLAY'):
+            self.thread, self.recorded_turns = recorded_process(stub.setting('REPLAY'),
+                                                                stub.launch_number())
+        self.turn = None          # the open turn: {'id', 'inputs', 'due'}
+        self.last_turn = None
+        self.count = 0
+        self.children = []
+        self.total = {}
+        self.more_waiting = False
+
+    def notify(self, method, **params):
+        stub.write_line({'method': method, 'params': params})
+
+    def answer(self, request_id, result):
+        stub.write_line({'id': request_id, 'result': result})
+
+    def error(self, request_id, code, text):
+        stub.write_line({'id': request_id, 'error': {'code': code, 'message': text}})
+
+    def item(self, item, done=True):
+        method = 'item/completed' if done else 'item/started'
+        self.notify(method, threadId=self.thread, turnId=self.turn['id'], item=item)
+
+    def end_turn(self, status='completed', error=None):
+        turn = {'id': self.turn['id'], 'items': [], 'status': status, 'error': error}
+        self.notify('turn/completed', threadId=self.thread, turn=turn)
+        self.last_turn = self.turn['id']
+        self.turn = None
+
+    def report(self, last):
+        """One model call's usage, under the growing thread total."""
+        self.total = {k: self.total.get(k, 0) + v for k, v in last.items()}
+        usage = {'total': self.total, 'last': last}
+        self.notify('thread/tokenUsage/updated', threadId=self.thread, turnId=self.turn['id'],
+                    tokenUsage=usage)
+
+    def collaborator(self, answer_first):
+        """A collaborator codex spawned: its own thread starts a turn, thinks, runs a command,
+        answers, reports usage and completes over this connection while the main turn waits."""
+        sub = 'th_sub7'
+        sub_turn = 'turn-sub-%d' % self.count
+
+        def call(status):
+            return {'type': 'collabAgentToolCall', 'id': 'collab-%d' % self.count, 'tool': 'wait',
+                    'status': status, 'senderThreadId': self.thread, 'receiverThreadIds': [sub]}
+
+        def on_sub(method, **params):
+            self.notify(method, threadId=sub, **params)
+
+        self.notify('thread/started', thread={'id': sub, 'agentNickname': 'challenger'})
+        self.item(call('inProgress'), False)
+        if answer_first:
+            self.item(message('FINAL: the main answer'))
+        on_sub('turn/started', turn={'id': sub_turn, 'status': 'inProgress', 'items': []})
+        reasoning = {'type': 'reasoning', 'id': 'rs-sub', 'summary': ['SUB: weighing it'],
+                     'content': []}
+        on_sub('item/completed', turnId=sub_turn, item=reasoning)
+        on_sub('item/completed', turnId=sub_turn, item=command('exec-sub'))
+        analysis = dict(message('SUB: the analysis', 'msg-sub'), phase='analysis')
+        on_sub('item/completed', turnId=sub_turn, item=analysis)
+        usage = {'total': {'inputTokens': 500}, 'last': {'inputTokens': 500, 'outputTokens': 50}}
+        on_sub('thread/tokenUsage/updated', turnId=sub_turn, tokenUsage=usage)
+        on_sub('turn/completed', turn={'id': sub_turn, 'items': [], 'status': 'completed',
+                                       'error': None})
+        self.item(call('completed'))
+        if not answer_first:
+            self.item(message('FINAL: the main answer'))
+
+    def complete(self):
+        """The open turn's work and answer, by mode, then its usage and its end."""
+        said = ' | '.join(self.turn['inputs'])
+        calls = list(TWO_CALLS)
+        if MODE in ('subagent', 'latesub', 'nomain'):   # the call that spawned it reports first
+            self.report(calls.pop(0))
+            self.collaborator(MODE == 'latesub')
+        if MODE == 'badline':
+            stub.write_line('{"method": "item/completed", "params": {"threadId"')
+        if MODE == 'noticedeath':
+            self.report(calls[0])
+            self.notify('error', threadId=self.thread, turnId=self.turn['id'], willRetry=False,
+                        error={'message': FAIL_TEXT})
+            sys.exit(1)
+        if MODE == 'stale':   # a command still running when the turn completes
+            late = dict(command('exec-late-%d' % self.count), status='inProgress', exitCode=None)
+            self.item(late, False)
+        if MODE in ('notice', 'quota'):
+            self.notify('error', threadId=self.thread, turnId=self.turn['id'], willRetry=True,
+                        error={'message': 'Reconnecting... 1/5'})
+        quoted = [message('The log I read says: ' + FAIL_TEXT)]
+        items = {
+            'quota': [],
+            'quoted': quoted,
+            'quotedfail': quoted,
+            'nofinal': [message('{"status":"ok","summary":"voided"}', 'msg_1'), command()],
+            'files': [file_change('fc-7', '/w/file-1.txt'), command('exec-8', 2),
+                      file_change('fc-11', '/w/file-2.txt', '/w/file-1.txt'),
+                      message('FINAL-3: the audit')],
+            'slow': [message('turn %d pid %d: %s' % (self.count, os.getpid(), said))],
+            'stale': [message('turn %d: %s' % (self.count, said))],
+            'subagent': [],
+            'latesub': [],
+            'nomain': [],
+            'unauthorized': [],
+        }.get(MODE, [message('stub ok')])
+        for item in items:
+            if item['type'] != 'agentMessage':
+                self.item(dict(item, status='inProgress', exitCode=None), False)
+            self.item(item)
+        for last in calls:
+            self.report(last)
+        if MODE == 'quota':
+            self.end_turn('failed', {'message': FAIL_TEXT, 'codexErrorInfo': 'usageLimitExceeded'})
+        elif MODE == 'quotedfail':
+            info = {'responseStreamDisconnected': {'httpStatusCode': None}}
+            self.end_turn('failed', {'message': 'stream disconnected', 'codexErrorInfo': info})
+        elif MODE == 'unauthorized':   # only the typed field names it
+            self.end_turn('failed', {'message': 'request failed', 'codexErrorInfo': 'unauthorized'})
+        elif MODE != 'nomain':
+            self.end_turn()
+
+    def start_turn(self, request_id, text, params):
+        was_open = self.turn is not None
+        if was_open:   # stale: the open turn ends before this input reaches it
+            self.complete()
+        self.count += 1
+        recorded = None
+        if self.recorded_turns:
+            recorded = self.recorded_turns[min(self.count, len(self.recorded_turns)) - 1]
+        if recorded:
+            turn_id = next(n['params']['turn']['id'] for n in recorded
+                           if n['method'] == 'turn/started')
+        else:
+            turn_id = 'turn-%d' % self.count
+        due = None
+        if MODE in ('slow', 'stale'):
+            due = time.time() + float(stub.setting('SLEEP', 2))
+        self.turn = {'id': turn_id, 'inputs': [text], 'due': due}
+        self.answer(request_id, {'turn': {'id': turn_id, 'status': 'inProgress'}})
+        if recorded:
+            for notification in recorded:
+                stub.write_line(notification)
+            self.turn = None
+            return
+        self.notify('turn/started', threadId=self.thread,
+                    turn={'id': turn_id, 'status': 'inProgress', 'items': []})
+        self.item({'type': 'userMessage', 'id': 'um-%d' % self.count,
+                   'content': params.get('input')})
+        if MODE == 'stale' and was_open:
+            # the last turn's command completes inside this one, and its model call reports
+            late = command('exec-late-%d' % (self.count - 1))
+            self.notify('item/completed', threadId=self.thread, turnId=self.last_turn, item=late)
+            usage = {'total': self.total, 'last': {'inputTokens': 900, 'outputTokens': 90}}
+            self.notify('thread/tokenUsage/updated', threadId=self.thread,
+                        turnId=self.last_turn, tokenUsage=usage)
+        if MODE in ('park', 'parkexit'):
+            child = subprocess.Popen(['sleep', '60'], start_new_session=True)
+            self.children.append(child)
+            self.item({'type': 'commandExecution', 'id': 'exec-1', 'command': 'sleep 60',
+                       'status': 'inProgress', 'processId': str(child.pid)}, False)
+            self.report({'inputTokens': 1000, 'cachedInputTokens': 800, 'outputTokens': 100,
+                         'reasoningOutputTokens': 40})
+            stub.log('child', child=child.pid)
+            stub.log('parked')
+        elif due is None:
+            self.complete()
+
+    def handle(self, request):
+        method = request.get('method')
+        request_id = request.get('id')
+        params = request.get('params') or {}
+        if method == 'turn/start' and stub.setting('ASK_DELAY'):
+            time.sleep(float(stub.setting('ASK_DELAY')))
+            if select.select([0], [], [], 0)[0] or self.more_waiting:
+                stub.log('overlap', id=request_id)
+        text = ' '.join(x.get('text', '') for x in params.get('input') or []
+                        if isinstance(x, dict))
+        if method == 'initialize':
+            self.answer(request_id, {'userAgent': 'stub/0.160.0', 'platformOs': 'macos'})
+        elif method == 'thread/start':
+            self.answer(request_id, {'thread': {'id': self.thread,
+                                                'ephemeral': params.get('ephemeral')},
+                                     'model': params.get('model'),
+                                     'sandbox': params.get('sandbox')})
+            self.notify('thread/started', thread={'id': self.thread})
+        elif method == 'thread/resume' and MODE == 'badresume':
+            self.error(request_id, -32600,
+                       'no rollout found for thread id %s' % params.get('threadId'))
+        elif method == 'thread/resume':
+            self.thread = params.get('threadId')
+            self.answer(request_id, {'thread': {'id': self.thread}, 'model': params.get('model')})
+        elif method == 'turn/start' and MODE == 'refuse':
+            self.error(request_id, -32602, FAIL_TEXT)
+        elif method == 'turn/start' and self.turn and MODE != 'stale':
+            self.turn['inputs'].append(text)
+            self.item({'type': 'userMessage', 'id': 'um-s%d' % len(self.turn['inputs']),
+                       'content': params.get('input')})
+            self.answer(request_id, {'turn': {'id': self.turn['id'], 'status': 'inProgress'}})
+        elif method == 'turn/start':
+            self.start_turn(request_id, text, params)
+        elif method == 'turn/interrupt' and self.turn and params.get('turnId') == self.turn['id']:
+            self.answer(request_id, {})
+            self.end_turn('interrupted')   # its command runs on
+        elif method == 'turn/interrupt':
+            self.error(request_id, -32600, 'no active turn to interrupt')
+        elif request_id is not None:
+            self.error(request_id, -32601, 'stub: no method %s' % method)
+
+    def run(self):
+        if MODE == 'parkexit':
+            signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+        buffered = b''
+        while True:
+            due = self.turn['due'] if self.turn else None
+            wait = None if due is None else max(0, due - time.time())
+            if not select.select([0], [], [], wait)[0]:
+                self.complete()
+                continue
+            chunk = os.read(0, 65536)
+            if not chunk:
+                stub.log('eof')
+                for child in self.children:
+                    child.kill()
+                sys.exit(0)
+            *lines, buffered = (buffered + chunk).split(b'\n')
+            for k, line in enumerate(lines):
+                stub.log('in', line=line.decode())
+                self.more_waiting = any(x.strip() for x in lines[k + 1:]) or bool(buffered.strip())
+                if line.strip():
+                    self.handle(json.loads(line))
+
+
+stub.log_launch()
+Server().run()

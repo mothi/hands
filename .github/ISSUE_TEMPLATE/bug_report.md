@@ -16,8 +16,8 @@ The JSON line `wait` or the buy printed. Remove anything private first.
 
 **Versions**
 - macOS (or Linux) version:
-- `bash --version | head -1`, `python3 --version`:
+- `python3 --version`:
 - the provider CLI's `--version` (claude, codex, grok or opencode):
-- does `bash ./hands.sh --selftest` pass? (paste its last line)
+- does `python3 tests/test_cli.py` pass? (paste its last line)
 
 Security issues: don't file them here — see SECURITY.md.

@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""A stub ACP agent, run as grok or (through the opencode link) as opencode.
+
+It replays a recorded ACP transcript, request by request: the transcript is split at each client
+line ("out"), and the client's Nth line (which must be the same method, else exit 3) plays
+segment N. Answer ids are mapped to the live client's. A {"dir": "sleep", "msg": S} row pauses
+the replay S seconds. The transcript is STUB_REPLAY, or by default this CLI's recorded 4-turn
+seat (fixtures/<cli>-acp-seat-sample.jsonl) without the client's cancel, so its turn 3 ends
+cancelled by itself.
+
+STUB_MODE:
+  eof         (the default) exit 0 when stdin closes
+  die         exit 1 after the last segment
+  stubborn    ignore stdin EOF; start a child in this process group; on a TERM, exit 0
+  escape      as die, but a detached child keeps stdout open, so the client never sees EOF
+  slow        each prompt answers STUB_SLEEP seconds late (default 2)
+  termcancel  on a TERM or stdin EOF, answer the open prompt 'cancelled', then exit (opencode 2.x)
+  termerror   on a TERM, answer the open prompt with the error opencode 2.0.22 sends when its
+              server died first, then exit 1
+`opencode session ...` (the wrapper deleting an abandoned turn's session) logs its launch after a
+second, as a real delete takes a moment, and exits 0.
+"""
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+import stub
+
+MODE = stub.setting('MODE', 'eof')
+
+
+def default_transcript():
+    path = os.path.join(stub.FIXTURES, '%s-acp-seat-sample.jsonl' % stub.NAME)
+    with open(path) as f:
+        rows = [json.loads(line) for line in f]
+    return [r for r in rows if not (r['dir'] == 'out' and isinstance(r['msg'], dict)
+                                    and r['msg'].get('method') == 'session/cancel')]
+
+
+def load_transcript():
+    path = stub.setting('REPLAY')
+    if not path:
+        return default_transcript()
+    with open(path) as f:
+        return [json.loads(line) for line in f]
+
+
+class Agent:
+    def __init__(self, rows):
+        self.segments = [[None, []]]   # [the client line that opens it, the rows it plays]
+        for row in rows:
+            if row['dir'] == 'out':
+                self.segments.append([row['msg'], []])
+            else:
+                self.segments[-1][1].append(row)
+        self.ids = {}                  # recorded answer id -> the live client's
+        self.open_prompt = None
+
+    def answer_open_prompt(self, **reply):
+        stub.write_line(dict({'jsonrpc': '2.0', 'id': self.open_prompt}, **reply))
+
+    def on_term(self, *_):
+        stub.log('term')
+        if MODE == 'termerror':
+            error = {'code': -32603, 'message': 'Internal error: OpenCode server is unavailable',
+                     'data': {'errorName': 'ServerUnavailable'}}
+            self.answer_open_prompt(error=error)
+            os._exit(1)
+        if MODE == 'termcancel':
+            self.answer_open_prompt(result={'stopReason': 'cancelled'})
+            os._exit(0)
+        if MODE == 'stubborn':
+            os._exit(0)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    def play(self, rows):
+        for row in rows:
+            message = row['msg']
+            if row['dir'] == 'sleep':
+                time.sleep(message)
+                continue
+            is_answer = isinstance(message, dict) and 'method' not in message
+            if is_answer and message.get('id') in self.ids:
+                message = dict(message, id=self.ids[message['id']])
+            stub.write_line(message)
+
+    def run(self):
+        signal.signal(signal.SIGTERM, self.on_term)
+        if MODE == 'stubborn':
+            stub.log('child', child=subprocess.Popen(['sleep', '60']).pid)
+        if MODE == 'escape':
+            child = subprocess.Popen(['sleep', '60'], start_new_session=True)
+            stub.log('child', child=child.pid)
+        self.play(self.segments[0][1])
+        for wanted, rows in self.segments[1:]:
+            line = sys.stdin.readline()
+            if not line:
+                stub.log('eof')
+                if MODE == 'termcancel':
+                    self.answer_open_prompt(result={'stopReason': 'cancelled'})
+                return 0
+            stub.log('in', line=line.rstrip('\n'))
+            got = json.loads(line)
+            if got.get('method') != wanted.get('method'):
+                return 3
+            if 'method' in wanted and 'id' in wanted:
+                self.ids[wanted['id']] = got['id']
+            if got.get('method') == 'session/prompt':
+                self.open_prompt = got['id']
+                if MODE == 'slow':
+                    time.sleep(float(stub.setting('SLEEP', 2)))
+            self.play(rows)
+        if MODE in ('die', 'escape'):
+            return 1
+        for line in iter(sys.stdin.readline, ''):   # past the transcript: refuse every request
+            stub.log('in', line=line.rstrip('\n'))
+            request = json.loads(line)
+            if 'id' in request and 'method' in request:
+                stub.write_line({'jsonrpc': '2.0', 'id': request['id'],
+                                 'error': {'code': -32603, 'message': 'stub: past the transcript'}})
+        stub.log('eof')
+        while MODE == 'stubborn':
+            time.sleep(1)
+        return 0
+
+
+if sys.argv[1:2] == ['session']:
+    time.sleep(1)
+    stub.log_launch()
+    sys.exit(0)
+stub.log_launch()
+sys.exit(Agent(load_transcript()).run())
