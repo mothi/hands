@@ -382,10 +382,10 @@ def grokview(out):   # the grok 228-line recorded stream (fixtures/grok-events-s
 def steady(here, sh, *dirs):   # the view is a pure function of the events: the same bytes twice, and fed one line at a time
     import subprocess
     sys.path.insert(0, here)
-    import seat
+    import hands
     for d in dirs:
         a, b = [subprocess.run([sh, 'events', d], capture_output=True).stdout.decode() for _ in (1, 2)]
-        v = seat.View()
+        v = hands.View()
         lines = open(J(d, 'events.jsonl'), 'rb').read().decode().split('\n')[:-1]
         if not (a and a == b == ''.join(v.feed(ln + '\n') for ln in lines) + v.close()):
             return False
@@ -1277,17 +1277,17 @@ PY207
   mkdir -p "$SB/t201"
   t 201 "THE SWEEP STOPS AT A MOUNT: a dir stale in every other way is kept when something under it is on another device" \
     python3 -c 'import os, sys, time
-sys.path.insert(0, sys.argv[1]); import seat
+sys.path.insert(0, sys.argv[1]); import hands
 p = sys.argv[2]; os.makedirs(os.path.join(p, "mnt")); old = time.time() - 31 * 86400
 for q in (os.path.join(p, "mnt"), p): os.utime(q, (old, old))
-cut = time.time() - seat.KEEP
-assert seat.stale(p, cut)
+cut = time.time() - hands.KEEP
+assert hands.stale(p, cut)
 real = os.lstat
 def lstat(q, *a, **k):
     r = real(q, *a, **k)
     return os.stat_result((r[0], r[1], r[2] + 1) + tuple(r[3:])) if q.endswith("/mnt") else r
-seat.os.lstat = lstat
-assert not seat.stale(p, cut)' "$HERE" "$SB/t201/20250101-000000-codex-9"
+hands.os.lstat = lstat
+assert not hands.stale(p, cut)' "$HERE" "$SB/t201/20250101-000000-codex-9"
   # 188: THE JOBS ROOT. A buy without --out makes its dir in $XDG_STATE_HOME/hands,
   # else HOME/.local/state/hands (unset, or relative: XDG ignores a relative value) -- never in $TMPDIR, which macOS
   # wipes at boot and prunes after 3 days -- named <date>-<time>-<provider>-<pid>, root and dir 0700 (XDG; prompts live
@@ -1375,7 +1375,7 @@ PY
   XDG_STATE_HOME="$SB/st191" stub_run --cwd "$SB/tmp" codex:gpt-5.6-terra "$SB/q.md" >/dev/null 2>&1
   D191="$(ls -d "$SB"/st191/hands/*-codex-* 2>/dev/null | head -1)"; python3 "$SB/age.py" 31 "$D191"
   XDG_STATE_HOME="$SB/st191" python3 "$HERE/seat.py" send "$D191" "$SB/q81.md" >/dev/null 2>&1; R191=$?
-  XDG_STATE_HOME="$SB/st191" python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import seat; seat.sweep()' "$HERE"
+  XDG_STATE_HOME="$SB/st191" python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import hands; hands.sweep()' "$HERE"
   XDG_STATE_HOME="$SB/st191" stub_run send "$D191" "$SB/q81.md" >/dev/null 2>&1
   stub_run wait "$D191" --timeout 30 >/dev/null 2>&1; stub_run stop "$D191" >/dev/null 2>&1
   t 191 "A RESUME IS USE: a send to a stopped seat whose files are all 31 days old touches it (rc 3: no live seat), a sweep right after keeps it, and the relaunch answers turn 2 ok" \
@@ -1390,7 +1390,7 @@ PY
   cat >"$SB/sw192.py" <<'PY'
 import errno, fcntl, io, os, shutil, sys, time
 sys.path.insert(0, sys.argv[1])
-import seat
+import hands, seat
 R, old, got = seat.JOBS, time.time() - 31 * 86400, {}
 def mk(n, log=True, sub=None):
     p = os.path.join(R, n)
@@ -1424,8 +1424,8 @@ def rmtree(path, *x, **k):   # (b): a relaunch opens b's job.log by b's own path
         except OSError as e:
             got['b'] = e.errno
     return real_rmtree(path, *x, **k)
-seat.fcntl.flock, seat.shutil.rmtree = flock, rmtree
-seat.sweep()
+hands.fcntl.flock, hands.shutil.rmtree = flock, rmtree
+hands.sweep()
 cdot = os.path.join(R, '.20250101-000000-codex-3')
 hidden = os.path.isdir(cdot) and not os.path.lexists(c)
 for q in (os.path.join(c, 'ro'), os.path.join(cdot, 'ro')):
@@ -1436,7 +1436,7 @@ if os.path.isdir(cdot):   # 31 days on, the next sweep finishes it in place
         for n in ds + fs:
             os.utime(os.path.join(top, n), (old, old))
     os.utime(cdot, (old, old))
-seat.sweep()
+hands.sweep()
 checks = {'a kept': os.path.isdir(a), 'b no dir': got.get('b') == errno.ENOENT and not os.path.lexists(b),
           'c finished later': hidden and not os.path.lexists(cdot),
           'd gone': not os.path.lexists(d)}

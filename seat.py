@@ -1,29 +1,26 @@
 #!/usr/bin/env python3
 """seat.py -- hands' engine: a seat is a job dir with a live CLI process in it. python3 stdlib only.
 
-hands.py keeps the grammar and the SEAT BOX; seat.py runs everything after launch. wires.py launches each provider's
+hands.py keeps the commands and the SEAT BOX; seat.py runs everything after launch. wires.py launches each provider's
 CLI and translates its stream into DIR/events.jsonl; everything downstream of the events is one rule (Seat.finish).
+Its own command line is internal (hands.py calls it):
   spawn DIR MSG   detach the wrapper: it delivers MSG as the next turn and runs the seat until the CLI exits
   send DIR FILE   the next turn to the LIVE seat (rc 3: none is live -- hands.py relaunches it)
-  mail DIR TEXT   append a driver line to DIR/inbox.jsonl
-  wait DIR [--for turn|mail|exit] [--timeout S]  |  events DIR [--follow]  |  stop DIR
   reap SECS ARGV  run ARGV in its own process group, limited to SECS seconds (0: no limit); every seat CLI runs under it
 Job dir: session (the handle) prompt.txt in.fifo stream.jsonl stderr.log events.jsonl inbox.jsonl outbox.jsonl
 turn-N/{result.txt,envelope.json} envelope.json result.txt driver job.log
 """
-import errno, fcntl, json, os, re, select, shutil, signal, socket, stat, subprocess, sys, time
+import errno, fcntl, json, os, re, select, signal, socket, stat, subprocess, sys, time
 import wires
 from wires import clip, event, jparse, now, rec   # the vocabulary every wire shares: one copy, in wires.py
 
 HERE, J = os.path.dirname(os.path.abspath(__file__)), os.path.join
 # THE JOBS ROOT, its one copy: every job dir hands.py names itself (a buy without --out, a probe) lives in
 # $XDG_STATE_HOME/hands (an absolute one; XDG ignores a relative value), else ~/.local/state/hands -- state that
-# outlives a reboot, where macOS's $TMPDIR is wiped at boot and pruned after 3 days. hands.py makes its dirs there,
-# quota.py reads the claude streams there. KEEP: how long a dir there with no live wrapper outlives its last write
+# outlives a reboot, where macOS's $TMPDIR is wiped at boot and pruned after 3 days. hands.py makes its dirs there
+# (and sweeps them), quota.py reads the claude streams there
 XDG = os.environ.get('XDG_STATE_HOME', '')
 JOBS = J(XDG if os.path.isabs(XDG) else J(os.path.expanduser('~'), '.local', 'state'), 'hands')
-KEEP = 30 * 86400
-NAMED = re.compile(r'\d{8}-\d{6}-[a-z]+-\d+|probe-\d+-[a-z]+')   # the names hands.py gives there (buy, probe)
 NOTE = ('turn-N/result.txt + envelope.json land at each turn_end (absent = not finished, never finished-empty); '
         'liveness = the age of the last events.jsonl line, or an open tool_call; next: hands.sh '
         'wait|send|mail|events|stop <dir> -- stop a seat with hands.sh stop, never by killing the wrapper')
@@ -144,64 +141,6 @@ def procs():
 def wrappers(d, rows=None):
     key = ' spawn %s ' % d
     return [r for r in (rows or procs()) if 'seat.py' in r[3] and key in r[3] + ' ' and r[0] != os.getpid()]
-
-
-def sweep():   # THE RETENTION, at every buy (hands.py, which then makes its dir in JOBS): a dir
-    # directly in JOBS that hands.py named (an --out dir outside JOBS is never swept), with nothing in it written
-    # within KEEP and no repository in it, goes (a link there never, nor its target: job.log is never made) --
-    # under its job.log lock, the lock a wrapper holds for its whole life (no job.log: no wrapper ever ran there, a buy
-    # refused before its launch, with no session to resume). Under the lock it is judged again (a resume touches its dir
-    # before it relaunches: send) and renamed out of every address, to .<name>, before the delete, so a relaunch racing
-    # it finds no dir. A .<name> dir is a delete begun and not finished (killed, or stopped part way): it has no address
-    # and was judged under its lock, so the next sweep that finds it stale finishes it in place
-    cut = time.time() - KEEP
-    try:
-        names = os.listdir(JOBS)
-    except OSError:
-        names = []
-    for n in names:
-        p = J(JOBS, n)
-        m = n[1:] if n[:1] == '.' else n   # .<name>: a delete begun and not finished
-        if not NAMED.fullmatch(m) or os.path.islink(p) or not os.path.isdir(p) or not stale(p, cut):
-            continue
-        if n[:1] == '.':
-            shutil.rmtree(p, ignore_errors=True)
-            continue
-        try:
-            fd = opened(J(p, 'job.log'), os.O_WRONLY | os.O_APPEND)
-        except FileNotFoundError:
-            fd = None
-        except OSError:
-            continue
-        try:
-            if fd is not None:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            if stale(p, cut):
-                os.rename(p, J(JOBS, '.' + n))
-                shutil.rmtree(J(JOBS, '.' + n), ignore_errors=True)
-        except OSError:   # a wrapper holds it: the seat is live
-            pass
-        finally:
-            if fd is not None:
-                os.close(fd)
-
-
-def stale(p, cut):   # nothing under p (p included, by lstat: a link's own time) written at or after cut, no .git in it
-    # (a repository), and no other filesystem mounted in it (never ours to delete); an unreadable part is not stale
-    def fail(e):
-        raise e
-    try:
-        top = os.lstat(p)
-        if top.st_mtime >= cut:
-            return False
-        for here, dirs, files in os.walk(p, onerror=fail):
-            for n in dirs + files:
-                q = os.lstat(J(here, n))
-                if n == '.git' or q.st_mtime >= cut or q.st_dev != top.st_dev:
-                    return False
-    except OSError:
-        return False
-    return True
 
 
 def seat_groups(roots, rows=None):   # every process group under the roots but their own (and the caller's)
@@ -830,170 +769,21 @@ def send(d, h, path):
     return 1
 
 
-def report(d):   # the sync buy's contract: the answer (on ok), then the envelope line
-    env = jload(J(d, 'envelope.json'))
-    if env is None:
-        print(dump({'status': 'error', 'dir': d, 'reason': 'no envelope'}))
-        return 1
-    if env.get('status') == 'ok':   # an ok envelope always names its turn, whose result.txt landed first
-        with open(J(d, 'turn-%s' % env['turn'], 'result.txt')) as f:
-            print(f.read().rstrip('\n'))
-    print(shown(env))
-    return 0 if env.get('status') == 'ok' else 1
-
-
-def wait(d, h, mode, timeout):
-    t0, st, box, i = time.time(), State(d), J(d, 'outbox.jsonl'), 0
-    m0 = size(box)
-    while True:
-        st.read()
-        if mode == 'mail' and size(box) > m0:
-            sys.stdout.write(tail(box, m0)[0])
-            return 0
-        if h and mode != 'exit' and st.expect and st.end >= st.expect:   # an idle seat mails nothing more
-            return report(d)
-        if i % 4 == 0 and not (wrappers(d) if h else not os.path.exists(J(d, 'envelope.json'))):
-            if h and st.read().expect and st.end < st.expect:   # a sent turn never ended, and no wrapper is left to end it:
-                # never the previous turn's answer as this one's (the next send relaunches and closes it incomplete)
-                print(dump({'status': 'incomplete', 'reason': 'wrapper-gone', 'dir': d, 'turn': st.expect,
-                            'session': h.get('session')}))
-                return 1
-            return report(d)
-        if timeout is not None and time.time() - t0 >= timeout:
-            print(dump({'status': 'running', 'dir': d, 'turn': st.turn, 'expect': st.expect, 'last_event': st.t,
-                              'open_tool_calls': len(st.open)}))
-            return 1
-        i += 1
-        time.sleep(0.25)
-
-
-def stop(d):   # TERM the seat's wrappers: each closes its CLI as at its deadline (Seat.cut types what that ends). What
-    # is left at 10 s of the seat's groups -- those under its wrappers when the stop first finds any (none yet: its CLI is
-    # still launching) -- is TERMed, and KILLed at 15 s. A group found then holds the turn in flight, so a group a wrapper
-    # starts later (its close-out's own: an abandoned turn's session delete) is never the stop's
-    t0, groups = time.time(), None
-    while time.time() - t0 < 20:
-        ws = wrappers(d)
-        if not ws:
-            break
-        groups = groups or seat_groups([w[0] for w in ws])
-        for w in ws:
-            try:
-                os.kill(w[0], signal.SIGTERM)
-            except OSError:
-                pass
-        if time.time() - t0 >= 10:
-            term(groups, signal.SIGTERM if time.time() - t0 < 15 else signal.SIGKILL)
-        time.sleep(0.2)
-    env = jload(J(d, 'envelope.json'))
-    if env:
-        print(shown(env))
-    return 1 if wrappers(d) else 0
-
-
-def one(v, n):   # a value as ONE line of at most n chars (+ the clip mark)
-    return clip(' '.join(v.split()) if isinstance(v, str) else json.dumps(v, ensure_ascii=False), n)
-
-
-class View:
-    """THE readable view of events.jsonl (`events DIR [--follow]`; the raw stream is `tail -f DIR/events.jsonl`).
-    Streamed text merges into one block per run, a thought run into one clipped line; one line per tool call (input
-    clipped), plus one ↳ line when the call learns its input later; a line per delivered input, turn_start and
-    turn_end (status, reason); a usage line per turn with its cache-hit %; errors, failed tool results, a push the host
-    did not take. Everything else (heartbeats, hooks, file events, exits) stays raw-only. Pure: the same events render
-    the same bytes however they arrive -- a block closes on the next event, never on a pause."""
-    def __init__(v):
-        v.block, v.calls = None, {}   # block = [kind, text] while text/thought deltas arrive; calls: call -> input shown
-
-    def feed(v, text):   # complete JSONL lines (LF-split) -> rendered text
-        return ''.join(v.event(e) for e in map(jparse, text.split('\n')) if isinstance(e, dict))
-
-    def close(v):
-        k, s = v.block or (None, '')
-        v.block = None
-        return ('~ %s\n' % one(s, 200) if k == 'thought' else s.strip() + '\n') if s.strip() else ''
-
-    def event(v, e):
-        k, n, call, inp, at = e.get('kind'), e.get('turn'), e.get('call'), e.get('input'), (e.get('t') or '')[11:19]
-        if k in ('text', 'thought'):
-            if v.block and v.block[0] == k:
-                v.block[1] += e.get('text') or ''
-                return ''
-            out, v.block = v.close(), [k, e.get('text') or '']
-            return out
-        out = v.close()
-        if k == 'tool_call':
-            v.calls[call] = inp
-            out += '$ %s%s\n' % (e.get('tool') or '?', ' ' + one(inp, 300) if inp else '')
-        elif call is not None and call in v.calls and inp not in (None, {}, v.calls[call]):   # the call's input, learnt late
-            v.calls[call] = inp
-            out += '  ↳ %s\n' % one(inp, 300)
-        if k == 'turn_start':
-            out += '── turn %s · %s\n' % (n, at)
-        elif k == 'turn_end':
-            out += '── turn %s %s%s · %s\n' % (n, e.get('status'), ' (%s)' % e['reason'] if e.get('reason') else '', at)
-        elif k == 'usage':
-            u = e.get('usage') or {}
-            tot = sum(u.get(x) or 0 for x in ('in', 'cache_read', 'cache_write'))
-            out += '· usage %s%s%s\n' % (' '.join('%s=%s' % (x, u[x]) for x in ('in', 'out', 'cache_read', 'cache_write', 'reasoning') if x in u) or 'unknown',
-                                         ' · cache hit %d%%' % int(100.0 * (u.get('cache_read') or 0) / tot + 0.5) if tot else '',
-                                         ' · $%.4f' % e['cost_usd'] if isinstance(e.get('cost_usd'), (int, float)) else '')
-        elif k == 'tool_result' and e.get('status') != 'ok':
-            out += '  ! %s %s: %s\n' % (e.get('tool') or call, e.get('status'), one(e.get('output') or '', 200))
-        elif k == 'error':
-            out += '!! %s\n' % one(e.get('text') or '', 300)
-        elif k == 'progress' and e.get('expect'):
-            out += '> t%s %s\n' % (e['expect'], e.get('text'))
-        elif k == 'progress' and e.get('push') == 'failed':
-            out += '!! %s: %s\n' % (e.get('text'), e.get('error'))
-        return out
-
-
-def events(d, follow):   # THE view, one-shot or followed; --follow ends with the seat: no wrapper alive (sampled
-    v, off = View(), 0   # BEFORE the read) and the file drained
-    while True:
-        live = follow and wrappers(d)
-        text, off = tail(J(d, 'events.jsonl'), off)
-        sys.stdout.write(v.feed(text) + ('' if live else v.close()))
-        sys.stdout.flush()
-        if not live:
-            return 0
-        time.sleep(0.5)
-
-
 def main(a):
     cmd = a[0] if a else ''
     if cmd == 'reap' and len(a) > 2:
         return reap(int(a[1]), a[2:])
-    if cmd not in ('spawn', 'send', 'mail', 'wait', 'events', 'stop') or len(a) < 2 or not os.path.isdir(a[1]):
+    if cmd not in ('spawn', 'send') or len(a) < 3 or not os.path.isdir(a[1]):
         print(__doc__.strip(), file=sys.stderr)
         return 2
     d = os.path.realpath(a[1])
     if cmd == 'spawn' and a[1] != d:   # the wrapper is found by its argv: that argv carries the canonical dir
         os.execv(sys.executable, [sys.executable, J(HERE, 'seat.py'), 'spawn', d] + a[2:])
     h = jload(J(d, 'session'))
-    if cmd == 'mail':   # the driver's line; the seat's live wrapper delivers it
-        if len(a) < 3:
-            return 2
-        try:   # opened like any engine append: never through a link the seat planted
-            append(J(d, 'inbox.jsonl'), {'t': now(), 'from': 'driver', 'text': ' '.join(a[2:])})
-        except OSError as e:
-            print('seat.py: %s/inbox.jsonl: %s -- not written' % (d, e.strerror or e), file=sys.stderr)
-            return 2
-        if h and not wrappers(d):
-            print('seat.py: %s has no live seat: the mail waits in its inbox until that seat runs again (send relaunches it)' % d, file=sys.stderr)
-            return 1
-        return 0
-    if cmd in ('spawn', 'send'):
-        if not h or len(a) < 3 or not os.path.isfile(a[2]):
-            print('seat.py: %s needs a persistent seat dir (a session handle) and an existing FILE' % cmd, file=sys.stderr)
-            return 2
-        return (spawn if cmd == 'spawn' else send)(d, h, a[2])
-    if cmd == 'wait':
-        mode = a[a.index('--for') + 1] if '--for' in a[:-1] else 'turn'
-        tmo = float(a[a.index('--timeout') + 1]) if '--timeout' in a[:-1] else None
-        return wait(d, h, mode, tmo) if mode in ('turn', 'mail', 'exit') else 2
-    return events(d, '--follow' in a) if cmd == 'events' else stop(d)
+    if not h or not os.path.isfile(a[2]):
+        print('seat.py: %s needs a persistent seat dir (a session handle) and an existing FILE' % cmd, file=sys.stderr)
+        return 2
+    return (spawn if cmd == 'spawn' else send)(d, h, a[2])
 
 
 if __name__ == '__main__':

@@ -27,13 +27,15 @@ envelope: {"status":"ok|error|incomplete|cancelled|truncated|timeout|auth-expire
   exit 0 ok, 1 any other status, 2 refused or a usage error. README.md is the manual;
   CONTRIBUTING.md has the engine's rules.
 """
-import json, math, os, re, shutil, signal, subprocess, sys, tempfile, time
+import fcntl, json, math, os, re, shutil, signal, subprocess, sys, tempfile, time
 
 import quota
 import seat
 import wires
 
 SEAT_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'seat.py')
+KEEP = 30 * 86400   # how long a dir in the jobs root with no live wrapper outlives its last write
+NAMED = re.compile(r'\d{8}-\d{6}-[a-z]+-\d+|probe-\d+-[a-z]+')   # the names hands.py gives there (buy, probe)
 
 # The seat contract. It heads every buy's prompt (a probe's ping too) and names no job dir, so
 # every seat's prompt shares one prefix through the task: the provider's prompt cache can reuse it.
@@ -98,7 +100,7 @@ def buy(spec, prompt_file, options):
     if not re.fullmatch(r'[a-z0-9]+', provider):
         say("bad provider '%s' (claude|codex|grok|opencode)" % provider)
         return 2
-    seat.sweep()   # the 30-day cleanup of the jobs root, at every buy
+    sweep()   # the 30-day cleanup of the jobs root, at every buy
     if options.out:   # a new or empty dir: a buy never writes over files it did not make
         job_dir = options.out
         if os.path.lexists(job_dir) and not empty(job_dir):
@@ -176,7 +178,8 @@ def launch(provider, model, job_dir, options):
     # A sync buy that is interrupted stops its seat first. A signal the caller ignores (nohup's
     # HUP) stays ignored.
     def interrupted(signum, frame):
-        quiet_stop(job_dir)
+        sys.stdout.flush()
+        stop(job_dir)
         sys.exit(128 + signum)
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         if signal.getsignal(signum) != signal.SIG_IGN:
@@ -186,8 +189,9 @@ def launch(provider, model, job_dir, options):
     if ack.returncode == 2:   # refused before any prompt: that envelope is the answer
         sys.stdout.write(ack.stdout)
         return 2
-    rc = seat.main(['wait', job_dir])
-    quiet_stop(job_dir)
+    rc = wait(job_dir, seat.jload(os.path.join(job_dir, 'session')), 'turn', None)
+    sys.stdout.flush()
+    stop(job_dir)
     return rc
 
 
@@ -209,11 +213,6 @@ def seconds(text):
 def spawn(job_dir, message_file):
     # A subprocess, never in-process: the wrapper it forks is found by its argv, seat.py spawn DIR
     return subprocess.call([sys.executable, SEAT_PY, 'spawn', job_dir, message_file])
-
-
-def quiet_stop(job_dir):
-    sys.stdout.flush()
-    subprocess.call([sys.executable, SEAT_PY, 'stop', job_dir], stdout=subprocess.DEVNULL)
 
 
 def send(job_dir, message_file):
@@ -241,6 +240,224 @@ def send(job_dir, message_file):
     return spawn(job_dir, message_file)
 
 
+def report(d):   # the sync buy's contract: the answer (on ok), then the envelope line
+    env = seat.jload(os.path.join(d, 'envelope.json'))
+    if env is None:
+        print(seat.dump({'status': 'error', 'dir': d, 'reason': 'no envelope'}))
+        return 1
+    if env.get('status') == 'ok':   # an ok envelope always names its turn, whose result.txt landed first
+        with open(os.path.join(d, 'turn-%s' % env['turn'], 'result.txt')) as f:
+            print(f.read().rstrip('\n'))
+    print(seat.shown(env))
+    return 0 if env.get('status') == 'ok' else 1
+
+
+def wait(d, h, mode, timeout):
+    t0, st, box, i = time.time(), seat.State(d), os.path.join(d, 'outbox.jsonl'), 0
+    m0 = seat.size(box)
+    while True:
+        st.read()
+        if mode == 'mail' and seat.size(box) > m0:
+            sys.stdout.write(seat.tail(box, m0)[0])
+            return 0
+        if h and mode != 'exit' and st.expect and st.end >= st.expect:   # an idle seat mails nothing more
+            return report(d)
+        if i % 4 == 0 and not (seat.wrappers(d) if h else not os.path.exists(os.path.join(d, 'envelope.json'))):
+            if h and st.read().expect and st.end < st.expect:   # a sent turn never ended, and no wrapper is left to end it:
+                # never the previous turn's answer as this one's (the next send relaunches and closes it incomplete)
+                print(seat.dump({'status': 'incomplete', 'reason': 'wrapper-gone', 'dir': d, 'turn': st.expect,
+                            'session': h.get('session')}))
+                return 1
+            return report(d)
+        if timeout is not None and time.time() - t0 >= timeout:
+            print(seat.dump({'status': 'running', 'dir': d, 'turn': st.turn, 'expect': st.expect, 'last_event': st.t,
+                              'open_tool_calls': len(st.open)}))
+            return 1
+        i += 1
+        time.sleep(0.25)
+
+
+def stop(d):   # TERM the seat's wrappers: each closes its CLI as at its deadline (Seat.cut types what that ends). What
+    # is left at 10 s of the seat's groups -- those under its wrappers when the stop first finds any (none yet: its CLI is
+    # still launching) -- is TERMed, and KILLed at 15 s. A group found then holds the turn in flight, so a group a wrapper
+    # starts later (its close-out's own: an abandoned turn's session delete) is never the stop's
+    t0, groups = time.time(), None
+    while time.time() - t0 < 20:
+        ws = seat.wrappers(d)
+        if not ws:
+            break
+        groups = groups or seat.seat_groups([w[0] for w in ws])
+        for w in ws:
+            try:
+                os.kill(w[0], signal.SIGTERM)
+            except OSError:
+                pass
+        if time.time() - t0 >= 10:
+            seat.term(groups, signal.SIGTERM if time.time() - t0 < 15 else signal.SIGKILL)
+        time.sleep(0.2)
+    return 1 if seat.wrappers(d) else 0
+
+
+def one(v, n):   # a value as ONE line of at most n chars (+ the clip mark)
+    return wires.clip(' '.join(v.split()) if isinstance(v, str) else json.dumps(v, ensure_ascii=False), n)
+
+
+class View:
+    """THE readable view of events.jsonl (`events DIR [--follow]`; the raw stream is `tail -f DIR/events.jsonl`).
+    Streamed text merges into one block per run, a thought run into one clipped line; one line per tool call (input
+    clipped), plus one ↳ line when the call learns its input later; a line per delivered input, turn_start and
+    turn_end (status, reason); a usage line per turn with its cache-hit %; errors, failed tool results, a push the host
+    did not take. Everything else (heartbeats, hooks, file events, exits) stays raw-only. Pure: the same events render
+    the same bytes however they arrive -- a block closes on the next event, never on a pause."""
+    def __init__(v):
+        v.block, v.calls = None, {}   # block = [kind, text] while text/thought deltas arrive; calls: call -> input shown
+
+    def feed(v, text):   # complete JSONL lines (LF-split) -> rendered text
+        return ''.join(v.event(e) for e in map(wires.jparse, text.split('\n')) if isinstance(e, dict))
+
+    def close(v):
+        k, s = v.block or (None, '')
+        v.block = None
+        return ('~ %s\n' % one(s, 200) if k == 'thought' else s.strip() + '\n') if s.strip() else ''
+
+    def event(v, e):
+        k, n, call, inp, at = e.get('kind'), e.get('turn'), e.get('call'), e.get('input'), (e.get('t') or '')[11:19]
+        if k in ('text', 'thought'):
+            if v.block and v.block[0] == k:
+                v.block[1] += e.get('text') or ''
+                return ''
+            out, v.block = v.close(), [k, e.get('text') or '']
+            return out
+        out = v.close()
+        if k == 'tool_call':
+            v.calls[call] = inp
+            out += '$ %s%s\n' % (e.get('tool') or '?', ' ' + one(inp, 300) if inp else '')
+        elif call is not None and call in v.calls and inp not in (None, {}, v.calls[call]):   # the call's input, learnt late
+            v.calls[call] = inp
+            out += '  ↳ %s\n' % one(inp, 300)
+        if k == 'turn_start':
+            out += '── turn %s · %s\n' % (n, at)
+        elif k == 'turn_end':
+            out += '── turn %s %s%s · %s\n' % (n, e.get('status'), ' (%s)' % e['reason'] if e.get('reason') else '', at)
+        elif k == 'usage':
+            u = e.get('usage') or {}
+            tot = sum(u.get(x) or 0 for x in ('in', 'cache_read', 'cache_write'))
+            out += '· usage %s%s%s\n' % (' '.join('%s=%s' % (x, u[x]) for x in ('in', 'out', 'cache_read', 'cache_write', 'reasoning') if x in u) or 'unknown',
+                                         ' · cache hit %d%%' % int(100.0 * (u.get('cache_read') or 0) / tot + 0.5) if tot else '',
+                                         ' · $%.4f' % e['cost_usd'] if isinstance(e.get('cost_usd'), (int, float)) else '')
+        elif k == 'tool_result' and e.get('status') != 'ok':
+            out += '  ! %s %s: %s\n' % (e.get('tool') or call, e.get('status'), one(e.get('output') or '', 200))
+        elif k == 'error':
+            out += '!! %s\n' % one(e.get('text') or '', 300)
+        elif k == 'progress' and e.get('expect'):
+            out += '> t%s %s\n' % (e['expect'], e.get('text'))
+        elif k == 'progress' and e.get('push') == 'failed':
+            out += '!! %s: %s\n' % (e.get('text'), e.get('error'))
+        return out
+
+
+def events(d, follow):   # THE view, one-shot or followed; --follow ends with the seat: no wrapper alive (sampled
+    v, off = View(), 0   # BEFORE the read) and the file drained
+    while True:
+        live = follow and seat.wrappers(d)
+        text, off = seat.tail(os.path.join(d, 'events.jsonl'), off)
+        sys.stdout.write(v.feed(text) + ('' if live else v.close()))
+        sys.stdout.flush()
+        if not live:
+            return 0
+        time.sleep(0.5)
+
+
+def sweep():   # THE RETENTION, at every buy and probe, before it makes its dir in the jobs root (seat.JOBS): a dir
+    # directly in the jobs root that hands.py named (an --out dir outside it is never swept), with nothing in it written
+    # within KEEP and no repository in it, goes (a link there never, nor its target: job.log is never made) --
+    # under its job.log lock, the lock a wrapper holds for its whole life (no job.log: no wrapper ever ran there, a buy
+    # refused before its launch, with no session to resume). Under the lock it is judged again (a resume touches its dir
+    # before it relaunches: send) and renamed out of every address, to .<name>, before the delete, so a relaunch racing
+    # it finds no dir. A .<name> dir is a delete begun and not finished (killed, or stopped part way): it has no address
+    # and was judged under its lock, so the next sweep that finds it stale finishes it in place
+    cut = time.time() - KEEP
+    try:
+        names = os.listdir(seat.JOBS)
+    except OSError:
+        names = []
+    for n in names:
+        p = os.path.join(seat.JOBS, n)
+        m = n[1:] if n[:1] == '.' else n   # .<name>: a delete begun and not finished
+        if not NAMED.fullmatch(m) or os.path.islink(p) or not os.path.isdir(p) or not stale(p, cut):
+            continue
+        if n[:1] == '.':
+            shutil.rmtree(p, ignore_errors=True)
+            continue
+        try:
+            fd = seat.opened(os.path.join(p, 'job.log'), os.O_WRONLY | os.O_APPEND)
+        except FileNotFoundError:
+            fd = None
+        except OSError:
+            continue
+        try:
+            if fd is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if stale(p, cut):
+                os.rename(p, os.path.join(seat.JOBS, '.' + n))
+                shutil.rmtree(os.path.join(seat.JOBS, '.' + n), ignore_errors=True)
+        except OSError:   # a wrapper holds it: the seat is live
+            pass
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+
+def stale(p, cut):   # nothing under p (p included, by lstat: a link's own time) written at or after cut, no .git in it
+    # (a repository), and no other filesystem mounted in it (never ours to delete); an unreadable part is not stale
+    def fail(e):
+        raise e
+    try:
+        top = os.lstat(p)
+        if top.st_mtime >= cut:
+            return False
+        for here, dirs, files in os.walk(p, onerror=fail):
+            for n in dirs + files:
+                q = os.lstat(os.path.join(here, n))
+                if n == '.git' or q.st_mtime >= cut or q.st_dev != top.st_dev:
+                    return False
+    except OSError:
+        return False
+    return True
+
+
+def verb(a):
+    """mail, wait, events and stop: DIR first, as seat.py wrote it."""
+    cmd = a[0]
+    if len(a) < 2 or not os.path.isdir(a[1]):
+        say('usage: hands.sh %s DIR ...' % cmd)
+        return 2
+    d = os.path.realpath(a[1])
+    h = seat.jload(os.path.join(d, 'session'))
+    if cmd == 'mail':   # the driver's line; the seat's live wrapper delivers it
+        if len(a) < 3:
+            return 2
+        try:   # opened like any engine append: never through a link the seat planted
+            seat.append(os.path.join(d, 'inbox.jsonl'), {'t': wires.now(), 'from': 'driver', 'text': ' '.join(a[2:])})
+        except OSError as e:
+            say('%s/inbox.jsonl: %s -- not written' % (d, e.strerror or e))
+            return 2
+        if h and not seat.wrappers(d):
+            say('%s has no live seat: the mail waits in its inbox until that seat runs again (send relaunches it)' % d)
+            return 1
+        return 0
+    if cmd == 'wait':
+        mode = a[a.index('--for') + 1] if '--for' in a[:-1] else 'turn'
+        tmo = float(a[a.index('--timeout') + 1]) if '--timeout' in a[:-1] else None
+        return wait(d, h, mode, tmo) if mode in ('turn', 'mail', 'exit') else 2
+    if cmd == 'events':
+        return events(d, '--follow' in a)
+    rc, env = stop(d), seat.jload(os.path.join(d, 'envelope.json'))
+    if env:
+        print(seat.shown(env))
+    return rc
+
+
 def probe(which):
     """A one-line ping per provider, on its smallest model: it proves the CLI and its login.
 
@@ -248,7 +465,7 @@ def probe(which):
     reading. A probe never pushes into the driver's session."""
     env = {k: v for k, v in os.environ.items() if not k.startswith('CLAUDE_CODE_MESSAGING_')}
     providers = list(wires.PROVIDERS) if which == 'all' else which.split()
-    seat.sweep()
+    sweep()
     rc = 0
     with tempfile.NamedTemporaryFile('w', prefix='hands-probe.', delete=False) as ping:
         ping.write('Reply with exactly: OK')
@@ -296,7 +513,7 @@ def main(args):
             return 2
         return send(args[1], args[2])
     if args[:1] in (['mail'], ['wait'], ['events'], ['stop']):
-        return seat.main(args)
+        return verb(args)
     options = Options()
     if args[:1] == ['start']:
         options.start, args = True, args[1:]
