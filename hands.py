@@ -537,7 +537,7 @@ def events(job_dir, follow):
 def ps():
     """Print one line per live seat: its provider and model, what it is doing, when its last
     event came, and its dir."""
-    job_dirs = live_dirs()
+    job_dirs = seat.live_seats()
     if not job_dirs:
         say('no live seats')
     for job_dir in job_dirs:
@@ -547,22 +547,6 @@ def ps():
         print('%-24s %s · %s · %s' % (name, doing(job_dir, state), ago(state.last_event),
                                       job_dir))
     return 0
-
-
-def live_dirs():
-    """The job dir of every live wrapper on this machine, found by its command line (seat.py
-    spawn DIR FILE), so a seat started with --out is found too."""
-    found = set()
-    for command in (row[3] for row in seat.process_table()):
-        if 'seat.py' not in command or ' spawn ' not in command:
-            continue
-        words = command.split(' spawn ', 1)[1].split(' ')
-        for count in range(1, len(words)):   # the dir may hold spaces; the message file follows
-            job_dir = ' '.join(words[:count])
-            if os.path.isfile(os.path.join(job_dir, 'session')):
-                found.add(job_dir)
-                break
-    return sorted(found)
 
 
 def doing(job_dir, state):
@@ -667,7 +651,8 @@ def probe(which):
 
     Claude's ping also refreshes the quota board (its stream's rate_limit_event is the claude
     reading). A probe never pushes to the driver."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith('CLAUDE_CODE_MESSAGING_')}
+    driver_names = {name for names, _ in seat.DRIVER_HOSTS.values() for name in names}
+    env = {k: v for k, v in os.environ.items() if k not in driver_names}
     providers = list(wires.PROVIDERS) if which == 'all' else which.split()
     sweep()
     rc = 0

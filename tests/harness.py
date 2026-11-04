@@ -2,8 +2,8 @@
 stub CLIs' log, process checks, recorded transcripts, and a stand-in for the driver's socket.
 
 Nothing here spends quota or reaches the network. The stub CLIs in tests/stubs come first on
-PATH, the jobs root and the opencode store live in the sandbox, and the driver's real socket is
-dropped from the environment the moment this module is imported.
+PATH, the jobs root and the opencode store live in the sandbox, and the variables naming a real
+driver session are dropped from the environment the moment this module is imported.
 """
 import json
 import os
@@ -25,10 +25,12 @@ STUBS = os.path.join(TESTS, 'stubs')
 FIXTURES = os.path.join(TESTS, 'fixtures')
 sys.path.insert(0, ROOT)
 
-# A run inside a Claude Code session inherits the driver's inbox socket. No test may reach it,
-# and no stub setting from the outer environment may leak into a test.
+# A run inside a driver session (Claude Code, Codex, OpenCode) inherits the variables that name
+# it. No test may push to it, and no stub setting from the outer environment may leak into a test.
+import seat   # here, once ROOT is on the path
+DRIVER_NAMES = {name for names, _ in seat.DRIVER_HOSTS.values() for name in names}
 for _name in list(os.environ):
-    if _name.startswith(('CLAUDE_CODE_MESSAGING_', 'STUB_')):
+    if _name in DRIVER_NAMES or _name.startswith('STUB_'):
         del os.environ[_name]
 
 SPECS = {

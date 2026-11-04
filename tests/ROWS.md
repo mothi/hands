@@ -118,12 +118,12 @@ re-proved: a mutant of the code it guards turns the new test red.
 | 90 | `test_seat.py` Pushes.test_no_socket_is_no_push_and_a_dead_one_is_survived |
 | 132 | `test_seat.py` Pushes.test_a_push_reads_no_reply_and_never_waits_for_one<br>`test_seat.py` Pushes.test_a_turn_end_posts_one_push<br>`test_seat.py` Pushes.test_no_socket_is_no_push_and_a_dead_one_is_survived |
 | 134 | `test_seat.py` Pushes.test_a_long_answer_is_clipped_in_its_push |
-| 153 | `test_seat.py` Pushes.test_every_wire_captures_the_socket_and_no_cli_sees_it |
-| 168 | `test_seat.py` Pushes.test_every_wire_captures_the_socket_and_no_cli_sees_it<br>`test_seat.py` Pushes.test_no_probe_cli_sees_the_socket |
+| 153 | `test_seat.py` Pushes.test_every_wire_captures_the_driver_and_no_cli_sees_it |
+| 168 | `test_seat.py` Pushes.test_every_wire_captures_the_driver_and_no_cli_sees_it<br>`test_seat.py` Pushes.test_no_probe_cli_sees_the_driver |
 | 169 | `test_seat.py` Pushes.test_a_relaunch_captures_the_socket_and_hides_it |
 | 164 | `test_seat.py` Pushes.test_a_job_dirs_mail_files_are_never_opened_through_a_link |
 | 200 | `test_seat.py` Pushes.test_capture_never_writes_through_a_link |
-| 157 | `test_seat.py` Hermetic.test_every_captured_socket_is_one_this_suite_made<br>`test_wires.py` Translation.test_the_suite_carries_no_driver_inbox |
+| 157 | `test_seat.py` Hermetic.test_every_captured_driver_is_one_this_suite_made<br>`test_wires.py` Translation.test_the_suite_carries_no_driver_session |
 | 12, 13, 14 | `test_seat.py` FailureText.test_usage_limits_are_provider_quota_dead_with_their_reset |
 | 15, 15b, 15c | `test_seat.py` FailureText.test_logins_are_auth_expired |
 | 16 | `test_seat.py` FailureText.test_other_text_is_an_error |
@@ -141,7 +141,7 @@ re-proved: a mutant of the code it guards turns the new test red.
 | test_close_terms_the_process_group | AcpClient.test_close_terms_the_process_group |
 | test_translate_rules | Translation.test_usage_is_normalized_per_provider<br>Translation.test_a_stop_reason_types_the_turn<br>Translation.test_updates_that_are_no_events<br>Translation.test_the_answer_is_the_last_text_after_the_last_tool<br>Translation.test_the_acp_commands |
 | test_set_config_waits_for_a_late_config_update | AcpClient.test_set_option_waits_for_a_late_config_update |
-| test_suite_env_carries_no_driver_inbox | Translation.test_the_suite_carries_no_driver_inbox |
+| test_suite_env_carries_no_driver_inbox | Translation.test_the_suite_carries_no_driver_session |
 
 ## Deleted with a cut
 

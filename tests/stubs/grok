@@ -19,6 +19,7 @@ STUB_MODE:
               server died first, then exit 1
 `opencode session ...` (the wrapper deleting an abandoned turn's session) logs its launch after a
 second, as a real delete takes a moment, and exits 0.
+`opencode api ...` is a push into the driver's session (stub.answer_push).
 """
 import json
 import os
@@ -128,6 +129,7 @@ class Agent:
         return 0
 
 
+stub.answer_push('api')
 if sys.argv[1:2] == ['session']:
     time.sleep(1)
     stub.log_launch()

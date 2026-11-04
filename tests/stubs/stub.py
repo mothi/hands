@@ -9,12 +9,15 @@ STUB_* environment variables, and each run appends JSON lines to the file named 
   term     it got a TERM
   child    the pid of a process it started
   parked   its turn has started and will not end by itself
+  push     a push into the driver's session (`codex queue`, `opencode api`): argv, the names of
+           every environment variable
 
 tests/harness.py reads the log back (StubLog).
 """
 import json
 import os
 import sys
+import time
 
 NAME = os.path.basename(sys.argv[0])
 FIXTURES = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'fixtures')
@@ -67,3 +70,15 @@ def write_line(message):
     text = message if isinstance(message, str) else json.dumps(message)
     sys.stdout.write(text + '\n')
     sys.stdout.flush()
+
+
+def answer_push(command):
+    """When this run is `<cli> <command> ...`, a push into the driver's session: log it, wait
+    STUB_PUSH_SLEEP seconds, say STUB_PUSH_SAYS on stderr, and exit STUB_PUSH_RC (default 0)."""
+    if sys.argv[1:2] != [command]:
+        return
+    log('push', argv=sys.argv[1:], env=sorted(os.environ))
+    time.sleep(float(setting('PUSH_SLEEP', 0)))
+    if setting('PUSH_SAYS'):
+        sys.stderr.write(setting('PUSH_SAYS') + '\n')
+    sys.exit(int(setting('PUSH_RC', 0)))

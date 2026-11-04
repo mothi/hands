@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """A stub codex CLI: `codex app-server`, JSON-RPC on stdin and stdout, as codex-cli 0.160 speaks it.
+`codex queue ...` is a push into the driver's thread (stub.answer_push).
 
 One thread, th_stub123 (a resume answers the thread it names). A turn/start opens a turn, or,
 while one is open, steers its input into it. turn/interrupt ends the open turn. At stdin EOF it
@@ -338,5 +339,6 @@ class Server:
                     self.handle(json.loads(line))
 
 
+stub.answer_push('queue')
 stub.log_launch()
 Server().run()

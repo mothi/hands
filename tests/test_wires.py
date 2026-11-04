@@ -382,8 +382,9 @@ class Translation(unittest.TestCase):
                          ['-m', 'grok-4.6', 'stdio'])
         self.assertEqual(wires.grok_command({})[0][-2:], ['--always-approve', 'stdio'])
 
-    def test_the_suite_carries_no_driver_inbox(self):
-        names = {'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN'}
+    def test_the_suite_carries_no_driver_session(self):
+        names = {'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CODEX_THREAD_ID',
+                 'OPENCODE_SESSION_ID'}
         self.assertFalse(names & set(os.environ))
 
 

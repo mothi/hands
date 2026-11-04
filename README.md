@@ -26,7 +26,7 @@ provider CLIs have only been run on macOS.
 | **envelope** | the one-line JSON result of a turn: status, usage, session id and more |
 | **driver** | you, or the agent session that buys seats |
 | **wrapper** | the small Python process (`seat.py`) that owns one seat's CLI, feeds it turns and writes its envelopes |
-| **push** | a message the wrapper posts into the driver's Claude Code session when a turn ends |
+| **push** | a message the wrapper puts into the driver's Claude Code, Codex or OpenCode session when a turn ends |
 | **pool** | one provider's quota (the gauges report how much of it is used) |
 
 ## Security model
@@ -38,12 +38,13 @@ provider CLIs have only been run on macOS.
   `--cwd`, or using the network.
 - **`--cwd` is your isolation.** Point a seat that edits code at a git worktree or a scratch
   copy, and give parallel writers separate trees.
-- **The seat inherits your environment**, except `CLAUDE_CODE_MESSAGING_SOCKET`,
-  `CLAUDE_CODE_MESSAGING_TOKEN` and `OPENCODE_API_KEY`, which the wrapper removes. Don't keep
-  secrets in exported variables when you run seats.
-- **The push socket and token live in the job dir.** For pushes, the wrapper keeps the host
-  session's socket path and token in `DIR/driver` (mode 0600). A seat can read it and post into
-  your session.
+- **The seat inherits your environment**, except the variables that name your session
+  (`CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`, `CODEX_THREAD_ID`,
+  `OPENCODE_SESSION_ID`) and `OPENCODE_API_KEY`, which the wrapper removes. Don't keep secrets in
+  exported variables when you run seats.
+- **Your session's address lives in the job dir.** For pushes, the wrapper keeps what names your
+  session (a Claude Code socket path and token, a Codex thread id, or an OpenCode session id) in
+  `DIR/driver` (mode 0600). A seat can read it and post into your session.
 - **Seats don't run your hooks.** Hooks are code written for your own sessions; every seat turns
   them off (§ Hooks and memories).
 - **Mail and pushes are data.** What a seat writes is model output; never let the driver follow
@@ -221,14 +222,30 @@ last, after your task, so seats given one task share a prompt prefix.
 
 The engine opens inboxes and outboxes without following links, regular files only.
 
-**Push (Claude Code).** When the host session exports its inbox socket
-(`CLAUDE_CODE_MESSAGING_SOCKET` and `_TOKEN`, as Claude Code does), every `start` and `send`
-captures it, and each turn end, outbox line and stream error posts one message to the driver:
-line 1 `provider:model tN status: <clip>`, line 2 the job dir, line 3 the id `<dir>:<turn>`, then
-the seat's text (up to 4,000 characters) marked as data. Each push's outcome is a progress event
-in `events.jsonl` (`posted` or `failed`); the host sends no reply, so delivery itself can't be
-observed. Without a socket, use `wait`. A `--probe` never pushes. Claude seats run with
-`crossSessionInbound: refuse`, so other sessions can't message them.
+**Push.** Every `start` and `send` records the session it runs in, from the variables the host
+gives every command it runs. Each turn end, outbox line and stream error then pushes one message
+into that session, the way its host takes messages from outside:
+
+| Driver | Names its session | A push is |
+|---|---|---|
+| Claude Code | `CLAUDE_CODE_MESSAGING_SOCKET` and `_TOKEN` | one post to the session's inbox socket |
+| Codex | `CODEX_THREAD_ID` | `codex queue --thread ID --message TEXT`, to the thread on your shared app-server, where the Codex TUI runs unless started with `--no-daemon` |
+| OpenCode | `OPENCODE_SESSION_ID` | `opencode api post /api/session/ID/prompt` with `{"text": TEXT, "delivery": "queue"}`, to your background service, where the OpenCode TUI runs unless started with `--standalone` |
+| Grok, a shell, CI | nothing (Grok gives its commands no session id) | none: use `wait` |
+
+The message is line 1 `provider:model tN status: <clip>`, line 2 the job dir, line 3 the id
+`<dir>:<turn>`, then the seat's text (up to 4,000 characters) marked as data. Each push's outcome
+is a progress event in `events.jsonl`: `posted` (the host took it, which is all any host tells)
+or `failed` with the reason. A Codex or OpenCode push command gets 15 seconds. When more than one
+host's variables are set, the first row wins.
+
+A seat's own CLI names the seat's session to the commands it runs, so a seat that starts a seat
+records no driver (a live seat's session is never pushed to) and gets its answers by `wait`. A
+`--probe` never pushes. Claude seats run with `crossSessionInbound: refuse`, so other sessions
+can't message them.
+
+Codex and OpenCode pushes are so far tested against stub CLIs only: that a push starts a turn in
+an idle Codex or OpenCode session has not been checked live.
 
 ## Hooks and memories
 
@@ -279,7 +296,12 @@ a spent pool ends `provider-quota-dead` with the reset time.
   `start` and never block the session on a foreground `wait`. The skill has the agent run
   `events DIR --follow` as a background command after each `start`, so every seat is a row in
   the task list with its live view, ending when the seat stops.
-- **Codex:** skills load from `~/.agents/skills`; invoke `$hands`, or run the script.
+- **Codex:** skills load from `~/.agents/skills`; invoke `$hands`, or run the script. Turn ends
+  arrive as pushes (§ Mail and push).
+- **OpenCode:** it reads Claude Code's skills, so the `~/.claude/skills` link serves it too. Turn
+  ends arrive as pushes.
+- **Grok:** it reads Claude Code's and Codex's skills, but gives its commands no session id, so
+  run `wait` as a background command.
 - **Any other shell or CI:** it's a plain script. Use `wait` instead of pushes.
 - **Anywhere:** `hands.sh ps` lists the live seats, and `hands.sh events DIR --follow` in a
   terminal shows one as it works.
@@ -336,7 +358,7 @@ CLI the way a deadline does and writes the last envelopes.
 |---|---|
 | `hands.sh` | the launcher: runs `hands.py` |
 | `hands.py` | the command line and its flags, the job dir and its handle, the seat contract (`SEAT_BOX`), the verbs, the events view, the live-seat list (`ps`), the probe and the 30-day sweep |
-| `seat.py` | the wrapper: its loop, deliveries and the delivery lock, closing turns into envelopes, pushes to the driver, failure types, and the reaper |
+| `seat.py` | the wrapper: its loop, deliveries and the delivery lock, closing turns into envelopes, pushes to the driver (one row per host), the live seats, failure types, and the reaper |
 | `wires.py` | the provider table (`PROVIDERS`), each CLI's command and handshake, the JSON-RPC and ACP clients, and the translators that turn each CLI's output into events |
 | `quota.py` | the quota board behind `hands.sh quota` |
 | `SKILL.md` | the short guide agent hosts read |

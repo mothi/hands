@@ -26,8 +26,9 @@ $H quota                           # the quota board: read-only, it never spends
 ## Rules for the calling agent
 
 - Buy real work with `start` and keep working. Never run `wait` in the foreground: it blocks
-  your session for the whole turn. In Claude Code each turn's answer arrives as a push;
-  elsewhere run `wait` as a background command, or poll `wait DIR --timeout 60`.
+  your session for the whole turn. In Claude Code, Codex and OpenCode each turn's answer arrives
+  as a push, a new message in your session; in Grok or a plain shell, run `wait` as a background
+  command, or poll `wait DIR --timeout 60`.
 - Let the user watch each seat. Right after `start`, run `hands.sh events DIR --follow` as a
   background command (in Claude Code, Bash with `run_in_background`; never Monitor, which feeds
   every line to you): it shows the user the seat's live view and ends when the seat stops. Don't
