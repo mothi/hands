@@ -12,7 +12,7 @@ turn-N/{result.txt,envelope.json} envelope.json result.txt driver job.log
 """
 import errno, fcntl, json, os, re, select, signal, socket, stat, subprocess, sys, time
 import wires
-from wires import clip, event, jparse, now, rec   # the vocabulary every wire shares: one copy, in wires.py
+from wires import clip, closed_turn, event, now, parse_json   # the vocabulary every wire shares
 
 HERE, J = os.path.dirname(os.path.abspath(__file__)), os.path.join
 # THE JOBS ROOT, its one copy: every job dir hands.py names itself (a buy without --out, a probe) lives in
@@ -279,7 +279,7 @@ class State:
 
     def read(s):
         text, s.off = tail(s.path, s.off)
-        for e in map(jparse, text.split('\n')):   # JSONL splits on LF only: str.splitlines also cuts U+2028/U+2029/U+0085
+        for e in map(parse_json, text.split('\n')):   # JSONL splits on LF only: str.splitlines also cuts U+2028/U+2029/U+0085
             if not isinstance(e, dict):
                 continue
             k, n = e.get('kind'), e.get('turn') or 0
@@ -314,7 +314,7 @@ def marker(d, text, expect, turn, **mail):   # THE delivery marker (a send, MSG,
 
 
 def record(prov, text):   # a message as one in.fifo line
-    return json.dumps(wires.user_line(prov, text), ensure_ascii=False).encode()
+    return json.dumps(wires.input_record(prov, text), ensure_ascii=False).encode()
 
 
 def deliver(d, prov, fd, text, expect, turn):   # a send's delivery, through in.fifo. The record is framed LF + line + LF:
@@ -332,7 +332,7 @@ def label(o):   # an inbox line (the driver's `hands.sh mail`) as its seat reads
 def whole(d, lines):   # in.fifo -> the records to deliver: whole JSON-object lines only; a torn one is dropped, typed, never fused
     out = []
     for ln in lines:
-        if ln.strip() and isinstance(jparse(ln.decode('utf-8', 'replace')), dict):
+        if ln.strip() and isinstance(parse_json(ln.decode('utf-8', 'replace')), dict):
             out.append(ln)
         elif ln.strip():
             append(J(d, 'events.jsonl'), event('progress', State(d).read().turn, text='torn input dropped: ' + clip(ln.decode('utf-8', 'replace'), 120)))
@@ -370,7 +370,7 @@ class Seat:
         turn = State(s.d).read().turn if text else 0   # the turn the mail arrived in
         for ln in text.split('\n')[:-1]:   # LF only, as State.read
             if ln.strip():
-                o = jparse(ln)
+                o = parse_json(ln)
                 push(s.d, s.h, turn, 'mail', 'mail to driver', str(o.get('text') if isinstance(o, dict) else o))
 
     def inbox(s):   # each inbox line not yet delivered -> the conversation, as a send's message, in order, once
@@ -386,7 +386,7 @@ class Seat:
                 lines = g.read(s.seen).split(b'\n')[:-1]
             st = State(s.d).read()
             for n, ln in enumerate(lines, 1):
-                o = jparse(ln.decode('utf-8', 'replace'))
+                o = parse_json(ln.decode('utf-8', 'replace'))
                 if n <= st.mailed or not isinstance(o, dict):
                     continue
                 s.take(label(o), st.next_turn(s.delivery, True), st.turn, inbox=n)
@@ -474,7 +474,7 @@ class Seat:
         s.first, s.t_first, s.eoff, st = 0, time.time(), size(J(d, 'stderr.log')), State(d).read()
         # a wrapper killed before its close-out left turns delivered and never answered: they close first, as its close-out
         # would have, so this launch numbers its turns past every marker already written (else a wait counts to the wrong turn)
-        s.finish([rec(n, 'incomplete', session=h.get('session')) for n in range(st.end + 1, st.expect + 1)], None)
+        s.finish([closed_turn(n, 'incomplete', session=h.get('session')) for n in range(st.end + 1, st.expect + 1)], None)
         s.first = State(d).read().next_turn(s.delivery, False)
         deadline = s.limit()
         # THE POLITE CLOSE (every wire), at the deadline and at a stop alike: the wrapper ends the CLI itself, with
@@ -484,7 +484,7 @@ class Seat:
         # past the deadline: it ends the CLI's group itself if the wrapper's close has not
         wrap = lambda argv: reaped_argv(deadline + 10 - time.time(), argv)
         if s.fam != 'acp':   # claude and codex translate on one Wire for the whole launch; ACP per turn (acp_turn)
-            s.W = wires.Wire(s.prov, s.first - 1, h.get('session'), s.put, s.pending)
+            s.W = wires.StreamTranslator(s.prov, s.first - 1, h.get('session'), s.put, s.pending)
         seat, why = wires.launch(h, wrap, s.log, J(d, 'stderr.log'), s.feed)
         if why:
             return s.early(*why, seat=seat)
@@ -499,14 +499,14 @@ class Seat:
             s.hand_on(seat)
             r, w = seat.fds()
             r, w, _ = select.select(r + [s.rfd], w, [], 0.5)
-            seat.ready(r, w)
+            seat.on_ready(r, w)
             if s.rfd in r:
                 s.read_fifo()
         s.late = seat.proc.poll() is None and time.time() >= deadline   # set BEFORE the close the turn reads it in
-        if seat.proc.poll() is None and s.W and s.W.tid:   # codex outlived the loop: the deadline or a stop ends its turn
+        if seat.proc.poll() is None and s.W and s.W.turn_id:   # codex outlived the loop: the deadline or a stop ends its turn
             try:
-                seat.call('turn/interrupt', {'threadId': s.W.session, 'turnId': s.W.tid}, 5)
-            except wires.AcpError:
+                seat.wait_for_answer('turn/interrupt', {'threadId': s.W.session, 'turnId': s.W.turn_id}, 5)
+            except wires.WireError:
                 pass
         s.letgo(s.rfd)
         rc = s.cut(rcode(seat.close(2)))   # close() answers a prompt whose pipe an escaped child still holds
@@ -515,7 +515,7 @@ class Seat:
 
     def log(s, line, way):   # stream.jsonl: claude's stdout verbatim; every JSON-RPC line, both ways, stamped
         if s.fam != 'stdin':
-            append(J(s.d, 'stream.jsonl'), {'t': now(), 'dir': way, 'msg': jparse(line)})
+            append(J(s.d, 'stream.jsonl'), {'t': now(), 'dir': way, 'msg': parse_json(line)})
         elif way == 'in':
             with open(J(s.d, 'stream.jsonl'), 'ab') as f:
                 f.write(line.encode() + b'\n')
@@ -527,7 +527,7 @@ class Seat:
             seat.write(b''.join(ln + b'\n' for ln in s.waiting))
             s.waiting = []
         elif s.fam == 'acp' and s.waiting and not seat.busy():
-            s.acp_turn(seat, s.n, wires.said(s.waiting.pop(0)))
+            s.acp_turn(seat, s.n, wires.record_text(s.waiting.pop(0)))
             s.n += 1
         elif s.fam == 'rpc' and s.waiting and not s.asked:
             s.rpc_turn(seat, s.waiting.pop(0))
@@ -535,7 +535,7 @@ class Seat:
     def feed(s, o):   # what the CLI said (a claude stdout line; a codex notification) -> its events, and the turns it
         # closed through finish; a stream error that closed none is pushed
         if not isinstance(o, dict):
-            s.W.ev('progress', text='non-JSON line: ' + clip(o, 120))
+            s.W.emit('progress', text='non-JSON line: ' + clip(o, 120))
             return
         s.errs = []
         recs = s.W.feed(o)
@@ -556,7 +556,7 @@ class Seat:
             elif status != 'ok':   # typed from provider error fields and the CLI's stderr, never from prose; a turn a stop
                 # ended is incomplete, whatever its agent said as it went (codex: interrupted; opencode: cancelled)
                 status, reset = ('incomplete', '') if s.halt else typed(
-                    status, r['errtext'] + ('\n' + since(J(d, 'stderr.log'), s.eoff) if rc is not None else ''), rc)
+                    status, r['error_text'] + ('\n' + since(J(d, 'stderr.log'), s.eoff) if rc is not None else ''), rc)
                 text = ''
             # a turn its CLI answered ok reads rc 0, whatever ended the CLI after it (a stop, the deadline)
             rc_ = 0 if status == 'ok' else rc if rc not in (None, 0) else 1
@@ -565,7 +565,7 @@ class Seat:
                 use = dict(use, cost_usd=r['extra']['cost_usd'])
             os.makedirs(J(d, 'turn-%d' % n), exist_ok=True)
             put(J(d, 'turn-%d' % n, 'result.txt'), text)
-            t0 = s.t_first if n == s.first else (r['t0'] or s.t_first)
+            t0 = s.t_first if n == s.first else (r['started'] or s.t_first)
             envelope(d, status, s.prov, h.get('model'), rc_, int(time.time() - t0), reset, use, h.get('effort'),
                      session=session, turn=n, delivery=s.delivery, reason=reason)
             if status == 'ok':   # result.txt -> the latest ok turn's answer
@@ -579,10 +579,10 @@ class Seat:
             push(d, h, n, 'turn_end', status, text or reason or reset)
 
     def close_out(s, rc, W=None):   # the open turn, then every turn delivered and never answered, closes; then the exit
-        if W and W.cur:
+        if W and W.current:
             s.finish([W.cut()], rc)
         st = State(s.d).read()
-        s.finish([rec(n, 'incomplete', session=W.session if W else s.h.get('session')) for n in range(st.end + 1, st.expect + 1)], rc)
+        s.finish([closed_turn(n, 'incomplete', session=W.session if W else s.h.get('session')) for n in range(st.end + 1, st.expect + 1)], rc)
         s.put(event('progress', W.turn if W else st.turn, text='exit rc=%s' % rc))
 
     def early(s, status, reason, why, seat=None):
@@ -612,7 +612,7 @@ class Seat:
         # active turn") -- so no client guess of the open turn races its end. The
         # seat's effort rides every one. A turn/start it refuses on an idle thread is that turn, failed; an
         # agent gone mid-delivery leaves the turn to the close-out
-        inp = [{'type': 'text', 'text': wires.said(ln)}]
+        inp = [{'type': 'text', 'text': wires.record_text(ln)}]
         p = dict({'threadId': s.W.session, 'input': inp}, **({'effort': s.h['effort']} if s.h.get('effort') else {}))
         s.asked = True
         rpc.request('turn/start', p, s.rpc_answered)
@@ -623,10 +623,10 @@ class Seat:
             return
         e = r['error'] if isinstance(r['error'], dict) else {'message': str(r['error'])}
         why = 'turn/start refused: %s %s' % (e.get('code'), e.get('message'))
-        recs = s.W.start() if s.W.cur is None else None
-        s.W.ev('error', text=clip(why))
+        recs = s.W.open_turn() if s.W.current is None else None
+        s.W.emit('error', text=clip(why))
         if recs is not None:
-            s.finish(recs + [s.W.end('error', '', None, 'none', why)], None)
+            s.finish(recs + [s.W.close('error', '', None, 'none', why)], None)
 
     def forget(s, sid, n):   # GUARD 2, ABANDONED TURNS: a turn whose agent went mid-turn other than by the
         # deadline's close (a stop -- a polite close too, kept here until a live opencode check shows it releases the claim
@@ -634,7 +634,7 @@ class Seat:
         # resumes at its next boot; its session is deleted -- the wire's own command (wires.forget; None = nothing to delete), in
         # the seat's cwd, under the reaper, its output to stderr.log (no provider error: failures are typed from
         # past it) -- before the turn's envelope lands, so a sync buy's stop never races it
-        argv = wires.forget(s.prov, sid, s.h.get('cli'))
+        argv = wires.forget_command(s.prov, sid, s.h.get('cli'))
         if argv:
             with open(J(s.d, 'stderr.log'), 'ab') as ef:
                 rc = rcode(subprocess.call(reaped_argv(60, argv), stdin=subprocess.DEVNULL, stdout=ef, stderr=ef, cwd=s.h['cwd']))
@@ -645,7 +645,7 @@ class Seat:
         seen, off, t0 = set(), size(J(s.d, 'stderr.log')), time.time()
 
         def sink(u):
-            for e in wires.translate(u, n, now(), s.prov):
+            for e in wires.acp_events(u, n, now(), s.prov):
                 if e['kind'] == 'file':   # grok reports one edit twice: one file event per call and path
                     if (e.get('call'), e.get('path')) in seen:
                         continue
@@ -654,7 +654,7 @@ class Seat:
         seat.prompt(text, sink, lambda res: s.acp_done(seat, n, res, off, t0))
 
     def acp_done(s, seat, n, res, off, t0):
-        *head, end = wires.translate(res, n, now(), s.prov)
+        *head, end = wires.acp_events(res, n, now(), s.prov)
         use = ([e for e in head if e['kind'] == 'usage'] or [{}])[0]
         for e in head:
             if e['kind'] == 'error':
@@ -671,7 +671,7 @@ class Seat:
             if rc is not None and not s.late:   # its agent gone mid-turn, not by the deadline: the turn is abandoned
                 s.forget(seat.session_id, n)
             rc = s.cut(rc)
-        s.finish([rec(n, end['status'], end.get('text'), use.get('usage'), end.get('final'), err, end.get('session'), t0,
+        s.finish([closed_turn(n, end['status'], end.get('text'), use.get('usage'), end.get('final'), err, end.get('session'), t0,
                       {k: use[k] for k in ('usage_unknown', 'cost_usd') if k in use})], rc)
 
 

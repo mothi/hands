@@ -3,7 +3,7 @@
 --fake; hands.sh's selftest runs it as its grok and opencode stubs) replays recorded grok and
 opencode transcripts (fixtures/*-acp-*.jsonl) request by request, mapping the recorded answer ids to
 the live client's. Run: python3 tests/test_acp.py"""
-import itertools, json, os, signal, subprocess, sys, tempfile, time, unittest
+import itertools, json, os, select, signal, subprocess, sys, tempfile, time, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # the repo root: wires.py
 import wires  # noqa: E402
@@ -180,26 +180,28 @@ class AcpTests(unittest.TestCase):
         with open(transcript, "w") as f:
             f.writelines(json.dumps(r) + "\n" for r in rows
                          if not (r["dir"] == "out" and isinstance(r["msg"], dict) and r["msg"].get("method") == "session/cancel"))
-        s = wires.AcpSeat([sys.executable, os.path.abspath(__file__), "--fake", transcript, mode, self.rec], self.tmp.name)
+        s = wires.AcpAgent([sys.executable, os.path.abspath(__file__), "--fake", transcript, mode, self.rec], self.tmp.name)
         self.addCleanup(s.close, 0.5)
         return s
 
     def turn(self, seat, n, text, wire=None):
         evs, box = [], []
-        seat.prompt(text, lambda u: evs.extend(wires.translate(u, n, None, wire)), box.append)
+        seat.prompt(text, lambda u: evs.extend(wires.acp_events(u, n, None, wire)), box.append)
         end = time.time() + 30
         while not box and time.time() < end:   # the seat's owner runs the loop: here, this test
-            seat.pump(0.5)
+            seat.step(0.5)
         res = box[0]
-        return res, evs + wires.translate(res, n, None, wire)
+        while seat.fds()[0] and select.select(seat.fds()[0], [], [], 0.2)[0]:   # what the agent sends right after
+            seat.on_ready(seat.fds()[0], [])   # its answer (grok's turn summaries) is no part of the next turn
+        return res, evs + wires.acp_events(res, n, None, wire)
 
     def test_grok_transcript_round_trips_and_translates(self):
         seat = self.seat(FX + "/grok-acp-sample.jsonl")
         self.assertTrue(seat.initialize()["loadSession"])
         self.assertEqual(seat.new_session(), "01a0d35c-6d25-77c1-b7bd-1a71c642327e")
-        self.assertEqual((seat.current("model"), seat.current("thought_level")), ("grok-4.6", "xhigh"))
-        self.assertEqual((seat.values("thought_level"), seat.values("nope")), (["xhigh", "high", "medium", "low"], None))
-        self.assertEqual(seat.set_config("thought_level", "low"), "low")   # grok's CLI effort flag never reaches ACP
+        self.assertEqual((seat.current_value("model"), seat.current_value("thought_level")), ("grok-4.6", "xhigh"))
+        self.assertEqual((seat.listed_values("thought_level"), seat.listed_values("nope")), (["xhigh", "high", "medium", "low"], None))
+        self.assertEqual(seat.set_option("thought_level", "low"), "low")   # grok's CLI effort flag never reaches ACP
         runs = [self.turn(seat, n, t, "grok") for n, t in ((1, "PONG"), (2, "said?"), (3, "sleep"), (4, "AFTER"))]
         self.assertEqual([rl(evs) for _, evs in runs], GROK)
         self.assertEqual([(e[-1]["status"], e[-1]["text"], e[-1]["final"], e[-1]["session"]) for _, e in runs],
@@ -214,7 +216,7 @@ class AcpTests(unittest.TestCase):
     def test_opencode_transcript_round_trips_and_translates(self):
         seat = self.seat(FX + "/opencode-acp-sample.jsonl")
         self.assertTrue(seat.initialize()["loadSession"])
-        self.assertEqual((seat.new_session(), seat.current("model"), seat.current("thought_level")),
+        self.assertEqual((seat.new_session(), seat.current_value("model"), seat.current_value("thought_level")),
                          ("ses_f2ca45c73ffe55AqfFsvtJPq2O", "opencode-go/deepseek-v4.1-flash", "low"))
         runs = [self.turn(seat, n, t, "opencode") for n, t in ((1, "PONG"), (2, "said?"), (3, "sleep"), (4, "AFTER"))]
         self.assertEqual([rl(evs) for _, evs in runs], OPENCODE)
@@ -259,10 +261,10 @@ class AcpTests(unittest.TestCase):
         box, end = [], time.time() + 10
         seat.prompt("x", None, box.append)
         while seat.proc.poll() is None and time.time() < end:
-            seat.pump(0.2)
+            seat.step(0.2)
         self.assertIsNotNone(seat.proc.poll())                # the agent is gone, its detached child is not
         for _ in range(5):
-            seat.pump(0.2)
+            seat.step(0.2)
         self.assertEqual(box, [], "EOF arrived: the escape fixture did not hold the pipe")
         seat.close(grace=0.5)
         with open(self.rec + ".child") as f:
@@ -323,19 +325,19 @@ class AcpTests(unittest.TestCase):
 
     def test_translate_rules(self):
         def tr(u):
-            return wires.translate(u, 7, t="T")
-        self.assertEqual(wires.usage({"inputTokens": 20429, "outputTokens": 18, "totalTokens": 20447, "cachedReadTokens": 128,
+            return wires.acp_events(u, 7, at="T")
+        self.assertEqual(wires.normalize_usage({"inputTokens": 20429, "outputTokens": 18, "totalTokens": 20447, "cachedReadTokens": 128,
                                     "cacheCreationTokens": 0, "reasoningTokens": 16}, "grok"),       # cache inside input
                          {"in": 20301, "out": 18, "cache_read": 128, "cache_write": 0, "reasoning": 16})
-        self.assertEqual(wires.usage({"inputTokens": 197, "outputTokens": 3, "totalTokens": 12764, "thoughtTokens": 20,
+        self.assertEqual(wires.normalize_usage({"inputTokens": 197, "outputTokens": 3, "totalTokens": 12764, "thoughtTokens": 20,
                                     "cachedReadTokens": 12544}, "opencode"),                        # reasoning apart from output
                          {"in": 197, "out": 23, "cache_read": 12544, "reasoning": 20})
-        self.assertEqual(wires.usage({"input_tokens": 10, "cache_read_input_tokens": 21806, "cache_creation_input_tokens": 8449,
+        self.assertEqual(wires.normalize_usage({"input_tokens": 10, "cache_read_input_tokens": 21806, "cache_creation_input_tokens": 8449,
                                     "output_tokens": 43, "output_tokens_details": {"thinking_tokens": 36}}, "claude"),
                          {"in": 10, "out": 43, "cache_read": 21806, "cache_write": 8449, "reasoning": 36})
-        self.assertEqual(wires.usage({"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 3, "reasoning_output_tokens": 1}, "codex"),
+        self.assertEqual(wires.normalize_usage({"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 3, "reasoning_output_tokens": 1}, "codex"),
                          {"in": 6, "out": 3, "cache_read": 4, "reasoning": 1})
-        self.assertIsNone(wires.usage({"totalTokens": 3}, "opencode"))                       # no field it maps: unknown
+        self.assertIsNone(wires.normalize_usage({"totalTokens": 3}, "opencode"))                       # no field it maps: unknown
         for stop, want in (("end_turn", "ok"), ("refusal", "error"), ("max_tokens", "truncated"), (None, "error"),
                            ("max_turn_requests", "truncated"), ("cancelled", "cancelled"), ("bogus", "error")):
             end = tr({"_client": "turn_end", "stopReason": stop, "answer": "A"})[-1]
@@ -346,19 +348,19 @@ class AcpTests(unittest.TestCase):
                                                  "locations": [{"path": "/w"}]})], ["tool_call"])   # a shell's cwd is no file
         self.assertEqual(tr({"sessionUpdate": "available_commands_update"}), [])
         t = wires.Turn()
-        t.text(None, "I'll run it.")
-        t.tool()
-        self.assertEqual(t.final(), "")                                     # narration before a tool is never the answer
+        t.add_text(None, "I'll run it.")
+        t.add_tool()
+        self.assertEqual(t.answer(), "")                                     # narration before a tool is never the answer
         t = wires.Turn()
-        t.text("m1", "the answer")
-        t.text("m2", " \n")
-        self.assertEqual(t.final(), "")                                     # a blank last response fails closed: no promotion
+        t.add_text("m1", "the answer")
+        t.add_text("m2", " \n")
+        self.assertEqual(t.answer(), "")                                     # a blank last response fails closed: no promotion
         self.assertEqual(wires.opencode_command({"model": "opencode-go/deepseek-v4.1-flash", "effort": "low"}),
                          (["opencode", "acp"], {}))   # 2.0 has no --cwd, 2.x takes no model from OPENCODE_CONFIG_CONTENT
         # on ACP (the model and the effort are session options: launch sets them), and the seat runs on the user's own
         # store: no env of its own
-        self.assertEqual(wires.forget("opencode", "ses_1", "/x/opencode"), ["/x/opencode", "session", "delete", "ses_1", "--standalone"])
-        self.assertEqual((wires.forget("grok", "s1"), wires.forget("opencode", None)), (None, None))   # grok keeps no claim
+        self.assertEqual(wires.forget_command("opencode", "ses_1", "/x/opencode"), ["/x/opencode", "session", "delete", "ses_1", "--standalone"])
+        self.assertEqual((wires.forget_command("grok", "s1"), wires.forget_command("opencode", None)), (None, None))   # grok keeps no claim
         self.assertEqual(wires.grok_command({"model": "grok-4.6"})[0][-3:], ["-m", "grok-4.6", "stdio"])
         self.assertEqual(wires.grok_command({})[0][-2:], ["--always-approve", "stdio"])   # model-less: the CLI default
         self.assertRaises(ValueError, wires.opencode_command, {"model": "deepseek"})
@@ -370,9 +372,9 @@ class AcpTests(unittest.TestCase):
         seat = self.seat(path)
         seat.initialize()
         seat.new_session()
-        self.assertEqual(seat.set_config("thought_level", "low"), "low")   # the reply said default; the update took it
+        self.assertEqual(seat.set_option("thought_level", "low"), "low")   # the reply said default; the update took it
         t0 = time.time()
-        self.assertRaises(wires.AcpError, seat.set_config, "thought_level", "high")   # never confirmed: still refused
+        self.assertRaises(wires.WireError, seat.set_option, "thought_level", "high")   # never confirmed: still refused
         self.assertLess(time.time() - t0, 5)                                # and the wait is bounded
 
     def test_suite_env_carries_no_driver_inbox(self):   # falsification: drop the pop, run with a fake socket exported

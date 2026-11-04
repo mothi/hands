@@ -313,7 +313,7 @@ class View:
         v.block, v.calls = None, {}   # block = [kind, text] while text/thought deltas arrive; calls: call -> input shown
 
     def feed(v, text):   # complete JSONL lines (LF-split) -> rendered text
-        return ''.join(v.event(e) for e in map(wires.jparse, text.split('\n')) if isinstance(e, dict))
+        return ''.join(v.event(e) for e in map(wires.parse_json, text.split('\n')) if isinstance(e, dict))
 
     def close(v):
         k, s = v.block or (None, '')

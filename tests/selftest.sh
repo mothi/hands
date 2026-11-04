@@ -185,7 +185,7 @@ def onefile(d, n, here):   # the raw wire reports the edit twice (translate alon
     sys.path.insert(0, here)
     import wires
     ups = [(r['msg'].get('params') or {}).get('update') for r in map(json.loads, open(J(d, 'stream.jsonl'))) if r['dir'] == 'in' and isinstance(r['msg'], dict)]
-    raw = [x for u in ups if isinstance(u, dict) and 'sessionUpdate' in u for x in wires.translate(u, 0) if x['kind'] == 'file']
+    raw = [x for u in ups if isinstance(u, dict) and 'sessionUpdate' in u for x in wires.acp_events(u, 0) if x['kind'] == 'file']
     got = [e for e in evs(d) if e['kind'] == 'file' and e['turn'] == int(n)]
     return len(raw) == 2 and len(got) == 1 and (got[0]['call'], got[0]['path']) == (raw[0]['call'], raw[0]['path'])
 def resumed(d, ack, rec, argv, sid):
@@ -615,7 +615,7 @@ for l in open(sys.argv[1]):
     sh -c "jq -e '.status==\"timeout\" and .rc==142 and .turn==1 and .session==\"ses_f2c74432dffeoPDAL0Eq6RHjaI\"' '$SB/a111b/envelope.json' >/dev/null"
   # 172 (GUARD 1): THE POLITE DEADLINE, one rule for every ACP wire. opencode keeps a turn's execution
   # claim when TERMed and releases it on a polite close, and its managed background service resumes a kept claim at its
-  # next boot -- so the wrapper ends the agent itself at the deadline (AcpSeat.close: stdin EOF first), and the reaper is a
+  # next boot -- so the wrapper ends the agent itself at the deadline (Cli.close: stdin EOF first), and the reaper is a
   # backstop 10 s later. Falsification: put the reaper back at the deadline (no wrapper close) -> the first end is term.
   t 172 "THE POLITE DEADLINE, every ACP wire (grok a111, opencode a111b): at the launch deadline the agent sees its stdin close (EOF) before any TERM, and the turn in flight is still typed timeout, rc 142, with its session" \
     sh -c "[ \"\$(head -1 '$SB/a111.rec.ends')\" = eof ] && [ \"\$(head -1 '$SB/a111b.rec.ends')\" = eof ] && jq -e '.status==\"timeout\" and .rc==142 and .session==\"01a0d38a-6416-74d3-82f8-80174c82f422\"' '$SB/a111/envelope.json' >/dev/null && jq -e '.status==\"timeout\" and .rc==142 and .session==\"ses_f2c74432dffeoPDAL0Eq6RHjaI\"' '$SB/a111b/envelope.json' >/dev/null"
@@ -1101,6 +1101,19 @@ STUB
   stub_run stop "$SB/p209f" >/dev/null 2>&1
   t 209 "THE STOP'S rc IS FOR THE TURNS IT CUT: a claude turn whose ok answer lands while a stop closes its CLI is ok, rc 0, with its answer; one that fails then is the stop's: incomplete, rc 143" \
     sh -c "jq -e '.status==\"ok\" and .rc==0' '$SB/p209/turn-1/envelope.json' >/dev/null && grep -q '^turn 1 pid' '$SB/p209/turn-1/result.txt' && jq -e '.status==\"incomplete\" and .rc==143' '$SB/p209f/turn-1/envelope.json' >/dev/null && grep -q 'API Error: 500' '$SB/p209f/events.jsonl'"
+  # 210: THE RECORDED CLI. A relaunch runs the CLI the seat recorded at its start, for claude as for every provider. The
+  # handle names a wrapper off PATH that marks its run. Falsification: start claude by name -> PATH's claude runs instead
+  stub_run start --cwd "$SB/tmp" --out "$SB/p210" claude:sonnet "$SB/q.md" >/dev/null 2>&1
+  stub_run wait "$SB/p210" --timeout 10 >/dev/null 2>&1; stub_run stop "$SB/p210" >/dev/null 2>&1
+  mkdir -p "$SB/alt210"
+  printf '#!/bin/sh\ntouch "%s"\nexec "%s" "$@"\n' "$SB/p210.ran" "$SB/bin/claude" >"$SB/alt210/claude"; chmod +x "$SB/alt210/claude"
+  python3 -c 'import json, sys
+h = json.load(open(sys.argv[1])); h["cli"] = sys.argv[2]
+open(sys.argv[1], "w").write(json.dumps(h))' "$SB/p210/session" "$SB/alt210/claude"
+  stub_run send "$SB/p210" "$SB/q81.md" >/dev/null 2>&1
+  stub_run wait "$SB/p210" --timeout 10 >/dev/null 2>&1; stub_run stop "$SB/p210" >/dev/null 2>&1
+  t 210 "THE RECORDED CLI: a relaunch runs the claude its seat recorded at the start (the handle's cli), as every provider does -- not whichever claude PATH finds" \
+    sh -c "[ -e '$SB/p210.ran' ] && jq -e '.status==\"ok\" and .turn==2' '$SB/p210/envelope.json' >/dev/null"
   t 131 "events --follow ENDS WITH THE SEAT: following a live seat, it exits (rc 0) within 2 s of stop, after draining the file (the stopped turn's incomplete turn_end is its last news) -- no wrapper alive is the one signal, no new state" \
     python3 "$SB/chk.py" follows "$HANDS" "$SB/p131"
   # THE TWO DELIVERY RACES (stub tests first, then the fixes). 138: a send killed mid-write leaves a
