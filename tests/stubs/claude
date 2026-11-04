@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""A stub claude CLI on the stdin stream-json wire: one message line in, one turn out.
+
+STUB_MODE picks how each turn goes:
+  ok          (the default) the answer names two environment switches and the turn number
+  count       the answer is 'turn N pid P'
+  echo        the answer is the message text itself
+  slow        STUB_SLEEP seconds (default 2), then count's answer, or a failure when STUB_FAIL
+              is set
+  replay      STUB_REPLAY, a recorded stream, one recorded turn per message line
+  park        the turn never ends
+  deaf        the turn never ends, and a TERM is ignored
+  straggler   start a sleep in the background, answer, then exit
+  initonly    die after the turn's first event
+  newsid      answer on another session (a resume that started a fresh one)
+  quoted      an ok answer that quotes a usage-limit line
+  quotedfail  a failed turn whose text quotes a usage-limit line
+  quota       an is_error result carrying the usage-limit text
+  authfail    a login failure on stderr
+"""
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+import stub
+
+MODE = stub.setting('MODE', 'ok')
+SESSION = 'sess-new' if MODE == 'newsid' else 'sess-stub'
+
+
+def result(text):
+    stub.write_line({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': text,
+                     'session_id': SESSION, 'usage': {'input_tokens': 2, 'output_tokens': 3}})
+
+
+def failed(error):
+    stub.write_line({'type': 'result', 'subtype': 'error_during_execution', 'is_error': True,
+                     'errors': [error], 'session_id': SESSION})
+
+
+def recorded_turns(path):
+    """The recorded stream split into turns, each starting at its system/init event."""
+    turns = [[]]
+    started = False
+    with open(path) as f:
+        for line in f:
+            event = json.loads(line)
+            opens = (event.get('type'), event.get('subtype')) == ('system', 'init')
+            if opens and started:
+                turns.append([])
+            started = started or opens
+            turns[-1].append(line.rstrip('\n'))
+    return turns
+
+
+def park():
+    stub.log('parked')
+    time.sleep(60)
+
+
+def run_turn(number, line):
+    if MODE == 'authfail':
+        sys.stderr.write('Invalid API key · Please run /login\n')
+        sys.exit(1)
+    stub.write_line({'type': 'system', 'subtype': 'init', 'session_id': SESSION})
+    if MODE == 'initonly':
+        sys.exit(1)
+    elif MODE == 'park':
+        park()
+    elif MODE == 'deaf':
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        park()
+    elif MODE == 'count':
+        result('turn %d pid %d' % (number, os.getpid()))
+    elif MODE == 'slow':
+        time.sleep(float(stub.setting('SLEEP', 2)))
+        if stub.setting('FAIL'):
+            failed('API Error: 500')
+        else:
+            result('turn %d pid %d' % (number, os.getpid()))
+    elif MODE == 'echo':
+        result(json.loads(line)['message']['content'][0]['text'])
+    elif MODE == 'quoted':
+        result('The log I read says: Claude AI usage limit reached, resets 5pm')
+    elif MODE == 'quotedfail':
+        text = 'The log says: Claude AI usage limit reached, resets 5pm'
+        stub.write_line({'type': 'assistant',
+                         'message': {'content': [{'type': 'text', 'text': text}]}})
+        failed('API Error: 500 Internal server error')
+    elif MODE == 'quota':
+        stub.write_line({'type': 'result', 'subtype': 'success', 'is_error': True,
+                         'result': 'Claude AI usage limit reached, resets 6:20am',
+                         'session_id': SESSION})
+    else:
+        if MODE == 'straggler':
+            stub.log('child', child=subprocess.Popen(['sleep', '300']).pid)
+        background = os.environ.get('CLAUDE_CODE_DISABLE_BACKGROUND_TASKS', 'unset')
+        memory = os.environ.get('CLAUDE_CODE_DISABLE_AUTO_MEMORY', 'unset')
+        result('bg=%s mem=%s turn=%d' % (background, memory, number))
+        if MODE == 'straggler':   # the CLI ends by itself: only the reaper finds the sleep
+            sys.exit(0)
+
+
+def main():
+    stub.log_launch()
+    turns = recorded_turns(stub.setting('REPLAY')) if MODE == 'replay' else None
+    number = 0
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            stub.log('eof')
+            return
+        number += 1
+        stub.log('in', line=line.rstrip('\n'))
+        if turns is None:
+            run_turn(number, line)
+        elif number <= len(turns):
+            for recorded in turns[number - 1]:
+                stub.write_line(recorded)
+
+
+main()

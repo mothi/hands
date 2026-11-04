@@ -8,30 +8,23 @@ permissions:
   contents: read
 
 jobs:
-  macos:
-    runs-on: macos-latest
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - name: hands selftest
-        run: bash tests/selftest.sh
-      - name: ACP suite
-        run: python3 tests/test_acp.py
-      - name: quota suite
-        run: python3 tests/test_quota.py
-
-  # Linux is untested; this job reports how far the suites get.
-  ubuntu:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - name: hands selftest
-        run: bash tests/selftest.sh
-      - name: ACP suite
+      - uses: actions/checkout@v5
+      - name: wires suite
+        run: python3 tests/test_wires.py
+      - name: cli suite
         if: always()
-        run: python3 tests/test_acp.py
+        run: python3 tests/test_cli.py
+      - name: seat suite
+        if: always()
+        run: python3 tests/test_seat.py
       - name: quota suite
         if: always()
         run: python3 tests/test_quota.py
