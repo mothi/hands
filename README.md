@@ -12,7 +12,8 @@ credentials: each CLI uses its own login.
 > **Read § Security model first.** A seat is a coding agent with full access to your machine,
 > running as you.
 
-Built and tested on macOS. Linux is untested.
+Runs on macOS and Linux. The test suites pass on both in CI, against stub CLIs; the real
+provider CLIs have only been run on macOS.
 
 ## Words used here
 
@@ -54,7 +55,7 @@ Report vulnerabilities privately: see [SECURITY.md](SECURITY.md).
 
 ## Prerequisites
 
-- macOS (tested) with `python3` 3.7 or later, `curl` (the Grok and OpenCode gauges), and `ps`
+- macOS or Linux, with `python3` 3.7 or later, `curl` (the Grok and OpenCode gauges), and `ps`
 - at least one provider CLI, logged in with its own login:
   [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`),
   [Codex](https://github.com/openai/codex) (`codex`), Grok (`grok`), or

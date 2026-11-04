@@ -461,7 +461,9 @@ class AcpClose(SeatChecks):
         job, _ = SB.start('acp-mail', GROK, '--effort', 'low', '--cwd', SB.path('tmp'),
                           STUB_MODE='slow', STUB_SLEEP='4')
         SB.hands('mail', job, 'while you work')
-        self.assertTrue(file_exists(job, 'turn-2', 'envelope.json'))
+        # two 4-second turns: more than the default 10-second wait on a slow runner
+        self.assertTrue(wait_until(lambda: os.path.exists(
+            os.path.join(job, 'turn-2', 'envelope.json')), 30))
         SB.stop(job)
         found = events(job)
         marker = first_index(found, lambda e: e['kind'] == 'progress' and e.get('inbox') == 1)
