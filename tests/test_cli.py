@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Tests for hands.py: the command line, the job dir and prompt it makes, the probe, the verbs
-(send, mail, wait, events), the events view and the 30-day sweep of the jobs root.
+(send, mail, wait, events), the events view, the live-seat list and the 30-day sweep of the
+jobs root.
 
 Stub CLIs stand in for the providers (tests/stubs). Run: python3 tests/test_cli.py"""
+import contextlib
+import datetime
 import errno
 import fcntl
+import io
 import json
 import os
 import re
@@ -13,6 +17,7 @@ import signal
 import subprocess
 import time
 import unittest
+from unittest import mock
 
 import harness
 from harness import envelope, events, read_text, wait_until
@@ -328,6 +333,64 @@ class Verbs(unittest.TestCase):
         pools = json.loads(run.out)['pools']
         self.assertEqual([(p['pool'], p['status']) for p in pools], [('claude', 'unknown')])
         self.assertIn('--probe claude', pools[0]['why'])
+
+
+class LiveSeats(unittest.TestCase):
+    """`hands.sh ps`: one line per live seat."""
+
+    def test_ps_lists_each_live_seat_until_it_stops(self):
+        job, _ = SB.start('ps seat', 'claude:sonnet', STUB_MODE='slow', STUB_SLEEP='4')
+
+        def line():   # the seat's line: a dir with a space in it is found whole
+            found = [x for x in SB.hands('ps').out.splitlines() if x.endswith(' · ' + job)]
+            return found[0] if found else ''
+
+        self.assertTrue(wait_until(lambda: 'running turn 1 · last event' in line()))
+        self.assertTrue(line().startswith('claude:sonnet '))
+        SB.wait(job, '--timeout', '30')
+        self.assertTrue(wait_until(lambda: 'idle after turn 1 ok · ' in line()))
+        SB.stop(job)
+        self.assertTrue(wait_until(lambda: line() == ''))
+
+    def test_each_seat_shows_what_it_is_doing(self):
+        job = SB.path('ps-states')
+        os.makedirs(job)
+        with open(os.path.join(job, 'envelope.json'), 'w') as f:
+            f.write('{"status":"ok","turn":1}\n')
+        start, end = {'kind': 'turn_start', 'turn': 1}, {'kind': 'turn_end', 'turn': 1}
+        second = {'kind': 'progress', 'turn': 1, 'expect': 2}
+        cases = [([], 'starting turn 1'),
+                 ([{'kind': 'progress', 'turn': 1, 'expect': 1}], 'starting turn 1'),
+                 ([start], 'running turn 1'),
+                 ([start, second], 'running turn 1 (1 queued)'),
+                 ([start, end], 'idle after turn 1 ok'),
+                 ([start, end, second], 'starting turn 2')]
+        for lines, shown in cases:
+            with open(os.path.join(job, 'events.jsonl'), 'w') as f:
+                f.write(''.join(json.dumps(line) + '\n' for line in lines))
+            self.assertEqual(hands.doing(job, seat.SeatState(job).read()), shown)
+
+    def test_the_last_event_shows_its_age(self):
+        def stamp(seconds):
+            then = datetime.datetime.now().astimezone() - datetime.timedelta(seconds=seconds)
+            return then.isoformat(timespec='seconds')
+
+        self.assertEqual(hands.ago(None), 'no events yet')
+        self.assertRegex(hands.ago(stamp(7)), r'^last event [78]s ago$')
+        self.assertEqual(hands.ago(stamp(125)), 'last event 2m ago')
+        self.assertEqual(hands.ago(stamp(3 * 3600 + 10)), 'last event 3h ago')
+        self.assertEqual(hands.ago(stamp(2 * 86400 + 3600)), 'last event 2d ago')
+
+    def test_ps_with_no_live_seat_says_so(self):
+        err = io.StringIO()
+        with mock.patch.object(hands, 'live_dirs', return_value=[]), \
+                contextlib.redirect_stderr(err):
+            self.assertEqual(hands.ps(), 0)
+        self.assertEqual(err.getvalue(), 'hands: no live seats\n')
+
+    def test_ps_takes_no_arguments(self):
+        run = SB.hands('ps', '--json')
+        self.assertEqual((run.rc, run.out, run.err), (2, '', 'hands: usage: hands.sh ps\n'))
 
 
 class EventsView(unittest.TestCase):

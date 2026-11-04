@@ -157,6 +157,7 @@ to keep.
 | `mail DIR TEXT` | appends a driver line to `DIR/inbox.jsonl`; the live wrapper delivers it as `MAIL from driver` (it never cancels a running turn) | nothing, 0. 1 when no wrapper is live (the line waits for the next launch). 2 when the inbox is a link or not a regular file |
 | `wait DIR [--for turn\|mail\|exit] [--timeout S]` | blocks, spending nothing, until every sent turn ends (`turn`), the seat's next outbox line (`mail`), or the wrapper exits (`exit`) | the answer if ok, then the envelope; 0 if ok, else 1. At the timeout: `{"status":"running","last_event","open_tool_calls",...}`, 1 |
 | `events DIR [--follow]` | a readable view of `DIR/events.jsonl`: text blocks, one line per tool call, turn and usage lines with the cache-hit %, errors. `--follow` ends when the seat does. The raw stream is `tail -f DIR/events.jsonl` | text, 0 |
+| `ps` | every live seat on this machine, found by its wrapper's command line (so `--out` dirs too): provider and model, `running turn N` (with how many are queued), `starting turn N` or `idle after turn N <status>`, the age of its last event, and its dir | one line per seat, 0. With none: `hands: no live seats` on stderr, 0 |
 | `quota [--json] [provider ...]` | the quota board: one line per provider (§ Quota gauges). Read-only: it never spends | the board, 0 |
 | `stop DIR` | the wrapper closes its CLI as at its deadline (stdin EOF, then TERM at 2 s, KILL at 4 s) and types the open turn and every queued one `incomplete`, rc 143; what is left at 10 s is TERMed, then KILLed | the envelope, 0 (1 if a wrapper survived) |
 
@@ -275,9 +276,13 @@ a spent pool ends `provider-quota-dead` with the reset time.
 
 - **Claude Code:** with the skill linked, say "hands: ask codex to review this" or run `/hands`.
   Turn ends, mail and errors arrive as pushes, so the session doesn't poll. Run real work with
-  `start` and never block the session on a foreground `wait`.
+  `start` and never block the session on a foreground `wait`. The skill has the agent run
+  `events DIR --follow` as a background command after each `start`, so every seat is a row in
+  the task list with its live view, ending when the seat stops.
 - **Codex:** skills load from `~/.agents/skills`; invoke `$hands`, or run the script.
 - **Any other shell or CI:** it's a plain script. Use `wait` instead of pushes.
+- **Anywhere:** `hands.sh ps` lists the live seats, and `hands.sh events DIR --follow` in a
+  terminal shows one as it works.
 
 Saying just **`hands`** in a host session runs a guided setup: the quota board, then a few
 questions (the task, the seat, the `--cwd` when it's unclear, the effort for an ACP or Codex
@@ -330,7 +335,7 @@ CLI the way a deadline does and writes the last envelopes.
 | File | What it holds |
 |---|---|
 | `hands.sh` | the launcher: runs `hands.py` |
-| `hands.py` | the command line and its flags, the job dir and its handle, the seat contract (`SEAT_BOX`), the verbs, the events view, the probe and the 30-day sweep |
+| `hands.py` | the command line and its flags, the job dir and its handle, the seat contract (`SEAT_BOX`), the verbs, the events view, the live-seat list (`ps`), the probe and the 30-day sweep |
 | `seat.py` | the wrapper: its loop, deliveries and the delivery lock, closing turns into envelopes, pushes to the driver, failure types, and the reaper |
 | `wires.py` | the provider table (`PROVIDERS`), each CLI's command and handshake, the JSON-RPC and ACP clients, and the translators that turn each CLI's output into events |
 | `quota.py` | the quota board behind `hands.sh quota` |

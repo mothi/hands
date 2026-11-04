@@ -13,6 +13,7 @@ job dir keeps the host's push socket path and token: README, Security model).
         wait until the turn ends, then print the answer and the envelope
   hands.sh events DIR [--follow]  a readable view of DIR/events.jsonl
   hands.sh stop DIR               close the seat as its deadline does; its envelope still lands
+  hands.sh ps                     every live seat: what it is doing, its last event, its dir
   hands.sh --probe [claude|codex|grok|opencode|all]
         a one-token ping per provider (it spends a little quota)
   hands.sh quota [--json] [provider ...]
@@ -37,6 +38,7 @@ envelope: {"status":"ok|error|incomplete|cancelled|truncated|timeout|auth-expire
   exit 0 ok, 1 any other status, 2 refused or a usage error. README.md is the manual;
   CONTRIBUTING.md has the engine's rules.
 """
+import datetime
 import fcntl
 import json
 import math
@@ -529,6 +531,65 @@ def events(job_dir, follow):
 
 
 # ---------------------------------------------------------------------------------------------
+# Live seats, for `hands.sh ps`
+
+
+def ps():
+    """Print one line per live seat: its provider and model, what it is doing, when its last
+    event came, and its dir."""
+    job_dirs = live_dirs()
+    if not job_dirs:
+        say('no live seats')
+    for job_dir in job_dirs:
+        handle = seat.read_json(os.path.join(job_dir, 'session')) or {}
+        state = seat.SeatState(job_dir).read()
+        name = ':'.join(part for part in (handle.get('provider'), handle.get('model')) if part)
+        print('%-24s %s · %s · %s' % (name, doing(job_dir, state), ago(state.last_event),
+                                      job_dir))
+    return 0
+
+
+def live_dirs():
+    """The job dir of every live wrapper on this machine, found by its command line (seat.py
+    spawn DIR FILE), so a seat started with --out is found too."""
+    found = set()
+    for command in (row[3] for row in seat.process_table()):
+        if 'seat.py' not in command or ' spawn ' not in command:
+            continue
+        words = command.split(' spawn ', 1)[1].split(' ')
+        for count in range(1, len(words)):   # the dir may hold spaces; the message file follows
+            job_dir = ' '.join(words[:count])
+            if os.path.isfile(os.path.join(job_dir, 'session')):
+                found.add(job_dir)
+                break
+    return sorted(found)
+
+
+def doing(job_dir, state):
+    """What a live seat is doing: running a turn (with any queued behind it), starting one, or
+    idle after its last turn."""
+    if state.turn > state.ended:
+        queued = state.expected - state.turn
+        return 'running turn %d%s' % (state.turn, ' (%d queued)' % queued if queued > 0 else '')
+    if state.expected > state.ended or not state.ended:
+        return 'starting turn %d' % max(state.expected, 1)
+    envelope = seat.read_json(os.path.join(job_dir, 'envelope.json')) or {}
+    return 'idle after turn %d %s' % (state.ended, envelope.get('status') or '')
+
+
+def ago(stamp):
+    """An event time as 'last event 4s ago' (or m, h, d)."""
+    try:
+        seconds = time.time() - datetime.datetime.fromisoformat(stamp).timestamp()
+    except (TypeError, ValueError):
+        return 'no events yet'
+    for unit, size in (('d', 86400), ('h', 3600), ('m', 60)):
+        if seconds >= size:
+            return 'last event %d%s ago' % (seconds // size, unit)
+    return 'last event %ds ago' % max(0, seconds)
+
+
+# ---------------------------------------------------------------------------------------------
 # The 30-day sweep of the jobs root
 
 
@@ -650,6 +711,11 @@ def probe_line(status, provider, rc):
 def main(args):
     if args[:1] == ['quota']:
         return quota.main(args[1:])
+    if args[:1] == ['ps']:
+        if len(args) != 1:
+            say('usage: hands.sh ps')
+            return 2
+        return ps()
     if args[:1] == ['send']:
         if len(args) != 3:
             say('usage: hands.sh send DIR FILE')

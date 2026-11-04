@@ -16,6 +16,7 @@ $H send DIR /tmp/followup.md       # the next turn; a stopped seat resumes its s
 $H mail DIR "run the lint first"   # a note the live seat gets as "MAIL from driver"
 $H wait DIR                        # the answer (when ok), then the envelope line
 $H events DIR --follow             # a readable live view; it ends with the seat
+$H ps                              # every live seat: what it is doing, its last event, its dir
 $H stop DIR                        # closes the CLI; the envelope still lands
 $H --cwd /path/repo claude:opus /tmp/task.md   # one-shot: start, wait, stop (short tasks only)
 $H --probe all                     # a 1-token ping per provider (it spends a little)
@@ -27,6 +28,10 @@ $H quota                           # the quota board: read-only, it never spends
 - Buy real work with `start` and keep working. Never run `wait` in the foreground: it blocks
   your session for the whole turn. In Claude Code each turn's answer arrives as a push;
   elsewhere run `wait` as a background command, or poll `wait DIR --timeout 60`.
+- Let the user watch each seat. Right after `start`, run `hands.sh events DIR --follow` as a
+  background command (in Claude Code, Bash with `run_in_background`; never Monitor, which feeds
+  every line to you): it shows the user the seat's live view and ends when the seat stops. Don't
+  read its output; the push or `wait` brings the answer. `hands.sh ps` lists every live seat.
 - A seat has no deadline unless `--timeout` names one. When its work is done, stop it with
   `hands.sh stop DIR`, never by killing a process.
 - A seat runs as the user with full read and write access. Point it at a worktree or a scratch
