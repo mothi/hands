@@ -87,7 +87,7 @@ def empty(path):
 
 def emit(job_dir, status, provider, model, rc, options, reset='', reason=''):
     """Write DIR/envelope.json (seat.py's one envelope writer) and print it."""
-    seat.envelope(job_dir, status, provider, model, rc, 0, reset, None, options.effort,
+    seat.write_envelope(job_dir, status, provider, model, rc, 0, reset, None, options.effort,
                   reason=reason or None)
     with open(os.path.join(job_dir, 'envelope.json')) as f:
         sys.stdout.write(f.read())
@@ -189,7 +189,7 @@ def launch(provider, model, job_dir, options):
     if ack.returncode == 2:   # refused before any prompt: that envelope is the answer
         sys.stdout.write(ack.stdout)
         return 2
-    rc = wait(job_dir, seat.jload(os.path.join(job_dir, 'session')), 'turn', None)
+    rc = wait(job_dir, seat.read_json(os.path.join(job_dir, 'session')), 'turn', None)
     sys.stdout.flush()
     stop(job_dir)
     return rc
@@ -228,7 +228,7 @@ def send(job_dir, message_file):
     rc = seat.main(['send', job_dir, message_file])
     if rc != 3:
         return rc
-    handle = seat.jload(os.path.join(job_dir, 'session'))
+    handle = seat.read_json(os.path.join(job_dir, 'session'))
     options = Options()
     options.effort = handle.get('effort') or ''
     if not handle.get('session'):
@@ -241,37 +241,37 @@ def send(job_dir, message_file):
 
 
 def report(d):   # the sync buy's contract: the answer (on ok), then the envelope line
-    env = seat.jload(os.path.join(d, 'envelope.json'))
+    env = seat.read_json(os.path.join(d, 'envelope.json'))
     if env is None:
-        print(seat.dump({'status': 'error', 'dir': d, 'reason': 'no envelope'}))
+        print(seat.one_line({'status': 'error', 'dir': d, 'reason': 'no envelope'}))
         return 1
     if env.get('status') == 'ok':   # an ok envelope always names its turn, whose result.txt landed first
         with open(os.path.join(d, 'turn-%s' % env['turn'], 'result.txt')) as f:
             print(f.read().rstrip('\n'))
-    print(seat.shown(env))
+    print(seat.printed(env))
     return 0 if env.get('status') == 'ok' else 1
 
 
 def wait(d, h, mode, timeout):
-    t0, st, box, i = time.time(), seat.State(d), os.path.join(d, 'outbox.jsonl'), 0
-    m0 = seat.size(box)
+    t0, st, box, i = time.time(), seat.SeatState(d), os.path.join(d, 'outbox.jsonl'), 0
+    m0 = seat.file_size(box)
     while True:
         st.read()
-        if mode == 'mail' and seat.size(box) > m0:
-            sys.stdout.write(seat.tail(box, m0)[0])
+        if mode == 'mail' and seat.file_size(box) > m0:
+            sys.stdout.write(seat.read_lines(box, m0)[0])
             return 0
-        if h and mode != 'exit' and st.expect and st.end >= st.expect:   # an idle seat mails nothing more
+        if h and mode != 'exit' and st.expected and st.ended >= st.expected:   # an idle seat mails nothing more
             return report(d)
         if i % 4 == 0 and not (seat.wrappers(d) if h else not os.path.exists(os.path.join(d, 'envelope.json'))):
-            if h and st.read().expect and st.end < st.expect:   # a sent turn never ended, and no wrapper is left to end it:
+            if h and st.read().expected and st.ended < st.expected:   # a sent turn never ended, and no wrapper is left to end it:
                 # never the previous turn's answer as this one's (the next send relaunches and closes it incomplete)
-                print(seat.dump({'status': 'incomplete', 'reason': 'wrapper-gone', 'dir': d, 'turn': st.expect,
+                print(seat.one_line({'status': 'incomplete', 'reason': 'wrapper-gone', 'dir': d, 'turn': st.expected,
                             'session': h.get('session')}))
                 return 1
             return report(d)
         if timeout is not None and time.time() - t0 >= timeout:
-            print(seat.dump({'status': 'running', 'dir': d, 'turn': st.turn, 'expect': st.expect, 'last_event': st.t,
-                              'open_tool_calls': len(st.open)}))
+            print(seat.one_line({'status': 'running', 'dir': d, 'turn': st.turn, 'expect': st.expected, 'last_event': st.last_event,
+                              'open_tool_calls': len(st.open_calls)}))
             return 1
         i += 1
         time.sleep(0.25)
@@ -286,14 +286,14 @@ def stop(d):   # TERM the seat's wrappers: each closes its CLI as at its deadlin
         ws = seat.wrappers(d)
         if not ws:
             break
-        groups = groups or seat.seat_groups([w[0] for w in ws])
+        groups = groups or seat.groups_under([w[0] for w in ws])
         for w in ws:
             try:
                 os.kill(w[0], signal.SIGTERM)
             except OSError:
                 pass
         if time.time() - t0 >= 10:
-            seat.term(groups, signal.SIGTERM if time.time() - t0 < 15 else signal.SIGKILL)
+            seat.signal_groups(groups, signal.SIGTERM if time.time() - t0 < 15 else signal.SIGKILL)
         time.sleep(0.2)
     return 1 if seat.wrappers(d) else 0
 
@@ -360,7 +360,7 @@ def events(d, follow):   # THE view, one-shot or followed; --follow ends with th
     v, off = View(), 0   # BEFORE the read) and the file drained
     while True:
         live = follow and seat.wrappers(d)
-        text, off = seat.tail(os.path.join(d, 'events.jsonl'), off)
+        text, off = seat.read_lines(os.path.join(d, 'events.jsonl'), off)
         sys.stdout.write(v.feed(text) + ('' if live else v.close()))
         sys.stdout.flush()
         if not live:
@@ -390,7 +390,7 @@ def sweep():   # THE RETENTION, at every buy and probe, before it makes its dir 
             shutil.rmtree(p, ignore_errors=True)
             continue
         try:
-            fd = seat.opened(os.path.join(p, 'job.log'), os.O_WRONLY | os.O_APPEND)
+            fd = seat.open_regular(os.path.join(p, 'job.log'), os.O_WRONLY | os.O_APPEND)
         except FileNotFoundError:
             fd = None
         except OSError:
@@ -433,12 +433,12 @@ def verb(a):
         say('usage: hands.sh %s DIR ...' % cmd)
         return 2
     d = os.path.realpath(a[1])
-    h = seat.jload(os.path.join(d, 'session'))
+    h = seat.read_json(os.path.join(d, 'session'))
     if cmd == 'mail':   # the driver's line; the seat's live wrapper delivers it
         if len(a) < 3:
             return 2
         try:   # opened like any engine append: never through a link the seat planted
-            seat.append(os.path.join(d, 'inbox.jsonl'), {'t': wires.now(), 'from': 'driver', 'text': ' '.join(a[2:])})
+            seat.append_json(os.path.join(d, 'inbox.jsonl'), {'t': wires.now(), 'from': 'driver', 'text': ' '.join(a[2:])})
         except OSError as e:
             say('%s/inbox.jsonl: %s -- not written' % (d, e.strerror or e))
             return 2
@@ -452,9 +452,9 @@ def verb(a):
         return wait(d, h, mode, tmo) if mode in ('turn', 'mail', 'exit') else 2
     if cmd == 'events':
         return events(d, '--follow' in a)
-    rc, env = stop(d), seat.jload(os.path.join(d, 'envelope.json'))
+    rc, env = stop(d), seat.read_json(os.path.join(d, 'envelope.json'))
     if env:
-        print(seat.shown(env))
+        print(seat.printed(env))
     return rc
 
 
