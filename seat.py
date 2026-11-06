@@ -124,9 +124,12 @@ def read_lines(path, offset):
 # Failure types. They come from a provider's error fields and the CLI's stderr, never from what
 # the model wrote: a model that quotes an error message does not fail its turn.
 
+# Subscription windows and balances, then API-key billing: Anthropic's credit balance, OpenAI's
+# insufficient_quota, and a gateway's 402 (OpenRouter's wording) under an opencode seat.
 QUOTA_TEXT = re.compile(r'usage balance exhausted|hit your (usage|session|weekly) limit|'
                         r'usage limit reached|quota exceeded|spending.?limit|'
-                        r'(run )?out of credits', re.I)
+                        r'(run )?out of credits|credit balance is too low|insufficient[_ ]quota|'
+                        r'exceeded your current quota|insufficient credits', re.I)
 RESET_TEXT = re.compile(r'resets? (at )?[A-Za-z0-9:. apm/-]{3,40}|again at [A-Za-z0-9:, ]{3,40}',
                         re.I)
 AUTH_TEXT = re.compile(r'grok login|not logged in|login required|unauthorized|'

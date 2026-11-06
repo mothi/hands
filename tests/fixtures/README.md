@@ -22,6 +22,9 @@ The test classes named below are in `tests/test_seat.py` unless another file is 
 | grok-403-spending | live probe (verbatim error) | `FailureText` |
 | claude-session-limit | live seat (agent notice wording, time zone set to UTC) | `FailureText`, with its reset |
 | codex-usage-limit | wording approximated from a live record | `FailureText`, with its reset; `CodexSeats`: failures typed from error fields |
+| claude-api-credit-low | Anthropic's documented credit-balance error, as Claude Code prints an API error (approximated, not recorded) | `FailureText`; `ClaudeSeats`: an API-key seat out of credit |
+| codex-api-insufficient-quota | OpenAI's documented `insufficient_quota` body behind a 429 (approximated, not recorded) | `FailureText`; `CodexSeats`: an API-key seat out of credit |
+| opencode-openrouter-402 | OpenRouter's insufficient-credits wording in an ACP error (approximated, not recorded) | `FailureText` |
 | grok-auth-expired | grok's documented login wording | `FailureText` |
 | claude-oauth-expired | a seat that died on an expired login (its result.txt) | `FailureText` |
 | opencode-missing-api-key | an OpenCode ACP seat on an empty store, never logged in: the error answering `session/prompt` | `AcpLaunch`: a missing login is auth-expired |

@@ -192,7 +192,7 @@ field:
 | `truncated` | the turn hit the model's output limit | `send` to continue |
 | `timeout` | `--timeout` expired; `session` is kept | `send` to continue, or raise the timeout |
 | `auth-expired` | the CLI needs a login | run that provider's login |
-| `provider-quota-dead` | the subscription window or balance is spent | if `reset` names a time, wait until then and don't retry before it. `reset: null` (a Grok spending limit) needs a top-up |
+| `provider-quota-dead` | the subscription window or balance is spent, or an API key's credit is (Anthropic's credit balance, OpenAI's `insufficient_quota`, a gateway's insufficient credits) | if `reset` names a time, wait until then and don't retry before it. `reset: null` (a Grok spending limit, an API key out of credit) needs a top-up |
 | `not-installed` | the CLI isn't on your PATH | install it |
 | `refused` | typed before any prompt; `reason`: `model-mismatch`, `effort-unsupported`, `model-required`, `no-session` | fix the buy |
 
@@ -325,6 +325,7 @@ seat), and the exact command is shown before it runs.
 |---|---|
 | `provider-quota-dead` with a `reset` time | wait until then |
 | `provider-quota-dead`, `reset: null` (Grok) | a spending limit; add credits |
+| `provider-quota-dead`, `reset: null` (an API key) | the key's account is out of credit; add credits in that provider's billing console |
 | `auth-expired` | run `claude`, `codex login`, `grok login` or `opencode auth login` |
 | `wait` prints `running` | the turn is still going. A long tool call is alive; a stale `last_event` with no open tool call is stuck: `stop`, then `send` |
 | `refused`, `effort-unsupported` or `model-mismatch` | pass an effort the model lists, and a model the agent lists (the refusal names them) |

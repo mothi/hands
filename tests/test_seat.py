@@ -596,6 +596,10 @@ class CodexSeats(SeatChecks):
                                     'quoted': 'ok',                         # a quote is text
                                     'quotedfail': 'error'})
         self.assertIn('Aug', envelope(SB.path('codex-fail-quota'))['reset'])
+        billing = read_text(os.path.join(harness.FIXTURES, 'codex-api-insufficient-quota.txt'))
+        job, _ = SB.buy('codex-fail-billing', CODEX, '--cwd', SB.work, STUB_MODE='quota',
+                        STUB_FAIL_TEXT=billing.strip())
+        self.assertEqual(envelope(job)['status'], 'provider-quota-dead')
         # the turn the dead app-server cut keeps the usage it reported, normalized
         self.assertEqual(envelope(SB.path('codex-fail-noticedeath'))['usage'],
                          {'in': 4, 'out': 2, 'cache_read': 2, 'reasoning': 1})
@@ -987,6 +991,12 @@ class ClaudeSeats(SeatChecks):
         self.assertEqual(statuses['quota'][0], 'provider-quota-dead')
         self.assertIn('resets 6:20am', envelope(SB.path('claude-fail-quota'))['reset'])
         self.assertEqual(statuses['authfail'][0], 'auth-expired')
+        # an API-key seat out of credit: the same type, with no reset to wait for
+        credit = read_text(os.path.join(harness.FIXTURES, 'claude-api-credit-low.txt'))
+        job, _ = SB.buy('claude-fail-credit', CLAUDE, '--cwd', SB.path('tmp'), STUB_MODE='quota',
+                        STUB_FAIL_TEXT=credit.strip())
+        self.assertEqual((envelope(job)['status'], envelope(job)['reset']),
+                         ('provider-quota-dead', None))
 
     def test_a_deadline_mid_turn_is_a_timeout_that_keeps_its_session(self):
         for mode in ('park', 'deaf'):   # deaf ignores the TERM too: only the KILL ends it
@@ -1547,6 +1557,11 @@ class FailureText(unittest.TestCase):
             self.assertEqual(self.classify(name + '.txt')[0], 'provider-quota-dead', name)
         self.assertIn('resets 6:20am', self.classify('claude-session-limit.txt')[1].lower())
         self.assertIn('again at aug', self.classify('codex-usage-limit.txt')[1].lower())
+
+    def test_api_key_billing_is_provider_quota_dead_with_no_reset(self):
+        for name in ('claude-api-credit-low', 'codex-api-insufficient-quota',
+                     'opencode-openrouter-402'):
+            self.assertEqual(self.classify(name + '.txt'), ('provider-quota-dead', ''), name)
 
     def test_logins_are_auth_expired(self):
         for name in ('grok-auth-expired', 'claude-oauth-expired', 'opencode-go-no-credential'):

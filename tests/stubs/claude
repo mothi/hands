@@ -15,7 +15,7 @@ STUB_MODE picks how each turn goes:
   newsid      answer on another session (a resume that started a fresh one)
   quoted      an ok answer that quotes a usage-limit line
   quotedfail  a failed turn whose text quotes a usage-limit line
-  quota       an is_error result carrying the usage-limit text
+  quota       an is_error result carrying the usage-limit text (or STUB_FAIL_TEXT)
   authfail    a login failure on stderr
 """
 import json
@@ -92,7 +92,8 @@ def run_turn(number, line):
         failed('API Error: 500 Internal server error')
     elif MODE == 'quota':
         stub.write_line({'type': 'result', 'subtype': 'success', 'is_error': True,
-                         'result': 'Claude AI usage limit reached, resets 6:20am',
+                         'result': stub.setting('FAIL_TEXT',
+                                                'Claude AI usage limit reached, resets 6:20am'),
                          'session_id': SESSION})
     else:
         if MODE == 'straggler':

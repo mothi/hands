@@ -1,0 +1,1 @@
+-32603 Internal error: Insufficient credits. Add more using https://openrouter.ai/settings/credits
