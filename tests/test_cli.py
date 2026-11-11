@@ -300,7 +300,8 @@ class Verbs(unittest.TestCase):
         self.assertNotIn('": ', sent.out + running.out)
 
     def test_wait_after_the_wrapper_died_mid_turn_is_incomplete(self):
-        job, _ = SB.start('wrapper-died', 'claude:sonnet', STUB_MODE='slow', STUB_SLEEP='8')
+        job, _ = SB.start('wrapper-died', 'claude:sonnet', '--idle', '60', STUB_MODE='slow',
+                          STUB_SLEEP='8')
         SB.wait(job, '--timeout', '60')
         SB.send(job)
         self.assertTrue(wait_until(lambda: any(e['kind'] == 'turn_start' and e['turn'] == 2
@@ -339,7 +340,8 @@ class LiveSeats(unittest.TestCase):
     """`hands.sh ps`: one line per live seat."""
 
     def test_ps_lists_each_live_seat_until_it_stops(self):
-        job, _ = SB.start('ps seat', 'claude:sonnet', STUB_MODE='slow', STUB_SLEEP='4')
+        job, _ = SB.start('ps seat', 'claude:sonnet', '--idle', '60', STUB_MODE='slow',
+                          STUB_SLEEP='4')
 
         def line():   # the seat's line: a dir with a space in it is found whole
             found = [x for x in SB.hands('ps').out.splitlines() if x.endswith(' · ' + job)]
@@ -351,6 +353,16 @@ class LiveSeats(unittest.TestCase):
         self.assertTrue(wait_until(lambda: 'idle after turn 1 ok · ' in line()))
         SB.stop(job)
         self.assertTrue(wait_until(lambda: line() == ''))
+
+    def test_a_seat_leaves_ps_by_itself_when_its_turn_ends(self):
+        job, _ = SB.start('ps-leaves', 'claude:sonnet')
+
+        def listed():
+            return [x for x in SB.hands('ps').out.splitlines() if x.endswith(' · ' + job)]
+
+        SB.wait(job, '--timeout', '30')
+        self.assertTrue(wait_until(lambda: listed() == []))   # no stop: the wrapper left
+        self.assertEqual(SB.stub_log(job).seats()[0].ended, ['eof'])
 
     def test_each_seat_shows_what_it_is_doing(self):
         job = SB.path('ps-states')
@@ -384,6 +396,7 @@ class LiveSeats(unittest.TestCase):
     def test_ps_with_no_live_seat_says_so(self):
         err = io.StringIO()
         with mock.patch.object(hands.seat, 'live_seats', return_value=[]), \
+                mock.patch.object(hands.seat, 'parked_seats', return_value=[]), \
                 contextlib.redirect_stderr(err):
             self.assertEqual(hands.ps(), 0)
         self.assertEqual(err.getvalue(), 'hands: no live seats\n')
@@ -450,6 +463,15 @@ class EventsView(unittest.TestCase):
         self.assertEqual(follower.returncode, 0)
         closing = re.findall(r'^── turn (\d+) ([a-z-]+)', out, re.M)
         self.assertEqual(closing, [('1', 'incomplete')])   # the stopped turn is its last news
+
+    def test_follow_ends_with_the_turn(self):
+        job, _ = SB.start('follow-turn', 'claude:sonnet', STUB_MODE='slow', STUB_SLEEP='2')
+        follower = SB.popen('events', job, '--follow')
+        out, _ = follower.communicate(timeout=30)   # no stop: the seat ended with its turn
+        self.assertEqual(follower.returncode, 0)
+        closing = re.findall(r'^── turn (\d+) ([a-z-]+)', out, re.M)
+        self.assertEqual(closing, [('1', 'ok')])
+        self.assertEqual(harness.wrapper_pids(job), [])
 
 
 class JobsRoot(unittest.TestCase):

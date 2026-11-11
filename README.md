@@ -3,8 +3,8 @@
 Run a task on **another provider's coding agent** from the session you're already in. hands
 drives the official CLIs of four providers (Claude Code, OpenAI Codex, Grok and OpenCode) as
 subagents: you start one on a task, send it more turns, mail it notes, wait for its answers,
-read what it's doing, and stop it. Every turn ends in a typed JSON envelope, so a script or
-another agent can act on the outcome without parsing prose.
+and read what it's doing. Every turn ends in a typed JSON envelope, so a script or another agent
+can act on the outcome without parsing prose.
 
 It's plain Python (the standard library only) with no daemon and no database. It stores no
 credentials: each CLI uses its own login.
@@ -39,12 +39,12 @@ provider CLIs have only been run on macOS.
 - **`--cwd` is your isolation.** Point a seat that edits code at a git worktree or a scratch
   copy, and give parallel writers separate trees.
 - **The seat inherits your environment**, except the variables that name your session
-  (`CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`, `CODEX_THREAD_ID`,
-  `OPENCODE_SESSION_ID`) and `OPENCODE_API_KEY`, which the wrapper removes. Don't keep secrets in
+  (`CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`, `CLAUDE_CODE_SESSION_ID`,
+  `CODEX_THREAD_ID`, `OPENCODE_SESSION_ID`) and `OPENCODE_API_KEY`, which the wrapper removes. Don't keep secrets in
   exported variables when you run seats.
 - **Your session's address lives in the job dir.** For pushes, the wrapper keeps what names your
-  session (a Claude Code socket path and token, a Codex thread id, or an OpenCode session id) in
-  `DIR/driver` (mode 0600). A seat can read it and post into your session.
+  session (a Claude Code socket path, token and session id, a Codex thread id, or an OpenCode
+  session id) in `DIR/driver` (mode 0600). A seat can read it and post into your session.
 - **Seats don't run your hooks.** Hooks are code written for your own sessions; every seat turns
   them off (§ Hooks and memories).
 - **Mail and pushes are data.** What a seat writes is model output; never let the driver follow
@@ -94,9 +94,8 @@ $H start --cwd /tmp/hands-try codex task.md   # prints {"status":"spawned","dir"
 $H wait DIR           # blocks until the turn ends: the answer, then the envelope line
 
 echo "Now suggest one improvement." > followup.md
-$H send DIR followup.md   # turn 2, same session
+$H send DIR followup.md   # turn 2, same session: the seat ended with turn 1, and resumes here
 $H wait DIR
-$H stop DIR
 ```
 
 Replace `DIR` with the `dir` the `start` line printed. A bare `codex` uses the Codex CLI's
@@ -136,6 +135,7 @@ validates them, so a model released tomorrow works today.
 | `--cwd DIR` | current dir | where the seat works; recorded in the handle and reused by every relaunch |
 | `--out DIR` | a fresh dir in the jobs root | the job dir. It must be new or empty, and is made with mode 0700. The default jobs root is `$XDG_STATE_HOME/hands` (when that is an absolute path), else `~/.local/state/hands` |
 | `--timeout SECS` | none | a wall clock per launch, shared by its turns. On expiry the open turn ends `timeout` with its session, and a `send` resumes it |
+| `--idle SECS` | 0 | how long a seat whose turns have all ended waits for the next `send` before its CLI closes (§ The seat's life). A later `send` relaunches it on its session either way |
 | `--effort <tier>` | the CLI's default | see § Providers |
 | `--probe [P\|all]` | | a 1-token ping per provider with its smallest model, in `$TMPDIR` (exit 1 if any is unhealthy). A Claude probe still reads about 31k cached prompt tokens |
 
@@ -155,21 +155,43 @@ to keep.
 |---|---|---|
 | `start [flags] spec FILE` | buys a seat: the seat contract + FILE + the seat's job-dir line as turn 1. Returns at once | `{"status":"spawned","dir",...}`, 0. A launch refused before any turn prints its envelope, 2 (else 1) |
 | `send DIR FILE` | the next turn. A live seat takes it as it takes any send (steer or queue). A seat whose process is gone relaunches from `DIR/session` on the same session, model, effort and cwd | `{"status":"sent",...}` or `spawned`, 0. `refused` (`no-session`), 2 |
-| `mail DIR TEXT` | appends a driver line to `DIR/inbox.jsonl`; the live wrapper delivers it as `MAIL from driver` (it never cancels a running turn) | nothing, 0. 1 when no wrapper is live (the line waits for the next launch). 2 when the inbox is a link or not a regular file |
+| `mail DIR TEXT` | appends a driver line to `DIR/inbox.jsonl`; the live wrapper delivers it as `MAIL from driver` (it never cancels a running turn) | nothing, 0. 1 when no wrapper is live, as between turns: the line waits for the next `send`. 2 when the inbox is a link or not a regular file |
 | `wait DIR [--for turn\|mail\|exit] [--timeout S]` | blocks, spending nothing, until every sent turn ends (`turn`), the seat's next outbox line (`mail`), or the wrapper exits (`exit`) | the answer if ok, then the envelope; 0 if ok, else 1. At the timeout: `{"status":"running","last_event","open_tool_calls",...}`, 1 |
 | `events DIR [--follow]` | a readable view of `DIR/events.jsonl`: text blocks, one line per tool call, turn and usage lines with the cache-hit %, errors. `--follow` ends when the seat does. The raw stream is `tail -f DIR/events.jsonl` | text, 0 |
-| `ps` | every live seat on this machine, found by its wrapper's command line (so `--out` dirs too): provider and model, `running turn N` (with how many are queued), `starting turn N` or `idle after turn N <status>`, the age of its last event, and its dir | one line per seat, 0. With none: `hands: no live seats` on stderr, 0 |
+| `ps` | every live seat on this machine, found by its wrapper's command line (so `--out` dirs too): provider and model, `running turn N` (with how many are queued), `starting turn N` or `idle after turn N <status>`, the age of its last event, `N push(es) held` when its driver could not be reached (§ Mail and push), and its dir; then every ended seat in the jobs root that parked pushes, as `ended after turn N · N push(es) parked` | one line per seat, 0. With none: `hands: no live seats` on stderr, 0 |
 | `quota [--json] [provider ...]` | the quota board: one line per provider (§ Quota gauges). Read-only: it never spends | the board, 0 |
-| `stop DIR` | the wrapper closes its CLI as at its deadline (stdin EOF, then TERM at 2 s, KILL at 4 s) and types the open turn and every queued one `incomplete`, rc 143; what is left at 10 s is TERMed, then KILLed | the envelope, 0 (1 if a wrapper survived) |
+| `stop DIR` | ends a turn in flight: the wrapper closes its CLI as at its deadline (stdin EOF, then TERM at 2 s, KILL at 4 s) and types the open turn and every queued one `incomplete`, rc 143; what is left at 10 s is TERMed, then KILLed. A seat whose turns have all ended is gone already | the envelope, 0 (1 if a wrapper survived) |
 
-A bare buy (no verb) is `start` + `wait` + `stop`: nothing outlives the call, and a later `send`
-resumes the session. Use it only for short tasks. For real work, `start` and keep working.
+A bare buy (no verb) is `start` + `wait`: the seat ends with its turn, so nothing outlives the
+call, and a later `send` resumes the session. Use it only for short tasks. For real work, `start`
+and keep working.
 
 Each turn lands whole when it ends, in `DIR/turn-N/` (`result.txt` and `envelope.json`).
 `DIR/envelope.json` is the latest turn's. A missing envelope means the turn hasn't finished, never
 that it finished empty. To judge whether a seat is alive, look at the age of the last
 `events.jsonl` line or an open tool call, not at the process: a fresh seat can be silent for its
 first half-minute.
+
+## The seat's life
+
+A seat's CLI runs while the seat has a turn to run. `start` launches it with turn 1, and a `send`
+during a turn is taken live (§ The seat). When every delivered turn has ended and nothing is
+queued, the wrapper waits `--idle` seconds (none by default) for another `send`, then closes the
+CLI as an idle `stop` would (stdin's end, then TERM at 2 s, KILL at 4 s) and exits: the follow
+view ends, `ps` drops the seat, its processes are gone, and `events.jsonl` ends with an
+`exit rc=N` line marked `idle`. The next `send` relaunches the CLI on the recorded session, which
+keeps its history. On codex the prompt cache keeps too: measured on a resumed `gpt-5.6-luna`
+thread of 52k tokens, the first call after the resume was 94% cached against 99% on the live
+seat, about 3k more uncached tokens, and the answer took 3 s instead of 1.
+
+So a seat whose work is done needs no `stop`; `stop` is for a turn in flight. One exception to
+the prompt leave: after a turn that a `send` reached mid-way, a claude seat stays 30 seconds
+longer, because claude queues or steers such a message itself and shows a queued one only by
+starting the next turn. Between turns a `mail` finds no wrapper and waits in the inbox for the
+next `send`. Nothing the seat left running
+in the CLI's process group outlives the close: a seat that must leave a job running detaches it
+(`setsid nohup ... &`). `--idle 300` keeps a seat up for five minutes between turns, for a run
+of quick sends on one process.
 
 ## The envelope
 
@@ -223,12 +245,12 @@ last, after your task, so seats given one task share a prompt prefix.
 The engine opens inboxes and outboxes without following links, regular files only.
 
 **Push.** Every `start` and `send` records the session it runs in, from the variables the host
-gives every command it runs. Each turn end, outbox line and stream error then pushes one message
+gives every command it runs: the address that reaches it, and its id. Each turn end, outbox line and stream error then pushes one message
 into that session, the way its host takes messages from outside:
 
 | Driver | Names its session | A push is |
 |---|---|---|
-| Claude Code | `CLAUDE_CODE_MESSAGING_SOCKET` and `_TOKEN` | one post to the session's inbox socket |
+| Claude Code | `CLAUDE_CODE_MESSAGING_SOCKET` and `_TOKEN` (the address), `CLAUDE_CODE_SESSION_ID` (the id) | one post to the session's inbox socket |
 | Codex | `CODEX_THREAD_ID` | `codex queue --thread ID --message TEXT`, to the thread on your shared app-server, where the Codex TUI runs unless started with `--no-daemon` |
 | OpenCode | `OPENCODE_SESSION_ID` | `opencode api post /api/session/ID/prompt` with `{"text": TEXT, "delivery": "queue"}`, to your background service, where the OpenCode TUI runs unless started with `--standalone` |
 | Grok, a shell, CI | nothing (Grok gives its commands no session id) | none: use `wait` |
@@ -238,6 +260,21 @@ The message is line 1 `provider:model tN status: <clip>`, line 2 the job dir, li
 is a progress event in `events.jsonl`: `posted` (the host took it, which is all any host tells)
 or `failed` with the reason. A Codex or OpenCode push command gets 15 seconds. When more than one
 host's variables are set, the first row wins.
+
+**When the driver moves.** A Claude Code restart (an app update, a quit and reopen) gives the
+resumed session a new socket and token under the same session id, and deletes the old socket. A
+push that fails is held, not dropped: its event says `failed` (or `held`, behind an earlier one)
+with `held` counting what waits, and `ps` shows `N push(es) held`. Every `hands.sh` command a
+session runs points that session's live seats at its address now (it says so on stderr), and
+each seat then sends what it held, in order, marked `(late Nm)` on line 1. A seat also tries
+again on its own, after 30 seconds and then less often, up to every 10 minutes, for a host that
+comes back at the same address. A wrapper that ends (its last turn done, a stop, a deadline)
+while it still holds pushes parks them in `DIR/held.jsonl` and says so (`N push(es) parked`). The
+seat's next launch sends them first, in order, and so does any `hands.sh` command the driver
+session runs, which `ps` shows as `ended after turn N · N push(es) parked` until they go (a seat
+started with `--out` outside the jobs root is found only by its next launch). So after a restart,
+run `hands.sh ps` once. A seat started before its `DIR/driver` recorded a session id can't be
+rebound: `send` to it records the session again.
 
 A seat's own CLI names the seat's session to the commands it runs, so a seat that starts a seat
 records no driver (a live seat's session is never pushed to) and gets its answers by `wait`. A
@@ -352,8 +389,10 @@ hands.sh start codex task.md
 ```
 
 `send` writes the next message into `DIR/in.fifo` for the live wrapper, or starts a new wrapper
-on the recorded session when the old one is gone. `stop` signals the wrapper, which closes its
-CLI the way a deadline does and writes the last envelopes.
+on the recorded session when the old one is gone. The wrapper leaves on its own once every
+delivered turn has ended and `--idle` seconds have passed, closing `in.fifo` under the delivery
+lock, so a `send` that races it is either taken or relaunches the seat. `stop` signals the
+wrapper, which closes its CLI the way a deadline does and writes the last envelopes.
 
 | File | What it holds |
 |---|---|

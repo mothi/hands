@@ -28,7 +28,7 @@ sys.path.insert(0, ROOT)
 # A run inside a driver session (Claude Code, Codex, OpenCode) inherits the variables that name
 # it. No test may push to it, and no stub setting from the outer environment may leak into a test.
 import seat   # here, once ROOT is on the path
-DRIVER_NAMES = {name for names, _ in seat.DRIVER_HOSTS.values() for name in names}
+DRIVER_NAMES = set(seat.DRIVER_NAMES)
 for _name in list(os.environ):
     if _name in DRIVER_NAMES or _name.startswith('STUB_'):
         del os.environ[_name]

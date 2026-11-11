@@ -6,13 +6,15 @@ job dir keeps the host's push socket path and token: README, Security model).
   hands.sh start [opts] provider[:model] prompt-file
         start a seat and return at once: {"status":"spawned","dir":DIR,...}
   hands.sh [opts] provider[:model] prompt-file
-        start a seat, wait for its answer, then stop it
-  hands.sh send DIR FILE          the next turn (a seat whose process is gone relaunches)
+        start a seat and wait for its answer
+  hands.sh send DIR FILE          the next turn (a seat whose process is gone relaunches on its
+        session: a seat's CLI runs while it has a turn, and ends when its last turn ends)
   hands.sh mail DIR TEXT          a driver line, which the seat's live wrapper delivers
   hands.sh wait DIR [--for turn|mail|exit] [--timeout S]
         wait until the turn ends, then print the answer and the envelope
   hands.sh events DIR [--follow]  a readable view of DIR/events.jsonl
-  hands.sh stop DIR               close the seat as its deadline does; its envelope still lands
+  hands.sh stop DIR               end a turn in flight: the seat closes as at its deadline, and
+        its envelope still lands (a seat whose turns have all ended is gone already)
   hands.sh ps                     every live seat: what it is doing, its last event, its dir
   hands.sh --probe [claude|codex|grok|opencode|all]
         a one-token ping per provider (it spends a little quota)
@@ -25,8 +27,9 @@ opts (all before the provider spec; the prompt is always a file):
   --out DIR        the job dir, new or empty, made 0700 (default: a fresh dir in
                    $XDG_STATE_HOME/hands, else ~/.local/state/hands, where every start deletes
                    dirs idle for 30 days)
-  --timeout SECS   a wall clock per launch (default: none; the seat runs until its work ends
-                   or a stop)
+  --timeout SECS   a wall clock per launch (default: none)
+  --idle SECS      how long a seat whose turns have all ended waits for the next send before
+                   its CLI closes (default: 0; a later send relaunches it on its session)
   --effort <tier>  claude, codex: low|medium|high|xhigh|max, passed through (codex adds ultra
                    where it lists it); grok, opencode: required, a value the model lists
                    (grok-4.6: low|medium|high|xhigh)
@@ -95,6 +98,7 @@ class Options:
         self.cwd = os.getcwd()
         self.out = ''
         self.timeout = ''
+        self.idle = ''
         self.effort = ''
         self.probe = ''
         self.start = False   # `start`: return once the seat is spawned
@@ -201,10 +205,11 @@ def end_early(job_dir, status, provider, model, rc, options, reset='', reason=''
 
 def launch(provider, model, job_dir, options):
     """Write the seat's handle, DIR/session, and spawn its wrapper. Without `start`, wait for
-    the answer, then stop the seat.
+    the answer, then stop whatever is left (a seat ends with its turn by itself).
 
     The handle is what every relaunch resumes with: the provider, model and effort, the
-    canonical cwd, the timeout, the CLI's path, and the session id the wrapper records."""
+    canonical cwd, the timeout and the idle grace, the CLI's path, and the session id the
+    wrapper records."""
     cli = cli_path(provider)
     if not cli:
         end_early(job_dir, 'not-installed', provider, model, 0, options)
@@ -214,13 +219,15 @@ def launch(provider, model, job_dir, options):
         end_early(job_dir, 'error', provider, model, 2, options)
         return 2
     timeout = parse_timeout(options.timeout)
-    if timeout is False:
-        say('--timeout takes seconds')
+    idle = parse_timeout(options.idle)
+    bad = '--timeout' if timeout is False else '--idle' if idle is False or (idle or 0) < 0 else ''
+    if bad:
+        say('%s takes seconds' % bad)
         end_early(job_dir, 'error', provider, model, 2, options)
         return 2
     handle = {'provider': provider, 'model': model or None, 'effort': options.effort or None,
-              'cwd': os.path.realpath(options.cwd), 'timeout': timeout, 'cli': cli,
-              'session': None}
+              'cwd': os.path.realpath(options.cwd), 'timeout': timeout, 'idle': idle or None,
+              'cli': cli, 'session': None}
     with open(os.path.join(job_dir, 'session'), 'w') as f:
         f.write(json.dumps(handle, separators=(',', ':')) + '\n')
     prompt = os.path.join(job_dir, 'prompt.txt')
@@ -497,8 +504,19 @@ class EventView:
         elif kind == 'progress' and line.get('expect'):
             out += '> t%s %s\n' % (line['expect'], line.get('text'))
         elif kind == 'progress' and line.get('push') == 'failed':
-            out += '!! %s: %s\n' % (line.get('text'), line.get('error'))
+            out += '!! %s: %s%s\n' % (line.get('text'), line.get('error'), held(line))
+        elif kind == 'progress' and line.get('push') == 'held':
+            out += '!! %s behind a failed one%s\n' % (line.get('text'), held(line))
+        elif kind == 'progress' and line.get('push') == 'posted' and line.get('late'):
+            out += '· %s %ds late%s\n' % (line.get('text'), line['late'], held(line))
+        elif kind == 'progress' and line.get('parked'):
+            out += '!! %s\n' % line.get('text')
         return out
+
+
+def held(line):
+    """A push event's count of what is still held, as its view line ends."""
+    return ' (%d held)' % line['held'] if line.get('held') else ''
 
 
 def usage_line(line):
@@ -536,16 +554,23 @@ def events(job_dir, follow):
 
 def ps():
     """Print one line per live seat: its provider and model, what it is doing, when its last
-    event came, and its dir."""
+    event came, how many pushes it holds for a driver it could not reach (when any), and its
+    dir; then one per ended seat in the jobs root that parked pushes it could not deliver."""
     job_dirs = seat.live_seats()
-    if not job_dirs:
+    parked = [job_dir for job_dir in seat.parked_seats() if job_dir not in job_dirs]
+    if not job_dirs and not parked:
         say('no live seats')
-    for job_dir in job_dirs:
+    for job_dir in job_dirs + parked:
         handle = seat.read_json(os.path.join(job_dir, 'session')) or {}
         state = seat.SeatState(job_dir).read()
         name = ':'.join(part for part in (handle.get('provider'), handle.get('model')) if part)
-        print('%-24s %s · %s · %s' % (name, doing(job_dir, state), ago(state.last_event),
-                                      job_dir))
+        if job_dir in parked:
+            what = 'ended after turn %d' % state.ended
+            held = ' · %d push(es) parked' % state.held_pushes
+        else:
+            what = doing(job_dir, state)
+            held = ' · %d push(es) held' % state.held_pushes if state.held_pushes else ''
+        print('%-24s %s · %s%s · %s' % (name, what, ago(state.last_event), held, job_dir))
     return 0
 
 
@@ -651,8 +676,7 @@ def probe(which):
 
     Claude's ping also refreshes the quota board (its stream's rate_limit_event is the claude
     reading). A probe never pushes to the driver."""
-    driver_names = {name for names, _ in seat.DRIVER_HOSTS.values() for name in names}
-    env = {k: v for k, v in os.environ.items() if k not in driver_names}
+    env = {k: v for k, v in os.environ.items() if k not in seat.DRIVER_NAMES}
     providers = list(wires.PROVIDERS) if which == 'all' else which.split()
     sweep()
     rc = 0
@@ -693,7 +717,23 @@ def probe_line(status, provider, rc):
                       separators=(',', ':'))
 
 
+def rebind():
+    """Point this session's live seats at its address now, and send what its ended seats parked.
+    A Claude Code restart moves a resumed session to a new socket and token: its live seats held
+    the pushes they could not send, and send them once their DIR/driver changes; its ended seats
+    parked theirs, and this command sends them."""
+    rebound = seat.rebind_seats()
+    if rebound:
+        say("this session's address changed (a restart?): %d live seat(s) now push to it, and "
+            "send the pushes they held: %s" % (len(rebound), ' '.join(rebound)))
+    served = seat.deliver_parked()
+    if served:
+        say('%d ended seat(s) had parked pushes this session missed; they are posted now: %s'
+            % (len(served), ' '.join(served)))
+
+
 def main(args):
+    rebind()
     if args[:1] == ['quota']:
         return quota.main(args[1:])
     if args[:1] == ['ps']:
@@ -714,7 +754,7 @@ def main(args):
         args = args[1:]
     while args:
         flag = args[0]
-        if flag in ('--cwd', '--timeout', '--out', '--effort'):
+        if flag in ('--cwd', '--timeout', '--idle', '--out', '--effort'):
             if len(args) < 2:
                 say('%s needs a value' % flag)
                 return 2

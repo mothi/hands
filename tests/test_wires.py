@@ -383,8 +383,8 @@ class Translation(unittest.TestCase):
         self.assertEqual(wires.grok_command({})[0][-2:], ['--always-approve', 'stdio'])
 
     def test_the_suite_carries_no_driver_session(self):
-        names = {'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CODEX_THREAD_ID',
-                 'OPENCODE_SESSION_ID'}
+        names = {'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN',
+                 'CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID', 'OPENCODE_SESSION_ID'}
         self.assertFalse(names & set(os.environ))
 
 
