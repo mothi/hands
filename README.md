@@ -136,7 +136,6 @@ validates them, so a model released tomorrow works today.
 | `--cwd DIR` | current dir | where the seat works; recorded in the handle and reused by every relaunch |
 | `--out DIR` | a fresh dir in the jobs root | the job dir. It must be new or empty, and is made with mode 0700. The default jobs root is `$XDG_STATE_HOME/hands` (when that is an absolute path), else `~/.local/state/hands` |
 | `--timeout SECS` | none | a wall clock per launch, shared by its turns. On expiry the open turn ends `timeout` with its session, and a `send` resumes it |
-| `--idle SECS` | 0 | how long a seat whose turns have all ended waits for the next `send` before its CLI closes (§ The seat's life). A later `send` relaunches it on its session either way |
 | `--effort <tier>` | the CLI's default | see § Providers |
 | `--probe [P\|all]` | | a 1-token ping per provider with its smallest model, working in the system temp dir (`$TMPDIR`, else `/tmp`), with its job dir `probe-PID-provider` in the jobs root (exit 1 if any is unhealthy). A Claude probe still reads about 31k cached prompt tokens |
 
@@ -184,22 +183,19 @@ again whole at every change. Those were about two thirds of a Codex seat's log.
 
 A seat's CLI runs while the seat has a turn to run. `start` launches it with turn 1, and a `send`
 during a turn is taken live (§ Providers). When every delivered turn has ended and nothing is
-queued, the wrapper waits `--idle` seconds (none by default) for another `send`, then closes the
-CLI as an idle `stop` would (stdin's end, then TERM at 2 s, KILL at 4 s) and exits: the follow
-view ends, `ps` drops the seat, its processes are gone, and `events.jsonl` ends with an
-`exit rc=N` line marked `idle`. The next `send` relaunches the CLI on the recorded session, which
-keeps its history. On codex the prompt cache keeps too: measured on a resumed `gpt-5.6-luna`
-thread of 52k tokens, the first call after the resume was 94% cached against 99% on the live
-seat, about 3k more uncached tokens, and the answer took 3 s instead of 1.
+queued, the wrapper closes the CLI as an idle `stop` would (stdin's end, then TERM at 2 s, KILL
+at 4 s) and exits: the follow view ends, `ps` drops the seat, its processes are gone, and
+`events.jsonl` ends with an `exit rc=N` line marked `idle`. The next `send` relaunches the CLI
+on the recorded session, which keeps its history. On codex the prompt cache keeps too: measured
+on a resumed `gpt-5.6-luna` thread of 52k tokens, the first call after the resume was 94% cached
+against 99% on the live seat, about 3k more uncached tokens, and the answer took 3 s instead of 1.
 
 So a seat whose work is done needs no `stop`; `stop` is for a turn in flight. After a turn that a
-`send` or a `mail` reached mid-way, a claude seat waits at least 30 seconds before it closes (or
-`--idle`, when that is longer), because claude queues or steers such a message itself and shows
-a queued one only by starting the next turn. Between turns a `mail` finds no wrapper and waits in the inbox for the
-next `send`. Nothing the seat left running
-in the CLI's process group outlives the close: a seat that must leave a job running detaches it
-(`setsid nohup ... &`). `--idle 300` keeps a seat up for five minutes between turns, for a run
-of quick sends on one process.
+`send` or a `mail` reached mid-way, a claude seat waits at least 30 seconds before it closes,
+because claude queues or steers such a message itself and shows a queued one only by starting
+the next turn. Between turns a `mail` finds no wrapper and waits in the inbox for the next
+`send`. Nothing the seat left running in the CLI's process group outlives the close: a seat that
+must leave a job running detaches it (`setsid nohup ... &`).
 
 ## The envelope
 
@@ -393,9 +389,9 @@ hands.sh start codex task.md
 
 `send` writes the next message into `DIR/in.fifo` for the live wrapper, or starts a new wrapper
 on the recorded session when the old one is gone. The wrapper leaves on its own once every
-delivered turn has ended and `--idle` seconds have passed, closing `in.fifo` under the delivery
-lock, so a `send` that races it is either taken or relaunches the seat. `stop` signals the
-wrapper, which closes its CLI the way a deadline does and writes the last envelopes.
+delivered turn has ended, closing `in.fifo` under the delivery lock, so a `send` that races it
+is either taken or relaunches the seat. `stop` signals the wrapper, which closes its CLI the way
+a deadline does and writes the last envelopes.
 
 | File | What it holds |
 |---|---|

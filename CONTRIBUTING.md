@@ -23,6 +23,8 @@ They are hermetic: the stub CLIs in `tests/stubs`, and the curl and codex stubs 
 `tests/test_quota.py` writes, stand in for the real ones, and nothing touches the network or
 spends quota. To run one test, name it:
 `python3 tests/test_seat.py CodexSeats.test_a_seat_ends_with_its_turn_and_a_send_resumes_it`.
+The tests keep a seat's process up between turns with the environment variable `HANDS_IDLE`
+(seconds), which is not part of the interface.
 
 A new behavior lands with a test, and the test must be able to fail: revert the fix alone, run
 the test, and see it go red. A test nobody has seen fail proves nothing.

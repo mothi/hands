@@ -40,7 +40,7 @@ $H quota                           # the quota board: read-only, it never spends
   your ended seats parked; each live seat then sends what it held while it couldn't reach you.
   Late pushes say `(late Nm)`; until then `ps` shows `N push(es) held` or `parked` on such seats.
 - A seat's CLI runs while it has a turn, and ends by itself when its last turn ends; the next
-  `send` resumes the session (`--idle SECS` keeps the CLI up that long for a quick follow-up).
+  `send` resumes the session.
   `stop` is for a turn in flight, never kill a process. A seat has no deadline unless
   `--timeout` names one.
 - A seat runs as the user with full read and write access. Point it at a worktree or a scratch

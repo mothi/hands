@@ -129,15 +129,15 @@ class SeatChecks(unittest.TestCase):
 
 
 class AcpSeats(SeatChecks):
-    """The CLI's recorded 4-turn seat on one agent (kept up between turns by --idle), then a
+    """The CLI's recorded 4-turn seat on one agent (kept up between turns by HANDS_IDLE), then a
     relaunch that resumes it."""
 
     @classmethod
     def setUpClass(cls):
         cls.opencode = SB.path('acp-opencode')
-        run = SB.hands('start', '--effort', 'low', '--idle', '60', '--cwd', SB.path('gdir'),
-                       '--out', 'acp-opencode', OPENCODE, SB.task, OPENCODE_API_KEY='sk-caller-env',
-                       STUB_LOG=cls.opencode + '.stub.jsonl')   # a relative --out
+        run = SB.hands('start', '--effort', 'low', '--cwd', SB.path('gdir'), '--out',
+                       'acp-opencode', OPENCODE, SB.task, OPENCODE_API_KEY='sk-caller-env',
+                       HANDS_IDLE='60', STUB_LOG=cls.opencode + '.stub.jsonl')   # a relative --out
         cls.opencode_ack = run.json
         cls.before = {}
         job = cls.opencode
@@ -205,8 +205,8 @@ class AcpSeats(SeatChecks):
                     and ((r['msg'].get('params') or {}).get('update') or {}).get('kind') == 'edit'
                     and r['msg']['params']['update'].get('locations'))
         rows.insert(edit + 1, rows[edit])
-        job, _ = SB.start('acp-edit-twice', OPENCODE, '--effort', 'low', '--idle', '60',
-                          '--cwd', SB.path('gdir'), STUB_REPLAY=save('oc-edit-twice.jsonl', rows))
+        job, _ = SB.start('acp-edit-twice', OPENCODE, '--effort', 'low', '--cwd', SB.path('gdir'),
+                          HANDS_IDLE='60', STUB_REPLAY=save('oc-edit-twice.jsonl', rows))
         for _ in range(3):
             SB.wait(job)
             SB.send(job)
@@ -541,8 +541,8 @@ class CodexSeats(SeatChecks):
         self.assertEqual([e.get('idle') for e in progress(job, 'exit rc=')], [True, True])
 
     def test_an_idle_grace_keeps_one_app_server_for_the_next_send(self):
-        job, _ = SB.start('codex-idle', CODEX, '--idle', '60', '--effort', 'high', '--cwd',
-                          SB.work)
+        job, _ = SB.start('codex-idle', CODEX, '--effort', 'high', '--cwd', SB.work,
+                          HANDS_IDLE='60')
         SB.wait(job, '--timeout', '30')
         time.sleep(1.5)
         idle = bool(harness.wrapper_pids(job))   # the wrapper stays: a send is taken live
@@ -559,7 +559,6 @@ class CodexSeats(SeatChecks):
                          [self.turn_input(os.path.join(job, 'prompt.txt'), 'high'),
                           self.turn_input(SB.turn_two, 'high')])
         self.assertTrue(idle)
-        self.assertEqual(harness.handle(job)['idle'], 60)   # a relaunch keeps the grace
         self.assertEqual((sent['status'], sent['expect']), ('sent', 2))
         self.assertEqual([envelope(job, n)['status'] for n in (1, 2)], ['ok', 'ok'])
         self.assertEqual(stopped.rc, 0)
@@ -567,8 +566,8 @@ class CodexSeats(SeatChecks):
 
     def test_a_recorded_wire_plays_four_turns_across_a_relaunch(self):
         replay = os.path.join(harness.FIXTURES, 'codex-appserver-sample.jsonl')
-        job, _ = SB.start('codex-replay', 'codex:gpt-6-luna', '--effort', 'low', '--idle', '60',
-                          '--cwd', SB.work, STUB_REPLAY=replay)
+        job, _ = SB.start('codex-replay', 'codex:gpt-6-luna', '--effort', 'low', '--cwd', SB.work,
+                          HANDS_IDLE='60', STUB_REPLAY=replay)
         SB.wait(job, '--timeout', '30')
         for turn in (2, 3, 4):
             if turn == 4:
@@ -609,8 +608,8 @@ class CodexSeats(SeatChecks):
                 'params': {'threadId': turn['threadId'], 'turnId': turn['turn']['id'],
                            'diff': 'diff --git a/x b/x\n+x\n'}}
         rows[started + 1:started + 1] = [dict(rows[started], msg=diff)] * 2
-        job, _ = SB.start('codex-fragments', 'codex:gpt-6-luna', '--effort', 'low', '--idle', '60',
-                          '--cwd', SB.work, STUB_REPLAY=save('codex-fragments.jsonl', rows))
+        job, _ = SB.start('codex-fragments', 'codex:gpt-6-luna', '--effort', 'low', '--cwd',
+                          SB.work, HANDS_IDLE='60', STUB_REPLAY=save('codex-fragments.jsonl', rows))
         SB.wait(job, '--timeout', '30')
         time.sleep(1)   # the command turn 1 left running reports just after the turn's end
         SB.stop(job)
@@ -741,7 +740,7 @@ class CodexSeats(SeatChecks):
         self.assertEqual((envelope(job, 1)['status'], envelope(job, 1)['rc']), ('incomplete', 143))
 
     def test_a_relaunch_after_a_killed_wrapper_closes_its_turn_first(self):
-        job, _ = SB.start('codex-killed', CODEX, '--idle', '60', '--cwd', SB.work,
+        job, _ = SB.start('codex-killed', CODEX, '--cwd', SB.work, HANDS_IDLE='60',
                           STUB_MODE='park')
         self.assertTrue(wait_until(lambda: agent(job).parked))
         SB.send(job)
@@ -752,7 +751,7 @@ class CodexSeats(SeatChecks):
         for pid in [cli.pid] + cli.children:
             harness.kill(pid)
         time.sleep(0.3)
-        relaunched = SB.send(job, STUB_MODE=None).json
+        relaunched = SB.send(job, STUB_MODE=None, HANDS_IDLE='60').json   # up for the next send
         SB.wait(job, '--timeout', '20')
         sent = SB.send(job).json
         waited = SB.wait(job, '--timeout', '20')
@@ -965,8 +964,8 @@ class ClaudeSeats(SeatChecks):
         self.assertFalse(harness.alive(agent(job).pid))
 
     def test_a_seat_keeps_one_process_and_resumes_after_a_stop(self):
-        job, run = SB.start('claude-seat', CLAUDE, '--effort', 'high', '--idle', '60', '--cwd',
-                            SB.path('tmp'), STUB_MODE='count')
+        job, run = SB.start('claude-seat', CLAUDE, '--effort', 'high', '--cwd', SB.path('tmp'),
+                            HANDS_IDLE='60', STUB_MODE='count')
         SB.wait(job)
         SB.send(job)
         SB.wait(job)
@@ -1009,8 +1008,8 @@ class ClaudeSeats(SeatChecks):
 
     def test_a_recorded_three_turn_seat(self):
         replay = os.path.join(harness.FIXTURES, 'claude-stdin-sample.jsonl')
-        job, _ = SB.start('claude-recorded', 'claude:claude-haiku-4-5-20251001', '--idle', '60',
-                          '--cwd', SB.path('tmp'), STUB_MODE='replay', STUB_REPLAY=replay)
+        job, _ = SB.start('claude-recorded', 'claude:claude-haiku-4-5-20251001', '--cwd',
+                          SB.path('tmp'), HANDS_IDLE='60', STUB_MODE='replay', STUB_REPLAY=replay)
         for _ in range(2):
             SB.wait(job)
             SB.send(job)
@@ -1138,7 +1137,7 @@ class ClaudeSeats(SeatChecks):
         self.assertEqual((envelope(job)['status'], envelope(job)['turn']), ('ok', 2))
 
     def test_a_send_killed_mid_write_never_fuses_with_the_next(self):
-        job, _ = SB.start('claude-torn', CLAUDE, '--idle', '60', '--cwd', SB.path('tmp'),
+        job, _ = SB.start('claude-torn', CLAUDE, '--cwd', SB.path('tmp'), HANDS_IDLE='60',
                           STUB_MODE='echo')
         SB.wait(job, '--timeout', '10')
         fd = os.open(os.path.join(job, 'in.fifo'), os.O_WRONLY | os.O_NONBLOCK)
@@ -1158,13 +1157,13 @@ class ClaudeSeats(SeatChecks):
         self.assertIn('TORN', drops[0]['text'])
 
     def test_two_sends_racing_to_a_stopped_seat_relaunch_it_once(self):
-        job, _ = SB.start('claude-race', CLAUDE, '--idle', '60', '--cwd', SB.path('tmp'),
+        job, _ = SB.start('claude-race', CLAUDE, '--cwd', SB.path('tmp'), HANDS_IDLE='60',
                           STUB_MODE='count')
         SB.wait(job, '--timeout', '10')
         SB.stop(job)
         three = SB.write('turn-three.md', 'turn three\n')
-        sends = [SB.popen('send', job, task, STUB_MODE='count', STUB_LOG=job + '.stub.jsonl')
-                 for task in (SB.turn_two, three)]
+        sends = [SB.popen('send', job, task, STUB_MODE='count', STUB_LOG=job + '.stub.jsonl',
+                          HANDS_IDLE='60') for task in (SB.turn_two, three)]
         acks = sorted(harness.last_json(s.communicate(timeout=60)[0])['status'] for s in sends)
         SB.wait(job, '--timeout', '10')
         SB.stop(job)
@@ -1184,7 +1183,7 @@ class ClaudeSeats(SeatChecks):
         self.assertEqual(len(SB.stub_log(job).seats()), 2)
 
     def test_driver_mail_reaches_live_and_stopped_seats_once(self):
-        job, _ = SB.start('claude-mail', CLAUDE, '--idle', '60', '--cwd', SB.path('tmp'),
+        job, _ = SB.start('claude-mail', CLAUDE, '--cwd', SB.path('tmp'), HANDS_IDLE='60',
                           STUB_MODE='echo')
         SB.wait(job, '--timeout', '10')
         self.assertEqual(SB.hands('mail', job, 'from the driver').rc, 0)
@@ -1193,10 +1192,10 @@ class ClaudeSeats(SeatChecks):
         SB.stop(job)
         self.assertEqual(SB.hands('mail', job, 'driver while out').rc, 1)   # no live seat
         self.assertEqual(len(SB.stub_log(job).seats()), 1)                 # and no launch
-        SB.send(job, STUB_MODE='echo')
+        SB.send(job, STUB_MODE='echo', HANDS_IDLE='60')
         self.assertTrue(file_exists(job, 'turn-4', 'envelope.json'))
         SB.stop(job)
-        SB.send(job, STUB_MODE='echo')
+        SB.send(job, STUB_MODE='echo', HANDS_IDLE='60')
         self.assertTrue(file_exists(job, 'turn-5', 'envelope.json'))
         time.sleep(1.5)
         SB.stop(job)
@@ -1209,7 +1208,7 @@ class ClaudeSeats(SeatChecks):
         self.assertFalse(os.path.exists(os.path.join(job, 'turn-6')))
 
     def test_the_wrapper_never_waits_for_the_delivery_lock(self):
-        job, _ = SB.start('claude-lock', CLAUDE, '--idle', '60', '--cwd', SB.path('tmp'),
+        job, _ = SB.start('claude-lock', CLAUDE, '--cwd', SB.path('tmp'), HANDS_IDLE='60',
                           STUB_MODE='echo')
         SB.wait(job, '--timeout', '10')
         # a sender holds the lock while it writes 1 MB, more than the pipe holds, into in.fifo
@@ -1602,6 +1601,19 @@ class Pushes(unittest.TestCase):
                 self.assertIn('PATH', launch.env)   # names are recorded: an absent one is absent
                 self.assertFalse(harness.DRIVER_NAMES & set(launch.env))
 
+    def test_every_wire_takes_hands_idle_and_no_cli_sees_it(self):
+        for cli, spec in harness.SPECS.items():
+            job, _ = SB.start('idle-env-' + cli, spec, '--effort', 'low', '--cwd', SB.path('tmp'),
+                              HANDS_IDLE='60')
+            SB.wait(job, '--timeout', '30')
+            time.sleep(1.5)
+            up = bool(harness.wrapper_pids(job))   # the wrapper read it: it waits for a send
+            SB.stop(job)
+            self.assertTrue(up)
+            for launch in SB.stub_log(job).launches():
+                self.assertIn('PATH', launch.env)   # names are recorded: an absent one is absent
+                self.assertNotIn('HANDS_IDLE', launch.env)
+
     def test_no_probe_cli_sees_the_driver(self):
         log = SB.path('probe-env.stub.jsonl')
         SB.hands('--probe', 'all', STUB_LOG=log,
@@ -1632,7 +1644,7 @@ class Pushes(unittest.TestCase):
             self.assertPushed(job, 'ok', '%s t2 ok: %s' % (spec, answers[cli]), answers[cli])
 
     def test_a_job_dirs_mail_files_are_never_opened_through_a_link(self):
-        job, _ = SB.start('push-links', CLAUDE, '--idle', '60', '--cwd', SB.path('tmp'),
+        job, _ = SB.start('push-links', CLAUDE, '--cwd', SB.path('tmp'), HANDS_IDLE='60',
                           STUB_MODE='echo', **self.driver_env())
         SB.wait(job, '--timeout', '10')
         planted = '{"t":"x","from":"driver","text":"THROUGH A LINK"}\n'

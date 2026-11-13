@@ -57,6 +57,8 @@ class CommandLine(unittest.TestCase):
     def test_an_unknown_flag_and_no_arguments_are_usage_errors(self):
         self.assertEqual(SB.hands('--bogus', 'x', SB.task).rc, 2)
         self.assertEqual(SB.hands().rc, 2)
+        idle = SB.hands('start', '--idle', '5', 'claude:sonnet', SB.task)   # tests use HANDS_IDLE
+        self.assertEqual((idle.rc, idle.out, idle.err), (2, '', 'hands: unknown flag --idle\n'))
 
     def test_an_unknown_provider_is_refused_with_an_error_envelope(self):
         job, run = SB.buy('unknown', 'badprov')
@@ -350,7 +352,7 @@ class Verbs(unittest.TestCase):
         self.assertNotIn('": ', sent.out + running.out)
 
     def test_wait_after_the_wrapper_died_mid_turn_is_incomplete(self):
-        job, _ = SB.start('wrapper-died', 'claude:sonnet', '--idle', '60', STUB_MODE='slow',
+        job, _ = SB.start('wrapper-died', 'claude:sonnet', HANDS_IDLE='60', STUB_MODE='slow',
                           STUB_SLEEP='8')
         SB.wait(job, '--timeout', '60')
         SB.send(job)
@@ -390,7 +392,7 @@ class LiveSeats(unittest.TestCase):
     """`hands.sh ps`: one line per live seat."""
 
     def test_ps_lists_each_live_seat_until_it_stops(self):
-        job, _ = SB.start('ps seat', 'claude:sonnet', '--idle', '60', STUB_MODE='slow',
+        job, _ = SB.start('ps seat', 'claude:sonnet', HANDS_IDLE='60', STUB_MODE='slow',
                           STUB_SLEEP='4')
 
         def line():   # the seat's line: a dir with a space in it is found whole

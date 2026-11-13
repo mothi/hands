@@ -29,8 +29,6 @@ opts (all before the provider spec; the prompt is always a file):
                    $XDG_STATE_HOME/hands, else ~/.local/state/hands, where every start deletes
                    dirs idle for 30 days)
   --timeout SECS   a wall clock per launch (default: none)
-  --idle SECS      how long a seat whose turns have all ended waits for the next send before
-                   its CLI closes (default: 0; a later send relaunches it on its session)
   --effort <tier>  claude, codex: low|medium|high|xhigh|max, passed through (codex adds ultra
                    where it lists it); opencode: required, a value the model lists
 
@@ -99,7 +97,6 @@ class Options:
         self.cwd = os.getcwd()
         self.out = ''
         self.timeout = ''
-        self.idle = ''
         self.effort = ''
         self.probe = ''
         self.start = False   # `start`: return once the seat is spawned
@@ -209,8 +206,7 @@ def launch(provider, model, job_dir, options):
     the answer, then stop whatever is left (a seat ends with its turn by itself).
 
     The handle is what every relaunch resumes with: the provider, model and effort, the
-    canonical cwd, the timeout and the idle grace, the CLI's path, and the session id the
-    wrapper records."""
+    canonical cwd, the timeout, the CLI's path, and the session id the wrapper records."""
     cli = cli_path(provider)
     if not cli:
         end_early(job_dir, 'not-installed', provider, model, 0, options)
@@ -220,15 +216,13 @@ def launch(provider, model, job_dir, options):
         end_early(job_dir, 'error', provider, model, 2, options)
         return 2
     timeout = parse_timeout(options.timeout)
-    idle = parse_timeout(options.idle)
-    bad = '--timeout' if timeout is False else '--idle' if idle is False or (idle or 0) < 0 else ''
-    if bad:
-        say('%s takes seconds' % bad)
+    if timeout is False:
+        say('--timeout takes seconds')
         end_early(job_dir, 'error', provider, model, 2, options)
         return 2
     handle = {'provider': provider, 'model': model or None, 'effort': options.effort or None,
-              'cwd': os.path.realpath(options.cwd), 'timeout': timeout, 'idle': idle or None,
-              'cli': cli, 'session': None}
+              'cwd': os.path.realpath(options.cwd), 'timeout': timeout, 'cli': cli,
+              'session': None}
     with open(os.path.join(job_dir, 'session'), 'w') as f:
         f.write(json.dumps(handle, separators=(',', ':')) + '\n')
     prompt = os.path.join(job_dir, 'prompt.txt')
@@ -794,7 +788,7 @@ def main(args):
         args = args[1:]
     while args:
         flag = args[0]
-        if flag in ('--cwd', '--timeout', '--idle', '--out', '--effort'):
+        if flag in ('--cwd', '--timeout', '--out', '--effort'):
             if len(args) < 2:
                 say('%s needs a value' % flag)
                 return 2

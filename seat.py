@@ -21,6 +21,7 @@ Python 3 standard library only.
 import errno
 import fcntl
 import json
+import math
 import os
 import re
 import select
@@ -686,12 +687,12 @@ def whole_records(job_dir, lines):
 class Wrapper:
     """Runs one seat: launches its CLI, delivers its messages, and records its turns.
 
-    It runs while the seat has a turn to run: once every delivered turn has ended and the
-    handle's `idle` seconds (0 by default) pass with no send, it closes the CLI as an idle stop
-    does and exits; `send` relaunches the seat on its recorded session. It outlives the CLI, so
-    it can always close the last turn and write its envelope."""
+    It runs while the seat has a turn to run: once every delivered turn has ended and its idle
+    grace (0 seconds unless a test sets HANDS_IDLE) passes with no send, it closes the CLI as an
+    idle stop does and exits; `send` relaunches the seat on its recorded session. It outlives the
+    CLI, so it can always close the last turn and write its envelope."""
 
-    def __init__(self, job_dir, handle, first_message, ack_fd):
+    def __init__(self, job_dir, handle, first_message, ack_fd, idle_grace=0):
         self.job_dir = job_dir
         self.handle = handle
         self.first_message = first_message
@@ -719,7 +720,7 @@ class Wrapper:
         self.driver_seen = None             # driver_stamp at the last try
         self.push_gap = PUSH_RETRY
         self.next_push_try = 0
-        self.idle_grace = float(handle.get('idle') or 0)   # seconds an idle seat waits for a send
+        self.idle_grace = idle_grace        # seconds an idle seat waits for a send
         self.idle_since = None              # when the seat last became idle
         self.unsure = False                 # claude got a message mid-turn: queued, or steered?
         self.left = False                   # the loop ended because the seat was idle
@@ -909,9 +910,9 @@ class Wrapper:
         return state.expected > 0 and state.ended >= state.expected
 
     def leave_when_idle(self, cli):
-        """Idle for the handle's `idle` seconds (STEER_GRACE at least after a turn a message
-        reached mid-way, in case claude queued it) -> close in.fifo under the delivery lock,
-        after one last read of it, and say so: the loop ends, and the CLI is closed as an idle
+        """Idle for the idle grace (STEER_GRACE at least after a turn a message reached
+        mid-way, in case claude queued it) -> close in.fifo under the delivery lock, after one
+        last read of it, and say so: the loop ends, and the CLI is closed as an idle
         stop closes it. A send that got its message in first is taken; one that comes after
         finds no reader, then no wrapper, and relaunches the seat. A mail that landed meanwhile
         is delivered first."""
@@ -1348,11 +1349,24 @@ def report_spawn(job_dir, handle, pid, ack_read):
     return 1
 
 
+def seconds(text):
+    """A count of seconds -> that number; 0 when it is empty, not a number, not finite or
+    negative."""
+    try:
+        value = float(text)
+    except ValueError:
+        return 0
+    return value if math.isfinite(value) and value >= 0 else 0
+
+
 def run_wrapper(job_dir, handle, message, log, ack_fd):
     """In the forked child: become the detached wrapper and run the seat. Never returns."""
     os.setsid()   # outlive the caller's process group (a killed tool call, a closed terminal)
     for sig in (signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
         signal.signal(sig, signal.SIG_IGN)   # as nohup does; the reaper keeps it for the CLI
+    # HANDS_IDLE: the seconds a seat whose turns have all ended waits for the next send. Only the
+    # tests set it, to keep one CLI across a recording's turns; it is not part of the interface.
+    idle_grace = seconds(os.environ.pop('HANDS_IDLE', ''))
     # Names no seat process may see. The driver's session stays out (pushes read DIR/driver).
     # An opencode seat runs on the user's own login: OPENCODE_API_KEY would reach every tool's
     # shell, and unlock paid models.
@@ -1362,7 +1376,7 @@ def run_wrapper(job_dir, handle, message, log, ack_fd):
     for source, target in ((null, 0), (log, 1), (log, 2)):   # its output goes to job.log
         os.dup2(source, target)
     try:
-        Wrapper(job_dir, handle, message, ack_fd).run()
+        Wrapper(job_dir, handle, message, ack_fd, idle_grace).run()
     except BaseException:
         traceback.print_exc()
     finally:
