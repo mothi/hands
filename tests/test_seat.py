@@ -622,6 +622,37 @@ class CodexSeats(SeatChecks):
         self.assertEqual([envelope(job, n)['usage'] for n in (1, 2, 3, 4)], usage)   # per turn
         self.assertEqual([e['usage'] for e in found if e['kind'] == 'usage'], usage)
 
+    def test_the_stream_log_leaves_out_fragments_and_the_resent_diff(self):
+        """stream.jsonl keeps every message but those that repeat what it holds whole: a streamed
+        fragment, whose item comes whole at item/completed, and the turn's diff, which codex
+        sends again whole at every change."""
+        rows = harness.transcript('codex-appserver-sample.jsonl')
+        started = first_index(rows, lambda r: r['dir'] == 'in' and isinstance(r['msg'], dict)
+                              and r['msg'].get('method') == 'turn/started')
+        turn = rows[started]['msg']['params']
+        diff = {'method': 'turn/diff/updated',
+                'params': {'threadId': turn['threadId'], 'turnId': turn['turn']['id'],
+                           'diff': 'diff --git a/x b/x\n+x\n'}}
+        rows[started + 1:started + 1] = [dict(rows[started], msg=diff)] * 2
+        job, _ = SB.start('codex-fragments', 'codex:gpt-6-luna', '--effort', 'low', '--idle', '60',
+                          '--cwd', SB.work, STUB_REPLAY=save('codex-fragments.jsonl', rows))
+        SB.wait(job, '--timeout', '30')
+        time.sleep(1)   # the command turn 1 left running reports just after the turn's end
+        SB.stop(job)
+        logged = [r['msg'].get('method')
+                  for r in harness.read_jsonl(os.path.join(job, 'stream.jsonl'))
+                  if r['dir'] == 'in' and isinstance(r['msg'], dict)]
+        left_out = ('item/agentMessage/delta', 'item/commandExecution/outputDelta',
+                    'turn/diff/updated')   # the recorded turn 1 holds one of each kind or more
+        self.assertEqual([m for m in logged if m in left_out], [])
+        for kept in ('turn/started', 'item/started', 'item/completed', 'thread/tokenUsage/updated',
+                     'account/rateLimits/updated', 'turn/completed'):
+            self.assertIn(kept, logged)
+        self.assertIn(None, logged)   # the answers to the wrapper's own requests
+        self.assertEqual((envelope(job, 1)['status'], result(job, 1)), ('ok', 'SECOND'))
+        texts = [e['text'] for e in events(job) if e['kind'] == 'text' and e['turn'] == 1]
+        self.assertEqual(texts, ['SECOND'])   # the whole item, never its fragments
+
     def test_file_changes_become_file_events(self):
         job, _ = SB.buy('codex-files', CODEX, '--cwd', SB.work, STUB_MODE='files')
         found = events(job)

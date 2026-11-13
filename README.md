@@ -172,6 +172,11 @@ that it finished empty. To judge whether a seat is alive, look at the age of the
 `events.jsonl` line or an open tool call, not at the process: a fresh seat can be silent for its
 first half-minute.
 
+`DIR/stream.jsonl` is the raw wire: Claude's stdout as it is, and for the other CLIs each
+JSON-RPC message, both ways, with its time. It leaves out what it already holds whole: streamed
+fragments, whose item arrives whole when it completes, and Codex's turn diff, which Codex sends
+again whole at every change. Those were about two thirds of a Codex seat's log.
+
 ## The seat's life
 
 A seat's CLI runs while the seat has a turn to run. `start` launches it with turn 1, and a `send`

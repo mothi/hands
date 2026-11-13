@@ -835,10 +835,13 @@ class Wrapper:
             self.start_codex_turn(cli, self.waiting.pop(0))
 
     def log_stream(self, line, direction):
-        """stream.jsonl: claude's stdout as it is; each JSON-RPC line, both ways, with its time."""
+        """stream.jsonl: claude's stdout as it is; each JSON-RPC line, both ways, with its time,
+        but for the lines that only repeat what the file holds whole (wires.repeats)."""
         if self.family != 'stdin':
-            append_json(self.path('stream.jsonl'),
-                        {'t': now(), 'dir': direction, 'msg': parse_json(line)})
+            message = parse_json(line)
+            if not wires.repeats(message):
+                append_json(self.path('stream.jsonl'),
+                            {'t': now(), 'dir': direction, 'msg': message})
         elif direction == 'in':
             with open(self.path('stream.jsonl'), 'ab') as f:
                 f.write(line.encode() + b'\n')

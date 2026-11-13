@@ -10,6 +10,10 @@ model catalogs keep only OpenCode's own providers; MCP server names became `mcp-
 plan tiers and some quota values were re-valued. Structure, ids, event order, statuses and usage are
 otherwise as recorded. New recordings get the same treatment (see CONTRIBUTING.md).
 
+**What a recording holds.** A JSON-RPC recording is a seat's `stream.jsonl`, which leaves out
+streamed fragments and Codex's turn diff (`repeats()` in `wires.py`). The Codex recording here
+predates that and still holds its fragments; the suites replay it the same either way.
+
 **Error wording.** `FailureText` in `tests/test_seat.py` asserts that each provider error string
 classifies to its typed status. When a provider changes its wording, add the new error text here
 the day it is found.
@@ -35,7 +39,7 @@ The test classes named below are in `tests/test_seat.py` unless another file is 
 | opencode-acp-resume-sample | the same for OpenCode: a new process reattaching the seat's session | `AcpSeats`: a send to a stopped OpenCode seat; `AcpClose`: an abandoned turn; `Pushes` |
 | grok-acp-sample, opencode-acp-sample | 4-turn ACP transcripts at the CLI's default effort | `tests/test_wires.py` `AcpClient`: the round trips |
 | claude-stdin-sample | claude 2.1.274 `--input-format stream-json` seat (haiku), 3 turns on one process with Bash tool calls | `ClaudeSeats`: a recorded three-turn seat, last answer `ZEBRA-42` |
-| codex-appserver-sample | codex-cli 0.160.0 app-server on stdio (read-only, approvals never), two processes, four turns: one steered mid-turn (a wrong-id steer refused), one interrupted, one after it, one on a new process's `thread/resume` | `CodexSeats`: a recorded wire across a relaunch (ok/cancelled/ok/ok; strays; per-turn usage) |
+| codex-appserver-sample | codex-cli 0.160.0 app-server on stdio (read-only, approvals never), two processes, four turns: one steered mid-turn (a wrong-id steer refused), one interrupted, one after it, one on a new process's `thread/resume` | `CodexSeats`: a recorded wire across a relaunch (ok/cancelled/ok/ok; strays; per-turn usage); the stream log leaves out fragments and the re-sent diff (the test adds two `turn/diff/updated` to turn 1) |
 | grok-events-sample | a 3-turn grok-4.6 seat's `events.jsonl` (228 lines, 3 tool calls, a mail round) | `tests/test_cli.py` `EventsView` |
 | claude-events-sample | the same 3 turns on Claude (43 lines) | `tests/test_cli.py` `EventsView` |
 | opencode-events-sample | the same 3 turns on OpenCode (34 lines); tool inputs arrive in a later update | `tests/test_cli.py` `EventsView`: a late input rides one ↳ line |

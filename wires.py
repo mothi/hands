@@ -907,6 +907,18 @@ def record_text(record):
     return str(message)
 
 
+def repeats(message):
+    """Whether a message only repeats what the stream holds whole, so stream.jsonl leaves it out.
+
+    A streamed fragment (codex names them .../delta and ...Delta) belongs to an item that
+    arrives whole at item/completed. And codex sends turn/diff/updated, the turn's whole diff,
+    again at every change, while each change is also a fileChange item. No translator reads
+    either, and together they were two thirds of the bytes of real codex seats' logs."""
+    method = message.get('method') if isinstance(message, dict) else None
+    return isinstance(method, str) and (method.lower().endswith('delta')
+                                        or method == 'turn/diff/updated')
+
+
 CODEX_TOOL_ITEMS = {   # codex item type -> (tool name, the item field that holds its input)
     'commandExecution': ('shell', 'command'),
     'fileChange': ('apply_patch', 'changes'),
@@ -1055,8 +1067,9 @@ class StreamTranslator:
         collaborator codex started reports over the same connection) is never the seat's text,
         calls or turns: while a seat turn is open, its usage counts toward that turn and its
         items and turns show as progress. Anything for a turn other than the open one (a command
-        that finishes after its turn) is stray. Deltas and status chatter stay in stream.jsonl:
-        each item arrives whole at item/completed."""
+        that finishes after its turn) is stray. Each item arrives whole at item/completed: its
+        deltas are read by no one and logged nowhere (repeats()). Status chatter stays in
+        stream.jsonl."""
         method = message.get('method')
         params = message.get('params') if isinstance(message.get('params'), dict) else {}
         item = params.get('item') if isinstance(params.get('item'), dict) else {}
