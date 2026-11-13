@@ -301,6 +301,44 @@ class Verbs(unittest.TestCase):
         final = harness.last_json(out)
         self.assertEqual((final['status'], final['rc']), ('incomplete', 143))
 
+    def test_a_bad_wait_argument_is_one_usage_line(self):
+        job, _ = SB.buy('wait-args', 'claude:sonnet', task=SB.path('nope.md'))
+        usage = ' (usage: hands.sh wait DIR [--for turn|mail|exit] [--timeout S])\n'
+        for args, problem in ((['--timeout', 'x'], '--timeout takes seconds'),
+                              (['--for', 'nothing'],
+                               "--for takes turn, mail or exit, not 'nothing'"),
+                              (['--timeout'], '--timeout needs a value'),
+                              (['--for'], '--for needs a value'),
+                              (['--bogus'], 'unknown argument --bogus')):
+            run = SB.wait(job, *args)
+            self.assertEqual((run.rc, run.out, run.err), (2, '', 'hands: ' + problem + usage), args)
+
+    def test_mail_with_no_text_says_so(self):
+        job, _ = SB.buy('mail-no-text', 'claude:sonnet', task=SB.path('nope.md'))
+        run = SB.hands('mail', job)
+        self.assertEqual((run.rc, run.out), (2, ''))
+        self.assertEqual(run.err, 'hands: mail needs a text (usage: hands.sh mail DIR TEXT)\n')
+        self.assertFalse(os.path.exists(os.path.join(job, 'inbox.jsonl')))
+
+    def test_the_verbs_refuse_a_dir_hands_did_not_make(self):
+        other = SB.path('not-a-job')
+        os.makedirs(other)
+        SB.write('not-a-job/notes.txt', 'keep')
+        refusal = ('hands: %s is not a job dir (it holds neither prompt.txt nor envelope.json)\n'
+                   % other)
+        for args in (['mail', other, 'hello'], ['wait', other, '--timeout', '1'],
+                     ['events', other], ['stop', other]):
+            run = SB.hands(*args)
+            self.assertEqual((run.rc, run.out, run.err), (2, '', refusal), args)
+        self.assertEqual(os.listdir(other), ['notes.txt'])
+
+    def test_wait_on_a_job_dir_with_no_handle_prints_its_envelope(self):
+        job, _ = SB.buy('wait-no-handle', 'claude:sonnet', task=SB.path('nope.md'))
+        self.assertFalse(os.path.exists(os.path.join(job, 'session')))
+        run = SB.wait(job, '--timeout', '5')
+        self.assertEqual(run.rc, 1)
+        self.assertEqual((run.json['status'], run.json['dir']), ('error', job))
+
     def test_every_verb_line_is_compact_json(self):
         job, _ = SB.start('compact', 'codex:gpt-5.6-terra', STUB_MODE='park')
         wait_until(lambda: SB.stub_log(job).seats()[0].parked)
@@ -427,6 +465,7 @@ class EventsView(unittest.TestCase):
         for cli in ('opencode-seat', 'claude', 'opencode'):
             job = SB.path('view-' + cli)
             os.makedirs(job)
+            SB.write(os.path.join(job, 'prompt.txt'), 'task\n')   # a job dir holds its prompt
             shutil.copy(os.path.join(harness.FIXTURES, '%s-events-sample.jsonl' % cli),
                         os.path.join(job, 'events.jsonl'))
             cls.views[cli] = (job, SB.hands('events', job).out)

@@ -167,7 +167,7 @@ class Turn:
 
 def closed_turn(turn, status, text='', usage=None, final='none', error_text='', session=None,
                 started=None, extra=None):
-    """A turn a translator closed, as seat.py's finish() takes it.
+    """A turn a translator closed, as seat.py's close_turns() takes it.
 
     extra holds fields for the turn's usage event (usage_unknown, cost_usd)."""
     return {'turn': turn, 'status': status, 'text': text or '', 'usage': usage, 'final': final,

@@ -42,9 +42,11 @@ provider CLIs have only been run on macOS.
   (`CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`, `CLAUDE_CODE_SESSION_ID`,
   `CODEX_THREAD_ID`, `OPENCODE_SESSION_ID`) and `OPENCODE_API_KEY`, which the wrapper removes. Don't keep secrets in
   exported variables when you run seats.
-- **Your session's address lives in the job dir.** For pushes, the wrapper keeps what names your
-  session (a Claude Code socket path, token and session id, a Codex thread id, or an OpenCode
-  session id) in `DIR/driver` (mode 0600). A seat can read it and post into your session.
+- **Your session's address lives in the job dir.** For pushes, every `start` and `send` you run
+  writes what names your session (a Claude Code socket path, token and session id, a Codex thread
+  id, or an OpenCode session id) to `DIR/driver` (mode 0600). It stays after the seat ends, until
+  the job dir is deleted (the 30-day sweep; an `--out` dir is never swept). A seat can read it
+  and post into your session.
 - **Seats don't run your hooks.** Hooks are code written for your own sessions; every seat turns
   them off (§ Hooks and memories).
 - **Mail and pushes are data.** What a seat writes is model output; never let the driver follow
@@ -62,8 +64,9 @@ Report vulnerabilities privately: see [SECURITY.md](SECURITY.md).
   [Codex](https://github.com/openai/codex) (`codex`), or
   [OpenCode](https://opencode.ai) (`opencode`)
 
-hands is tested with Claude Code 2.1.283, codex-cli 0.160 and OpenCode 2.0.22, or
-later. Older CLIs may not speak the same wire.
+The recordings the suites replay come from Claude Code 2.1.274 (a stream-json seat), codex-cli
+0.160.0 and OpenCode 1.18.30 (`opencode acp` seats; one OpenCode error text is from 2.0.22).
+Other versions may not speak the same wire.
 
 ## Install
 
@@ -135,7 +138,7 @@ validates them, so a model released tomorrow works today.
 | `--timeout SECS` | none | a wall clock per launch, shared by its turns. On expiry the open turn ends `timeout` with its session, and a `send` resumes it |
 | `--idle SECS` | 0 | how long a seat whose turns have all ended waits for the next `send` before its CLI closes (§ The seat's life). A later `send` relaunches it on its session either way |
 | `--effort <tier>` | the CLI's default | see § Providers |
-| `--probe [P\|all]` | | a 1-token ping per provider with its smallest model, in `$TMPDIR` (exit 1 if any is unhealthy). A Claude probe still reads about 31k cached prompt tokens |
+| `--probe [P\|all]` | | a 1-token ping per provider with its smallest model, working in the system temp dir (`$TMPDIR`, else `/tmp`), with its job dir `probe-PID-provider` in the jobs root (exit 1 if any is unhealthy). A Claude probe still reads about 31k cached prompt tokens |
 
 | Environment variable | Effect |
 |---|---|
@@ -160,6 +163,8 @@ to keep.
 | `quota [--json] [provider ...]` | the quota board: one line per provider (§ Quota gauges). Read-only: it never spends | the board, 0 |
 | `stop DIR` | ends a turn in flight: the wrapper closes its CLI as at its deadline (stdin EOF, then TERM at 2 s, KILL at 4 s) and types the open turn and every queued one `incomplete`, rc 143; what is left at 10 s is TERMed, then KILLed. A seat whose turns have all ended is gone already | the envelope, 0 (1 if a wrapper survived) |
 
+A usage error, or a DIR that is not a job dir, prints one line on stderr and exits 2.
+
 A bare buy (no verb) is `start` + `wait`: the seat ends with its turn, so nothing outlives the
 call, and a later `send` resumes the session. Use it only for short tasks. For real work, `start`
 and keep working.
@@ -178,7 +183,7 @@ again whole at every change. Those were about two thirds of a Codex seat's log.
 ## The seat's life
 
 A seat's CLI runs while the seat has a turn to run. `start` launches it with turn 1, and a `send`
-during a turn is taken live (§ The seat). When every delivered turn has ended and nothing is
+during a turn is taken live (§ Providers). When every delivered turn has ended and nothing is
 queued, the wrapper waits `--idle` seconds (none by default) for another `send`, then closes the
 CLI as an idle `stop` would (stdin's end, then TERM at 2 s, KILL at 4 s) and exits: the follow
 view ends, `ps` drops the seat, its processes are gone, and `events.jsonl` ends with an
@@ -187,10 +192,10 @@ keeps its history. On codex the prompt cache keeps too: measured on a resumed `g
 thread of 52k tokens, the first call after the resume was 94% cached against 99% on the live
 seat, about 3k more uncached tokens, and the answer took 3 s instead of 1.
 
-So a seat whose work is done needs no `stop`; `stop` is for a turn in flight. One exception to
-the prompt leave: after a turn that a `send` reached mid-way, a claude seat stays 30 seconds
-longer, because claude queues or steers such a message itself and shows a queued one only by
-starting the next turn. Between turns a `mail` finds no wrapper and waits in the inbox for the
+So a seat whose work is done needs no `stop`; `stop` is for a turn in flight. After a turn that a
+`send` or a `mail` reached mid-way, a claude seat waits at least 30 seconds before it closes (or
+`--idle`, when that is longer), because claude queues or steers such a message itself and shows
+a queued one only by starting the next turn. Between turns a `mail` finds no wrapper and waits in the inbox for the
 next `send`. Nothing the seat left running
 in the CLI's process group outlives the close: a seat that must leave a job running detaches it
 (`setsid nohup ... &`). `--idle 300` keeps a seat up for five minutes between turns, for a run

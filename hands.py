@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """hands: run a task on another provider's coding-agent CLI (claude, codex, opencode) as a
-subagent seat. Each CLI keeps its own login; hands stores no credentials (while a seat runs, its
-job dir keeps the host's push socket path and token: README, Security model).
+subagent seat. Each CLI keeps its own login; hands stores no credentials (each start and send
+from a driver session writes that session's address, for Claude Code its push socket path and
+token, to DIR/driver, which stays until the job dir is deleted: README, Security model).
 
   hands.sh start [opts] provider[:model] prompt-file
         start a seat and return at once: {"status":"spawned","dir":DIR,...}
@@ -313,14 +314,16 @@ def run_verb(args):
     if len(args) < 2 or not os.path.isdir(args[1]):
         say('usage: hands.sh %s DIR ...' % verb)
         return 2
+    if not is_job_dir(args[1]):
+        say('%s is not a job dir (it holds neither prompt.txt nor envelope.json)' % args[1])
+        return 2
     job_dir = os.path.realpath(args[1])
     handle = seat.read_json(os.path.join(job_dir, 'session'))
     if verb == 'mail':
         return mail(job_dir, handle, args[2:])
     if verb == 'wait':
-        mode = args[args.index('--for') + 1] if '--for' in args[:-1] else 'turn'
-        timeout = float(args[args.index('--timeout') + 1]) if '--timeout' in args[:-1] else None
-        return wait(job_dir, handle, mode, timeout) if mode in ('turn', 'mail', 'exit') else 2
+        parsed = wait_args(args[2:])
+        return 2 if parsed is None else wait(job_dir, handle, *parsed)
     if verb == 'events':
         return events(job_dir, '--follow' in args)
     if verb != 'stop':
@@ -332,9 +335,41 @@ def run_verb(args):
     return rc
 
 
+def is_job_dir(path):
+    """Whether hands made this dir: a start's first write in its job dir is prompt.txt, or
+    envelope.json when that start ends before it (its prompt file not found)."""
+    return any(os.path.isfile(os.path.join(path, name))
+               for name in ('prompt.txt', 'envelope.json'))
+
+
+def wait_args(args):
+    """wait's flags -> (mode, timeout), or None after saying what is wrong."""
+    mode, timeout, problem = 'turn', None, ''
+    while args and not problem:
+        flag, value = args[0], args[1] if len(args) > 1 else None
+        if flag not in ('--for', '--timeout'):
+            problem = 'unknown argument %s' % flag
+        elif value is None:
+            problem = '%s needs a value' % flag
+        elif flag == '--for':
+            mode = value
+            if mode not in ('turn', 'mail', 'exit'):
+                problem = "--for takes turn, mail or exit, not '%s'" % mode
+        else:
+            timeout = parse_timeout(value)
+            if timeout is None or timeout is False:
+                problem = '--timeout takes seconds'
+        args = args[2:]
+    if problem:
+        say('%s (usage: hands.sh wait DIR [--for turn|mail|exit] [--timeout S])' % problem)
+        return None
+    return mode, timeout
+
+
 def mail(job_dir, handle, words):
     """Append a driver line to the seat's inbox; the seat's live wrapper delivers it."""
     if not words:
+        say('mail needs a text (usage: hands.sh mail DIR TEXT)')
         return 2
     line = {'t': wires.now(), 'from': 'driver', 'text': ' '.join(words)}
     try:   # never through a link the seat planted

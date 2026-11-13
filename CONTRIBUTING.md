@@ -4,8 +4,8 @@ Thanks for helping. hands is small on purpose, and these rules keep it that way.
 
 ## The surface is frozen
 
-The flags, the six seat verbs (`start`, `send`, `mail`, `wait`, `events`, `stop`) and `quota` are
-the whole interface. A new capability is a separate script that calls `hands.sh`, not another flag. A new
+The flags, the one-shot run, the six seat verbs (`start`, `send`, `mail`, `wait`, `events`,
+`stop`), `ps`, `--probe` and `quota` are the whole interface. A new capability is a separate script that calls `hands.sh`, not another flag. A new
 provider is one entry in the provider table (`PROVIDERS` in `wires.py`), not a flag.
 
 ## Every change is tested
@@ -15,13 +15,14 @@ Run all four suites before a commit. Each must print `0 failed` and exit 0:
 ```bash
 python3 tests/test_wires.py   # the clients and translators on their own (seconds)
 python3 tests/test_cli.py     # hands.py end to end (about a minute)
-python3 tests/test_seat.py    # the wrapper against stub CLIs (about four minutes)
+python3 tests/test_seat.py    # the wrapper against stub CLIs (about five minutes)
 python3 tests/test_quota.py   # the quota board
 ```
 
-They are hermetic: the stub CLIs in `tests/stubs` stand in for the real ones, and nothing
-touches the network or spends quota. To run one test, name it:
-`python3 tests/test_seat.py CodexSeats.test_one_app_server_serves_every_turn`.
+They are hermetic: the stub CLIs in `tests/stubs`, and the curl and codex stubs that
+`tests/test_quota.py` writes, stand in for the real ones, and nothing touches the network or
+spends quota. To run one test, name it:
+`python3 tests/test_seat.py CodexSeats.test_a_seat_ends_with_its_turn_and_a_send_resumes_it`.
 
 A new behavior lands with a test, and the test must be able to fail: revert the fix alone, run
 the test, and see it go red. A test nobody has seen fail proves nothing.

@@ -15,9 +15,13 @@ Read README § Security model before you run a seat. In short:
 - A seat is a coding agent with **full read and write access, running as you**. There is no
   read-only mode. Nothing stops a seat from reading your files, running any command, or
   reaching the network.
-- hands stores no credentials of its own. Each CLI uses its own login. While a seat lives, its
-  job dir holds the host session's push socket path and token (`driver`, mode 0600). A seat
-  can read it.
+- hands stores no credentials of its own. Each CLI uses its own login. Every `start` (or one-shot
+  run) and `send` from a driver session writes what names that session to the job dir's
+  `driver` file (mode 0600): for Claude Code its push socket path, token and session id, for
+  Codex its thread id, for OpenCode its session id. A later command from the same session
+  rewrites it when the session's address changes. Nothing deletes it when the seat ends: it
+  stays until the job dir is deleted (the 30-day sweep, for a dir in the jobs root; an `--out`
+  dir is never swept). Anything that runs as you can read it, every seat included.
 
 In scope: mail that reaches a file it shouldn't, a job dir or temp file that another local user can read or
 replace, credentials that leak into process arguments, logs or job dirs, and the sweep deleting
