@@ -1422,6 +1422,7 @@ class Pushes(unittest.TestCase):
         self.assertNotIn('address changed', stranger.err + nameless.err)
         self.assertEqual(read_json(driver)['address'], [old.path, 'tok-old'])
 
+        time.sleep(2)   # so both held pushes are measurably late: lateness counts whole seconds
         new = harness.DriverSocket(SB.path('restart-new.sock'))   # the resumed session
         try:
             resumed = SB.hands('ps', CLAUDE_CODE_MESSAGING_SOCKET=new.path,
@@ -1494,6 +1495,7 @@ class Pushes(unittest.TestCase):
                             CLAUDE_CODE_SESSION_ID='ses-other')   # another session: left alone
         self.assertNotIn('parked', stranger.err)
         self.assertTrue(os.path.isfile(parked))
+        time.sleep(2)   # so the parked push is measurably late: lateness counts whole seconds
         new = harness.DriverSocket(SB.path('parked-new.sock'))   # the resumed session
         try:
             resumed = SB.hands('quota', CLAUDE_CODE_MESSAGING_SOCKET=new.path,
