@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hands: run a task on another provider's coding-agent CLI (claude, codex, grok, opencode) as a
+"""hands: run a task on another provider's coding-agent CLI (claude, codex, opencode) as a
 subagent seat. Each CLI keeps its own login; hands stores no credentials (while a seat runs, its
 job dir keeps the host's push socket path and token: README, Security model).
 
@@ -16,7 +16,7 @@ job dir keeps the host's push socket path and token: README, Security model).
   hands.sh stop DIR               end a turn in flight: the seat closes as at its deadline, and
         its envelope still lands (a seat whose turns have all ended is gone already)
   hands.sh ps                     every live seat: what it is doing, its last event, its dir
-  hands.sh --probe [claude|codex|grok|opencode|all]
+  hands.sh --probe [claude|codex|opencode|all]
         a one-token ping per provider (it spends a little quota)
   hands.sh quota [--json] [provider ...]
         the quota board: read-only, it never spends
@@ -31,8 +31,7 @@ opts (all before the provider spec; the prompt is always a file):
   --idle SECS      how long a seat whose turns have all ended waits for the next send before
                    its CLI closes (default: 0; a later send relaunches it on its session)
   --effort <tier>  claude, codex: low|medium|high|xhigh|max, passed through (codex adds ultra
-                   where it lists it); grok, opencode: required, a value the model lists
-                   (grok-4.6: low|medium|high|xhigh)
+                   where it lists it); opencode: required, a value the model lists
 
 envelope: {"status":"ok|error|incomplete|cancelled|truncated|timeout|auth-expired|
              provider-quota-dead|not-installed|refused",
@@ -80,9 +79,10 @@ your job dir (the last line of this prompt names it). Mail from the driver arriv
 message that starts "MAIL from driver".
 """
 
+PROVIDER_NAMES = '|'.join(sorted(wires.PROVIDERS))   # the providers, as messages name them
+
 PROBE_SPECS = {   # each provider's smallest model; an ACP seat names an effort its model lists
     'claude': ('claude:haiku', ''),
-    'grok': ('grok', 'low'),
     'opencode': ('opencode:opencode-go/deepseek-v4.1-flash', 'low'),   # its cheapest that works
 }
 
@@ -132,7 +132,7 @@ def buy(spec, prompt_file, options):
     """Make the job dir and its prompt, then launch the seat."""
     provider, _, model = spec.partition(':')
     if not re.fullmatch(r'[a-z0-9]+', provider):   # it names the job dir: only a plain name
-        say("bad provider '%s' (claude|codex|grok|opencode)" % provider)
+        say("bad provider '%s' (%s)" % (provider, PROVIDER_NAMES))
         return 2
     sweep()
     job_dir = make_job_dir(provider, options)
@@ -148,7 +148,7 @@ def buy(spec, prompt_file, options):
         return 2
     write_prompt(job_dir, prompt_file)
     if provider not in wires.PROVIDERS:   # a typo, or a provider hands has no wire for
-        say("unknown provider '%s' (claude|codex|grok|opencode)" % provider)
+        say("unknown provider '%s' (%s)" % (provider, PROVIDER_NAMES))
         end_early(job_dir, 'error', provider, model, 2, options)
         return 2
     return launch(provider, model, job_dir, options)
@@ -286,6 +286,11 @@ def send(job_dir, message_file):
     job_dir = os.path.realpath(job_dir)
     if not os.path.isfile(message_file):
         say('send file not found: %s' % message_file)
+        return 2
+    provider = (seat.read_json(os.path.join(job_dir, 'session')) or {}).get('provider')
+    if provider not in wires.PROVIDERS:   # the handle names a provider with no entry in the table
+        say("%s names provider '%s', which hands does not run (%s)"
+            % (job_dir, provider, PROVIDER_NAMES))
         return 2
     rc = seat.main(['send', job_dir, message_file])
     if rc != 3:

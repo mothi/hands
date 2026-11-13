@@ -1,6 +1,6 @@
 ---
 name: hands
-description: Run a task on another provider's model as a subagent seat — codex (gpt-5.6 sol/terra/luna, gpt-6 astra), grok, opencode (Go plan: deepseek-v4.1-flash, muse-spark-1.3-contributor), or claude (opus, fable 5.1), chosen per call. A seat is a job dir with a session in it, whose CLI runs while it has a turn and ends with its last one — start it, send it turns, mail it, wait on it, read its events — and every turn ends in a typed envelope. Use when the user says hands, ask codex/grok, or wants a second opinion from another model. Bare "hands" with no task = interactive guided setup (the quota board, then a few questions).
+description: Run a task on another provider's model as a subagent seat — codex (gpt-5.6 sol/terra/luna, gpt-6 astra), opencode (Go plan: deepseek-v4.1-flash, muse-spark-1.3-contributor), or claude (opus, fable 5.1), chosen per call. A seat is a job dir with a session in it, whose CLI runs while it has a turn and ends with its last one — start it, send it turns, mail it, wait on it, read its events — and every turn ends in a typed envelope. Use when the user says hands, ask codex, or wants a second opinion from another model. Bare "hands" with no task = interactive guided setup (the quota board, then a few questions).
 ---
 
 # hands: subagent seats on other providers' CLIs
@@ -27,7 +27,7 @@ $H quota                           # the quota board: read-only, it never spends
 
 - Buy real work with `start` and keep working. Never run `wait` in the foreground: it blocks
   your session for the whole turn. In Claude Code, Codex and OpenCode each turn's answer arrives
-  as a push, a new message in your session; in Grok or a plain shell, run `wait` as a background
+  as a push, a new message in your session; in a plain shell, run `wait` as a background
   command, or poll `wait DIR --timeout 60`.
 - Let the user watch each seat. Right after each `start` and `send`, run
   `hands.sh events DIR --follow` as a background command (in Claude Code, Bash with
@@ -64,7 +64,7 @@ $H quota                           # the quota board: read-only, it never spends
   call (`wait --timeout` prints both), not by its process. A fresh seat can be silent for half a
   minute.
 - A send to a busy seat never cancels its turn: claude and codex steer it into the running
-  turn; grok and opencode queue it behind that turn.
+  turn; opencode queues it behind that turn.
 - Between turns a seat has no process: a `mail` then waits in the inbox for the next `send`. To
   ask an idle seat something, `send` it.
 - Every prompt starts with the seat contract (`SEAT_BOX` in `hands.py`). It tells the seat how to
@@ -85,11 +85,11 @@ session, turn, delivery, and a reason when there is one.
 - `usage` is the turn's own tokens: `in` (uncached), `cache_read`, `cache_write`, `out`, and
   `cost_usd` when the provider reports it. Nothing is retried for you.
 
-## Grok and OpenCode seats
+## OpenCode seats
 
-- Name the model and an effort it lists, for example `--effort low grok:grok-4.6` or
-  `--effort low opencode:opencode-go/deepseek-v4.1-flash` (grok-4.6: low, medium, high, xhigh;
-  deepseek-v4.1-flash: low, high, max). Anything else is refused before the first prompt.
+- Name the model and an effort it lists, for example
+  `--effort low opencode:opencode-go/deepseek-v4.1-flash` (deepseek-v4.1-flash: low, high, max).
+  Anything else is refused before the first prompt.
 - OpenCode ids are `provider/model` on the user's own OpenCode setup. The muse `-contributor`
   models train on their prompts: never send them work the user would not publish.
 - An OpenCode turn abandoned midway (a stop, a crash) has its session deleted, so a later `send`
@@ -100,7 +100,7 @@ session, turn, delivery, and a reason when there is one.
 1. Run `hands.sh quota` and show the board.
 2. Ask, in one compact message or the host's question UI, for the task (if missing) and the
    seat: providers that are alive, with one recommended. Ask for a `--cwd` only when the task
-   edits an unclear tree (default: a scratch dir), and for `--effort` on codex, grok and
+   edits an unclear tree (default: a scratch dir), and for `--effort` on codex and
    opencode. Leave the timeout and the out dir at their defaults, and name them when you confirm.
 3. Show the exact `hands.sh` command before you run it.
 

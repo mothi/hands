@@ -17,7 +17,7 @@ import time
 import unittest
 
 import harness
-from harness import (GROK_SESSION, OPENCODE_SESSION, envelope, events, first_index, read_json,
+from harness import (OPENCODE_SESSION, envelope, events, first_index, read_json,
                      read_text, result, turn_ends, wait_until)
 
 import seat
@@ -25,7 +25,6 @@ import wires
 
 SB = None
 SLOW_LAUNCH = None
-GROK = 'grok:grok-4.6'
 OPENCODE = 'opencode:opencode-go/deepseek-v4.1-flash'
 CODEX = 'codex:gpt-5.6-terra'
 CLAUDE = 'claude:sonnet'
@@ -44,11 +43,11 @@ def setUpModule():
         os.makedirs(SB.path(name))
     # An ACP handshake whose first two answers come 35 s late each: a launch past a minute,
     # every call within its bound. It runs while the other tests do; SlowLaunch checks it.
-    rows = harness.without_cancel(harness.transcript('grok-acp-seat-sample.jsonl'))
-    slow = save('grok-slow.jsonl', harness.with_delays(rows, 35, 2))
+    rows = harness.without_cancel(harness.transcript('opencode-acp-seat-sample.jsonl'))
+    slow = save('opencode-slow.jsonl', harness.with_delays(rows, 35, 2))
     job = SB.path('slow-launch')
-    SLOW_LAUNCH = SB.popen('start', '--effort', 'low', '--cwd', SB.path('tmp'), '--out', job,
-                           GROK, SB.task, STUB_REPLAY=slow, STUB_LOG=job + '.stub.jsonl')
+    SLOW_LAUNCH = SB.popen('start', '--effort', 'low', '--cwd', SB.path('gdir'), '--out', job,
+                           OPENCODE, SB.task, STUB_REPLAY=slow, STUB_LOG=job + '.stub.jsonl')
 
 
 def tearDownModule():
@@ -126,36 +125,29 @@ class SeatChecks(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------
-# ACP seats: grok and opencode
+# ACP seats: opencode
 
 
 class AcpSeats(SeatChecks):
-    """Each CLI's recorded 4-turn seat on one agent (kept up between turns by --idle), then a
+    """The CLI's recorded 4-turn seat on one agent (kept up between turns by --idle), then a
     relaunch that resumes it."""
 
     @classmethod
     def setUpClass(cls):
-        cls.grok, run = SB.start('acp-grok', GROK, '--effort', 'low', '--idle', '60', '--cwd',
-                                 SB.path('tmp'))
-        cls.grok_ack = run.json
         cls.opencode = SB.path('acp-opencode')
         run = SB.hands('start', '--effort', 'low', '--idle', '60', '--cwd', SB.path('gdir'),
                        '--out', 'acp-opencode', OPENCODE, SB.task, OPENCODE_API_KEY='sk-caller-env',
                        STUB_LOG=cls.opencode + '.stub.jsonl')   # a relative --out
         cls.opencode_ack = run.json
         cls.before = {}
-        for job in (cls.grok, cls.opencode):
-            for _ in range(3):
-                SB.wait(job)
-                SB.send(job)
+        job = cls.opencode
+        for _ in range(3):
             SB.wait(job)
-            stream = harness.read_jsonl(os.path.join(job, 'stream.jsonl'))
-            cls.before[job] = (events(job), result(job), stream)
-            SB.stop(job)
-        resume = os.path.join(harness.FIXTURES, 'grok-acp-resume-sample.jsonl')
-        cls.grok_resume = SB.send(cls.grok, STUB_REPLAY=resume).json
-        SB.wait(cls.grok)
-        SB.stop(cls.grok)
+            SB.send(job)
+        SB.wait(job)
+        stream = harness.read_jsonl(os.path.join(job, 'stream.jsonl'))
+        cls.before[job] = (events(job), result(job), stream)
+        SB.stop(job)
         resume = os.path.join(harness.FIXTURES, 'opencode-acp-resume-sample.jsonl')
         cls.opencode_resume = SB.send(cls.opencode, STUB_REPLAY=resume,
                                       OPENCODE_API_KEY='sk-caller-env').json
@@ -176,15 +168,6 @@ class AcpSeats(SeatChecks):
             self.assertEqual(result(job, turn), 'PONG')
         self.assertEqual(first.cwd, harness.handle(job)['cwd'])   # the agent runs in the seat's cwd
 
-    def test_a_grok_seat_runs_four_turns_on_one_agent(self):
-        self.assertFourTurnsOnOneAgent(self.grok, self.grok_ack, GROK_SESSION, 'reasoning_effort')
-        first = agent(self.grok)
-        self.assertEqual(first.argv, ['agent', '--no-leader', '--always-approve', '-m', 'grok-4.6',
-                                      'stdio'])
-        self.assertEqual(first.values.get('GROK_DISABLE_AUTOUPDATER'), '1')
-        hooks = [first.values.get('GROK_%s_HOOKS_ENABLED' % k) for k in ('CLAUDE', 'CURSOR')]
-        self.assertEqual(hooks, ['0', '0'])   # no hooks of the user's run in a seat
-
     def test_an_opencode_seat_runs_a_bare_acp_and_sets_its_effort(self):
         self.assertFourTurnsOnOneAgent(self.opencode, self.opencode_ack, OPENCODE_SESSION,
                                        'effort')
@@ -192,57 +175,55 @@ class AcpSeats(SeatChecks):
         self.assertEqual(first.argv, ['acp'])
         self.assertNotIn('OPENCODE_CONFIG_CONTENT', first.env)   # 2.x takes no model from it
 
-    def test_both_wires_speak_the_event_vocabulary(self):
+    def test_the_wire_speaks_the_event_vocabulary(self):
         kinds = ['turn_start', 'text', 'thought', 'tool_call', 'tool_result', 'file', 'usage',
                  'turn_end', 'progress']
-        for job in (self.grok, self.opencode):
-            found, text, _ = self.before[job]
-            self.assertVocabulary(found, kinds, ['ok', 'ok', 'cancelled', 'ok'], 'DONE', text)
-
-    def test_the_answer_is_only_the_text_after_the_last_tool(self):
-        found = self.before[self.grok][0]
-        said = ''.join(e.get('text', '') for e in found if e['turn'] == 4 and e['kind'] == 'text')
-        self.assertNotEqual(said.strip(), 'DONE')    # grok narrated before its tool...
-        self.assertTrue(said.rstrip().endswith('DONE'))
-        self.assertEqual(result(self.grok, 4), 'DONE')   # ...and only the answer counts
+        found, text, _ = self.before[self.opencode]
+        self.assertVocabulary(found, kinds, ['ok', 'ok', 'cancelled', 'ok'], 'DONE', text)
 
     def test_a_cancelled_turn(self):
-        for job, closed_by_client in ((self.grok, True), (self.opencode, False)):
-            turn = [e for e in self.before[job][0] if e['turn'] == 3]
-            end = envelope(job, 3)
-            self.assertEqual((end['status'], end['rc']), ('cancelled', 1))
-            self.assertEqual(result(job, 3), '')
-            calls = [e['call'] for e in turn if e['kind'] == 'tool_call']
-            uses = [e for e in turn if e['kind'] == 'usage']
-            closes = [(e['call'], e['status'], e.get('synthetic')) for e in turn
-                      if e['kind'] == 'tool_result']
-            self.assertEqual((len(calls), len(uses)), (1, 1))
-            if closed_by_client:   # grok leaves its tool open: the client closes it; usage is real
-                self.assertEqual(closes, [(calls[0], 'cancelled', True)])
-                self.assertEqual(end['usage'], dict(uses[0]['usage'], cost_usd=uses[0]['cost_usd']))
-                self.assertGreater(end['usage']['in'], 0)
-            else:                  # opencode closes its own, and reports zeros: usage unknown
-                self.assertEqual(closes, [(calls[0], 'ok', None)])
-                self.assertIs(uses[0].get('usage_unknown'), True)
-                self.assertIsNone(end['usage'])
+        job = self.opencode
+        turn = [e for e in self.before[job][0] if e['turn'] == 3]
+        end = envelope(job, 3)
+        self.assertEqual((end['status'], end['rc']), ('cancelled', 1))
+        self.assertEqual(result(job, 3), '')
+        calls = [e['call'] for e in turn if e['kind'] == 'tool_call']
+        uses = [e for e in turn if e['kind'] == 'usage']
+        closes = [(e['call'], e['status'], e.get('synthetic')) for e in turn
+                  if e['kind'] == 'tool_result']
+        self.assertEqual((len(calls), len(uses)), (1, 1))
+        # opencode closes its own, and reports zeros: usage unknown
+        self.assertEqual(closes, [(calls[0], 'ok', None)])
+        self.assertIs(uses[0].get('usage_unknown'), True)
+        self.assertIsNone(end['usage'])
 
     def test_one_edit_reported_twice_is_one_file_event(self):
-        stream = self.before[self.grok][2]
+        # opencode sends an in_progress update again unchanged (turn 3's shell call has two);
+        # here the edit's update of turn 4 comes twice
+        rows = seat_transcript('opencode')
+        edit = next(i for i, r in enumerate(rows) if r['dir'] == 'in'
+                    and ((r['msg'].get('params') or {}).get('update') or {}).get('kind') == 'edit'
+                    and r['msg']['params']['update'].get('locations'))
+        rows.insert(edit + 1, rows[edit])
+        job, _ = SB.start('acp-edit-twice', OPENCODE, '--effort', 'low', '--idle', '60',
+                          '--cwd', SB.path('gdir'), STUB_REPLAY=save('oc-edit-twice.jsonl', rows))
+        for _ in range(3):
+            SB.wait(job)
+            SB.send(job)
+        SB.wait(job)
+        SB.stop(job)
+        stream = harness.read_jsonl(os.path.join(job, 'stream.jsonl'))
         updates = [(r['msg'].get('params') or {}).get('update') for r in stream
                    if r['dir'] == 'in' and isinstance(r['msg'], dict)]
         raw = [e for u in updates if isinstance(u, dict) and 'sessionUpdate' in u
                for e in wires.acp_events(u, 0) if e['kind'] == 'file']
-        kept = [e for e in self.before[self.grok][0] if e['kind'] == 'file' and e['turn'] == 4]
+        kept = [e for e in events(job) if e['kind'] == 'file' and e['turn'] == 4]
         self.assertEqual(len(raw), 2)   # the wire reports the one edit twice
         self.assertEqual([(e['call'], e['path']) for e in kept], [(raw[0]['call'], raw[0]['path'])])
 
-    def test_usage_counts_reasoning_as_output_on_both_wires(self):
-        self.assertEqual(envelope(self.grok, 1)['usage'],   # grok's output already holds it
-                         {'in': 20434, 'out': 28, 'cache_read': 128, 'cache_write': 0,
-                          'reasoning': 26, 'cost_usd': 0.013974})
+    def test_usage_counts_reasoning_as_output(self):
         self.assertEqual(envelope(self.opencode, 4)['usage'],   # opencode's: 3 + 82 thought
                          {'in': 301, 'out': 85, 'cache_read': 12672, 'reasoning': 82})
-        self.assertIn('"cost_usd": 0.013974', read_text(os.path.join(self.grok, 'events.jsonl')))
 
     def assertResumed(self, job, ack, session):
         self.assertEqual(ack['expect'], 5)
@@ -258,10 +239,6 @@ class AcpSeats(SeatChecks):
         self.assertEqual((end['turn'], end['status'], end['session']), (5, 'ok', session))
         self.assertEqual(result(job, 5), 'PONG')
         return second
-
-    def test_a_send_to_a_stopped_grok_seat_resumes_its_session(self):
-        second = self.assertResumed(self.grok, self.grok_resume, GROK_SESSION)
-        self.assertEqual(second.argv[-3:], ['-m', 'grok-4.6', 'stdio'])
 
     def test_a_send_to_a_stopped_opencode_seat_resumes_its_session(self):
         second = self.assertResumed(self.opencode, self.opencode_resume, OPENCODE_SESSION)
@@ -285,11 +262,6 @@ class AcpSeats(SeatChecks):
                           if x.argv[:1] == ['session']], [])
 
     def test_each_seat_runs_a_private_agent(self):
-        for launch in SB.stub_log(self.grok).seats():
-            argv = launch.argv
-            self.assertIn('--no-leader', argv[:argv.index('stdio')])
-            self.assertFalse({'--leader', '--leader-socket', 'leader', 'serve', 'headless'}
-                             & set(argv))
         for launch in SB.stub_log(self.opencode).seats():
             self.assertEqual(launch.argv, ['acp'])   # its own child server: no attach flag exists
 
@@ -313,12 +285,12 @@ class AcpLaunch(SeatChecks):
 
     def test_what_the_agent_does_not_list_is_refused_before_any_prompt(self):
         refusals = [
-            SB.buy('acp-effort-max', GROK, '--effort', 'max', '--cwd', SB.path('tmp'))
+            SB.buy('acp-effort-xhigh', OPENCODE, '--effort', 'xhigh', '--cwd', SB.path('gdir'))
             + ('effort-unsupported',),
             SB.buy('acp-no-effort', OPENCODE, '--cwd', SB.path('gdir'))
             + ('effort-unsupported',),   # the engine never guesses one
-            SB.start('acp-no-model', 'grok:grok-9.9', '--effort', 'low', '--cwd', SB.path('tmp'))
-            + ('model-mismatch',),       # never substituted
+            SB.start('acp-no-model', 'opencode:opencode-go/nope-9.9', '--effort', 'low',
+                     '--cwd', SB.path('gdir')) + ('model-mismatch',),       # never substituted
         ]
         for job, run, reason in refusals:
             self.assertEqual(run.rc, 2, job)
@@ -328,15 +300,19 @@ class AcpLaunch(SeatChecks):
             self.assertIn('initialize', methods)
             self.assertNotIn('session/prompt', methods)
             self.assertFalse(os.path.exists(os.path.join(job, 'turn-1')))
-        self.assertIn('runs grok-4.6 and lists grok-4.7, grok-4.7-build-fast, grok-4.6, grok-4.5; '
-                      'the seat names grok-9.9', envelope(refusals[2][0])['reset'])
+        why = envelope(refusals[2][0])['reset']
+        self.assertIn('runs opencode-go/deepseek-v4.1-flash and lists '
+                      'opencode-go/deepseek-v4-flash, opencode-go/deepseek-v4-flash-vision-exp, ',
+                      why)
+        self.assertIn('; the seat names opencode-go/nope-9.9', why)
 
     def test_a_usage_limit_answering_a_prompt_is_provider_quota_dead(self):
-        text = read_text(os.path.join(harness.FIXTURES, 'grok-402-balance.txt'))
-        rows = harness.first_prompt_fails(harness.transcript('grok-acp-seat-sample.jsonl'), text)
-        job, _ = SB.buy('acp-402', GROK, '--effort', 'low', STUB_REPLAY=save('402.jsonl', rows))
+        text = read_text(os.path.join(harness.FIXTURES, 'opencode-openrouter-402.txt'))
+        rows = harness.first_prompt_fails(harness.transcript('opencode-acp-seat-sample.jsonl'),
+                                          text)
+        job, _ = SB.buy('acp-402', OPENCODE, '--effort', 'low', STUB_REPLAY=save('402.jsonl', rows))
         self.assertEqual((envelope(job)['status'], envelope(job)['session']),
-                         ('provider-quota-dead', GROK_SESSION))
+                         ('provider-quota-dead', OPENCODE_SESSION))
 
     def test_a_missing_login_answering_a_prompt_is_auth_expired(self):
         text = read_text(os.path.join(harness.FIXTURES, 'opencode-missing-api-key.txt'))
@@ -349,13 +325,13 @@ class AcpLaunch(SeatChecks):
                          ('auth-expired', 1, OPENCODE_SESSION))
 
     def test_a_stop_during_the_launch(self):
-        rows = seat_transcript('grok')
+        rows = seat_transcript('opencode')
         cases = {'ends-3s': harness.with_delays(rows, 3, 1),        # the handshake ends 3 s in
                  'still-going': harness.with_delays(rows, 35, 2)}   # still answering at the stop
         for name, case in cases.items():
             job = SB.path('acp-stop-launch-' + name)
-            starting = SB.popen('start', '--effort', 'low', '--cwd', SB.path('tmp'), '--out', job,
-                                GROK, SB.task, STUB_REPLAY=save(name + '.jsonl', case),
+            starting = SB.popen('start', '--effort', 'low', '--cwd', SB.path('gdir'), '--out', job,
+                                OPENCODE, SB.task, STUB_REPLAY=save(name + '.jsonl', case),
                                 STUB_LOG=job + '.stub.jsonl')
             self.assertTrue(wait_until(lambda: SB.stub_log(job).launches()
                                        and agent(job).lines))   # the wrapper is in the handshake
@@ -375,8 +351,8 @@ class AcpClose(SeatChecks):
     """Stops, deadlines and what an ACP seat leaves behind when one cuts its turn."""
 
     def test_a_stop_mid_turn_reaps_the_agent_and_its_group(self):
-        job, _ = SB.start('acp-stop', GROK, '--effort', 'low', '--cwd', SB.path('tmp'),
-                          STUB_REPLAY=hung('grok'), STUB_MODE='stubborn')
+        job, _ = SB.start('acp-stop', OPENCODE, '--effort', 'low', '--cwd', SB.path('gdir'),
+                          STUB_REPLAY=hung('opencode'), STUB_MODE='stubborn')
         self.assertTrue(wait_until(lambda: turn_started(job) and agent(job).children))
         self.assertEqual(SB.stop(job).rc, 0)
         cli = agent(job)
@@ -384,15 +360,14 @@ class AcpClose(SeatChecks):
         self.assertGone(job, *cli.children)
         end = envelope(job)
         self.assertEqual((end['status'], end['rc'], end['turn'], end['session']),
-                         ('incomplete', 143, 1, GROK_SESSION))
-        self.assertEqual([x for x in SB.stub_log(job).launches() if x.argv[:1] == ['session']], [])
+                         ('incomplete', 143, 1, OPENCODE_SESSION))
 
     def test_a_deadline_mid_turn_is_a_timeout_that_keeps_its_session(self):
-        job, _ = SB.buy('acp-deadline', GROK, '--effort', 'low', '--timeout', '3',
-                        '--cwd', SB.path('tmp'), STUB_REPLAY=hung('grok'))
+        job, _ = SB.buy('acp-deadline', OPENCODE, '--effort', 'low', '--timeout', '3',
+                        '--cwd', SB.path('gdir'), STUB_REPLAY=hung('opencode'))
         end = envelope(job)
         self.assertEqual((end['status'], end['rc'], end['turn'], end['session']),
-                         ('timeout', 142, 1, GROK_SESSION))
+                         ('timeout', 142, 1, OPENCODE_SESSION))
         self.assertEqual(agent(job).ended[:1], ['eof'])   # closed politely: stdin first, no TERM
 
     def test_a_turn_the_agent_cancels_at_the_deadline_is_still_a_timeout(self):
@@ -448,14 +423,14 @@ class AcpClose(SeatChecks):
         self.assertEqual(deletes[0].cwd, SB.path('gdir'))
 
     def test_an_acp_seat_ends_with_its_turn_and_a_send_resumes_it(self):
-        job, _ = SB.start('acp-ends', GROK, '--effort', 'low', '--cwd', SB.path('tmp'))
+        job, _ = SB.start('acp-ends', OPENCODE, '--effort', 'low', '--cwd', SB.path('gdir'))
         SB.wait(job, '--timeout', '30')
         self.assertGone(job)   # no stop: the wrapper left when turn 1 ended
         first = agent(job)
         self.assertEqual(first.methods(), ['initialize', 'session/new', 'session/set_config_option',
                                            'session/prompt'])
         self.assertEqual(first.ended, ['eof'])
-        resume = os.path.join(harness.FIXTURES, 'grok-acp-resume-sample.jsonl')
+        resume = os.path.join(harness.FIXTURES, 'opencode-acp-resume-sample.jsonl')
         ack = SB.send(job, STUB_REPLAY=resume).json
         SB.wait(job, '--timeout', '30')
         self.assertGone(job)
@@ -463,7 +438,7 @@ class AcpClose(SeatChecks):
         second = agent(job, 1)
         self.assertEqual(second.methods(), ['initialize', 'session/resume',
                                             'session/set_config_option', 'session/prompt'])
-        self.assertEqual(second.messages()[1][1]['sessionId'], GROK_SESSION)
+        self.assertEqual(second.messages()[1][1]['sessionId'], OPENCODE_SESSION)
         self.assertEqual([envelope(job, n)['status'] for n in (1, 2)], ['ok', 'ok'])
         self.assertEqual(result(job, 2), 'PONG')
         self.assertEqual([e.get('idle') for e in progress(job, 'exit rc=')], [True, True])
@@ -481,7 +456,7 @@ class AcpClose(SeatChecks):
         self.assertTrue(any('seat.py reap 0 ' in line for line in children), children)
 
     def test_driver_mail_to_a_busy_seat_waits_behind_its_turn(self):
-        job, _ = SB.start('acp-mail', GROK, '--effort', 'low', '--cwd', SB.path('tmp'),
+        job, _ = SB.start('acp-mail', OPENCODE, '--effort', 'low', '--cwd', SB.path('gdir'),
                           STUB_MODE='slow', STUB_SLEEP='4')
         SB.hands('mail', job, 'while you work')
         # two 4-second turns: more than the default 10-second wait on a slow runner
@@ -499,7 +474,7 @@ class AcpClose(SeatChecks):
         self.assertEqual(prompts[1], 'MAIL from driver:\nwhile you work')
 
     def test_a_send_while_a_turn_runs_queues_behind_it(self):
-        job, _ = SB.start('acp-queue', GROK, '--effort', 'low', '--cwd', SB.path('tmp'),
+        job, _ = SB.start('acp-queue', OPENCODE, '--effort', 'low', '--cwd', SB.path('gdir'),
                           STUB_MODE='slow')
         sent = SB.send(job).json
         SB.wait(job, '--timeout', '30')
@@ -1614,8 +1589,7 @@ class Pushes(unittest.TestCase):
         self.assertEqual([e.get('id') for e in self.outcomes(job)], ['%s:1' % job])
 
     def test_every_wire_captures_the_driver_and_no_cli_sees_it(self):
-        answers = {'claude': 'bg=1 mem=1 turn=1', 'codex': 'stub ok', 'grok': 'PONG',
-                   'opencode': 'PONG'}
+        answers = {'claude': 'bg=1 mem=1 turn=1', 'codex': 'stub ok', 'opencode': 'PONG'}
         every_host = self.driver_env(CODEX_THREAD_ID='test-th', OPENCODE_SESSION_ID='test-ses')
         for cli, spec in harness.SPECS.items():
             job, _ = SB.buy('push-wire-' + cli, spec, '--effort', 'low', '--cwd', SB.path('tmp'),
@@ -1640,13 +1614,12 @@ class Pushes(unittest.TestCase):
 
 
     def test_a_relaunch_captures_the_socket_and_hides_it(self):
-        answers = {'claude': 'bg=1 mem=1 turn=1', 'codex': 'stub ok', 'grok': 'PONG',
-                   'opencode': 'PONG'}
+        answers = {'claude': 'bg=1 mem=1 turn=1', 'codex': 'stub ok', 'opencode': 'PONG'}
         for cli, spec in harness.SPECS.items():
             job, _ = SB.buy('push-relaunch-' + cli, spec, '--effort', 'low',
                             '--cwd', SB.path('tmp'))   # bought with no socket
             replay = {}
-            if cli in ('grok', 'opencode'):
+            if cli == 'opencode':
                 replay['STUB_REPLAY'] = os.path.join(harness.FIXTURES,
                                                      '%s-acp-resume-sample.jsonl' % cli)
             SB.send(job, **self.driver_env(**replay))
@@ -1798,8 +1771,7 @@ class FailureText(unittest.TestCase):
         return seat.classify(read_text(os.path.join(harness.FIXTURES, fixture)))
 
     def test_usage_limits_are_provider_quota_dead_with_their_reset(self):
-        for name in ('grok-402-balance', 'grok-403-spending', 'claude-session-limit',
-                     'codex-usage-limit'):
+        for name in ('claude-session-limit', 'codex-usage-limit'):
             self.assertEqual(self.classify(name + '.txt')[0], 'provider-quota-dead', name)
         self.assertIn('resets 6:20am', self.classify('claude-session-limit.txt')[1].lower())
         self.assertIn('again at aug', self.classify('codex-usage-limit.txt')[1].lower())
@@ -1810,7 +1782,7 @@ class FailureText(unittest.TestCase):
             self.assertEqual(self.classify(name + '.txt'), ('provider-quota-dead', ''), name)
 
     def test_logins_are_auth_expired(self):
-        for name in ('grok-auth-expired', 'claude-oauth-expired', 'opencode-go-no-credential'):
+        for name in ('claude-oauth-expired', 'opencode-go-no-credential'):
             self.assertEqual(self.classify(name + '.txt')[0], 'auth-expired', name)
 
     def test_other_text_is_an_error(self):

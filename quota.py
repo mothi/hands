@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """quota -- how much of each provider's quota is used, and when it resets.
 
-    hands.sh quota [--json] [claude|codex|grok|opencode ...]
+    hands.sh quota [--json] [claude|codex|opencode ...]
 
-One line per provider (all four by default), or one JSON document with --json. It only reads:
+One line per provider (all three by default), or one JSON document with --json. It only reads:
 it never spends quota, never starts a seat, and always exits 0. A provider it cannot read is
 shown as unknown, with the reason.
 
@@ -12,10 +12,9 @@ Where each reading comes from:
             credential, no endpoint. The line says how old the reading is; hands.sh --probe
             claude takes a fresh one.
   codex     the codex CLI's own app-server, asked account/rateLimits/read. No credential.
-  grok      cli-chat-proxy.grok.com/v1/billing, with the token from ~/.grok/auth.json
   opencode  opencode.ai/zen/go/v1/usage (the Go plan), with the key from opencode's auth.json
 
-The grok and opencode endpoints are undocumented and may change. Their token goes to curl on
+The opencode endpoint is undocumented and may change. Its token goes to curl on
 stdin, never on its command line. Raw replies are never printed or stored: only the numbers
 below leave this file, and a provider's error text is masked before it is shown.
 """
@@ -84,11 +83,9 @@ def raise_if_error(reply):
     return reply
 
 
-def fetch(url, token, *headers):
+def fetch(url, token):
     """GET url with a bearer token. The token goes to curl on stdin: ps shows argv to all."""
     argv = ['curl', '-sS', '--max-time', '20', url, '-H', '@-']
-    for header in headers:
-        argv += ['-H', header]
     try:
         done = subprocess.run(argv, input='Authorization: Bearer %s\n' % token,
                               capture_output=True, text=True)
@@ -246,21 +243,6 @@ def kill_group(pid):
         pass
 
 
-def read_grok():
-    path = os.path.expanduser('~/.grok/auth.json')
-    key = read_login(path, lambda auth: next(iter(auth.values()))['key'])
-    reply = parse_reply(fetch('https://cli-chat-proxy.grok.com/v1/billing?format=credits', key,
-                              'x-grok-client-mode: build'))
-    config = reply.get('config') or {}
-    used = config.get('creditUsagePercent')
-    # The gateway leaves out a zero, so a new billing period has no creditUsagePercent at all.
-    # That reads as 0 only while the period's end is there to show the reply is a real one.
-    if used is None and config.get('billingPeriodEnd'):
-        used = 0.0
-    found = window('week', used, config.get('billingPeriodEnd'))
-    return {'windows': [found] if found else []}
-
-
 def read_opencode():
     data = os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
     path = os.path.join(data, 'opencode', 'auth.json')
@@ -277,7 +259,6 @@ def read_opencode():
 READERS = {
     'claude': read_claude,
     'codex': read_codex,
-    'grok': read_grok,
     'opencode': read_opencode,
 }
 

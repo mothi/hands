@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Tests for wires.py with no seat around it: the ACP and JSON-RPC clients against the stub
-agent (tests/stubs/grok) replaying recorded grok and opencode transcripts, and the translators,
+agent (tests/stubs/opencode) replaying recorded opencode transcripts, and the translators,
 usage normalizer and command builders on their own. Run: python3 tests/test_wires.py"""
 import contextlib
 import io
@@ -18,15 +18,8 @@ import harness
 
 import wires
 
-AGENT = os.path.join(harness.STUBS, 'grok')
+AGENT = os.path.join(harness.STUBS, 'opencode')
 # The event kinds of each recorded turn, derived by hand from the raw update order.
-GROK_TURNS = [
-    'turn_start progress*3 thought*16 text*2 progress*2 usage turn_end',
-    'turn_start progress*2 thought*39 text*2 progress*2 usage turn_end',
-    'turn_start progress*3 thought*42 text*15 progress*3 tool_call progress*5 tool_result usage '
-    'turn_end',
-    'turn_start progress*2 thought*42 text progress*2 usage turn_end',
-]
 OPENCODE_TURNS = [
     'turn_start text progress usage turn_end',
     'turn_start text progress usage turn_end',
@@ -151,34 +144,6 @@ class AcpClient(unittest.TestCase):
             readable = client.fds()[0]
         return answers[0], found + wires.acp_events(answers[0], number, None, provider)
 
-    def test_a_recorded_grok_seat_round_trips(self):
-        client = self.agent(os.path.join(harness.FIXTURES, 'grok-acp-sample.jsonl'))
-        self.assertTrue(client.initialize()['loadSession'])
-        session = '01a0d35c-6d25-77c1-b7bd-1a71c642327e'
-        self.assertEqual(client.new_session(), session)
-        self.assertEqual((client.current_value('model'), client.current_value('thought_level')),
-                         ('grok-4.6', 'xhigh'))
-        self.assertEqual(client.listed_values('thought_level'), ['xhigh', 'high', 'medium', 'low'])
-        self.assertIsNone(client.listed_values('nope'))
-        self.assertEqual(client.set_option('thought_level', 'low'), 'low')
-        turns = [self.turn(client, n, text, 'grok')
-                 for n, text in ((1, 'PONG'), (2, 'said?'), (3, 'sleep'), (4, 'AFTER'))]
-        self.assertEqual([kinds(found) for _, found in turns], GROK_TURNS)
-        ends = [(f[-1]['status'], f[-1]['text'], f[-1]['final'], f[-1]['session'])
-                for _, f in turns]
-        self.assertEqual(ends, [(status, text, 'boundary', session) for status, text in
-                                (('ok', 'PONG'), ('ok', 'PONG'), ('cancelled', ''),
-                                 ('ok', 'AFTER'))])
-        cancelled = turns[2][1]
-        closed = [(e['call'], e['status'], e.get('synthetic')) for e in cancelled
-                  if e['kind'] == 'tool_result']
-        self.assertEqual(closed, [('call-44db5404-56c6-4801-b4cc-522d9916cad1-0', 'cancelled',
-                                   True)])
-        used = [e for e in cancelled if e['kind'] == 'usage'][0]   # real, though it was cancelled
-        self.assertEqual((used['usage']['in'], used['usage']['cache_read'], used['cost_usd']),
-                         (17746, 2816, 0.01272144))
-        self.assertEqual(client.close(), 0)
-
     def test_a_recorded_opencode_seat_round_trips(self):
         client = self.agent(os.path.join(harness.FIXTURES, 'opencode-acp-sample.jsonl'))
         self.assertTrue(client.initialize()['loadSession'])
@@ -186,6 +151,7 @@ class AcpClient(unittest.TestCase):
                           client.current_value('thought_level')),
                          ('ses_f2ca45c73ffe55AqfFsvtJPq2O', 'opencode-go/deepseek-v4.1-flash',
                           'low'))
+        self.assertIsNone(client.listed_values('nope'))
         turns = [self.turn(client, n, text, 'opencode')
                  for n, text in ((1, 'PONG'), (2, 'said?'), (3, 'sleep'), (4, 'AFTER'))]
         self.assertEqual([kinds(found) for _, found in turns], OPENCODE_TURNS)
@@ -220,8 +186,8 @@ class AcpClient(unittest.TestCase):
         self.assertEqual(sent[4]['error']['code'], -32601)   # fs/* was never offered
         _, found = self.turn(client, 2, 'the agent dies mid-turn')
         self.assertEqual(kinds(found), 'turn_start tool_call tool_result error turn_end')
-        self.assertEqual((found[-1]['status'], found[2]['status'], found[2]['call']),
-                         ('incomplete', 'cancelled', 'c2'))
+        self.assertEqual((found[-1]['status'], found[2]['status'], found[2]['call'],
+                          found[2].get('synthetic')), ('incomplete', 'cancelled', 'c2', True))
         self.assertEqual(client.close(), 1)
 
     def test_close_frees_a_prompt_whose_pipe_an_escaped_child_holds(self):
@@ -323,9 +289,6 @@ class Translation(unittest.TestCase):
 
     def test_usage_is_normalized_per_provider(self):
         cases = [
-            ({'inputTokens': 20429, 'outputTokens': 18, 'totalTokens': 20447,
-              'cachedReadTokens': 128, 'cacheCreationTokens': 0, 'reasoningTokens': 16}, 'grok',
-             {'in': 20301, 'out': 18, 'cache_read': 128, 'cache_write': 0, 'reasoning': 16}),
             ({'inputTokens': 197, 'outputTokens': 3, 'totalTokens': 12764, 'thoughtTokens': 20,
               'cachedReadTokens': 12544}, 'opencode',
              {'in': 197, 'out': 23, 'cache_read': 12544, 'reasoning': 20}),
@@ -337,7 +300,7 @@ class Translation(unittest.TestCase):
               'reasoning_output_tokens': 1}, 'codex',
              {'in': 6, 'out': 3, 'cache_read': 4, 'reasoning': 1}),
         ]
-        for raw, provider, normal in cases:   # grok counts the cache inside its input
+        for raw, provider, normal in cases:   # codex counts the cache inside its input
             self.assertEqual(wires.normalize_usage(raw, provider), normal, provider)
         self.assertIsNone(wires.normalize_usage({'totalTokens': 3}, 'opencode'))   # unknown
 
@@ -376,11 +339,8 @@ class Translation(unittest.TestCase):
         self.assertRaises(ValueError, wires.opencode_command, {'model': 'deepseek'})
         self.assertEqual(wires.forget_command('opencode', 'ses_1', '/x/opencode'),
                          ['/x/opencode', 'session', 'delete', 'ses_1', '--standalone'])
-        self.assertIsNone(wires.forget_command('grok', 's1'))   # grok keeps no claim
+        self.assertIsNone(wires.forget_command('codex', 's1'))   # codex keeps no claim
         self.assertIsNone(wires.forget_command('opencode', None))
-        self.assertEqual(wires.grok_command({'model': 'grok-4.6'})[0][-3:],
-                         ['-m', 'grok-4.6', 'stdio'])
-        self.assertEqual(wires.grok_command({})[0][-2:], ['--always-approve', 'stdio'])
 
     def test_the_suite_carries_no_driver_session(self):
         names = {'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN',

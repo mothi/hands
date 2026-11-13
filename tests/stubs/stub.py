@@ -1,6 +1,6 @@
 """What the stub CLIs share: their settings and their log.
 
-The stubs stand in for the real claude, codex, grok and opencode CLIs. Each one is set up by
+The stubs stand in for the real claude, codex and opencode CLIs. Each one is set up by
 STUB_* environment variables, and each run appends JSON lines to the file named by $STUB_LOG:
 
   launch   argv, cwd, pid, the names of every environment variable, the values of the few in SHOWN
@@ -25,9 +25,6 @@ FIXTURES = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file_
 # Values the tests check. Every other variable is logged by name only.
 SHOWN = (
     'XDG_DATA_HOME',
-    'GROK_DISABLE_AUTOUPDATER',
-    'GROK_CLAUDE_HOOKS_ENABLED',
-    'GROK_CURSOR_HOOKS_ENABLED',
     'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS',
     'CLAUDE_CODE_DISABLE_AUTO_MEMORY',
 )

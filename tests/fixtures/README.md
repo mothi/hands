@@ -22,26 +22,21 @@ The test classes named below are in `tests/test_seat.py` unless another file is 
 
 | fixture | origin | read by |
 |---|---|---|
-| grok-402-balance | live seat (verbatim error) | `FailureText`; `AcpLaunch`: a usage limit answering a prompt |
-| grok-403-spending | live probe (verbatim error) | `FailureText` |
 | claude-session-limit | live seat (agent notice wording, time zone set to UTC) | `FailureText`, with its reset |
 | codex-usage-limit | wording approximated from a live record | `FailureText`, with its reset; `CodexSeats`: failures typed from error fields |
 | claude-api-credit-low | Anthropic's documented credit-balance error, as Claude Code prints an API error (approximated, not recorded) | `FailureText`; `ClaudeSeats`: an API-key seat out of credit |
 | codex-api-insufficient-quota | OpenAI's documented `insufficient_quota` body behind a 429 (approximated, not recorded) | `FailureText`; `CodexSeats`: an API-key seat out of credit |
-| opencode-openrouter-402 | OpenRouter's insufficient-credits wording in an ACP error (approximated, not recorded) | `FailureText` |
-| grok-auth-expired | grok's documented login wording | `FailureText` |
+| opencode-openrouter-402 | OpenRouter's insufficient-credits wording in an ACP error (approximated, not recorded) | `FailureText`; `AcpLaunch`: a usage limit answering a prompt |
 | claude-oauth-expired | a seat that died on an expired login (its result.txt) | `FailureText` |
 | opencode-missing-api-key | an OpenCode ACP seat on an empty store, never logged in: the error answering `session/prompt` | `AcpLaunch`: a missing login is auth-expired |
 | opencode-go-no-credential | an OpenCode 2.0.22 buy with no Go key in its store | `FailureText` |
-| grok-acp-seat-sample | grok 1.0.41 `grok agent stdio` seat (grok-4.6, effort low), 4 turns on one process: two replies, a shell `sleep` the client cancelled, a file write; `{t,dir,msg}` lines | the grok stub's default transcript: `AcpSeats`, `AcpLaunch`, `AcpClose` |
-| grok-acp-resume-sample | the same session reattached by a new process: initialize, session/resume, effort set again, one prompt | `AcpSeats`: a send to a stopped grok seat; `Pushes`: a relaunch |
-| opencode-acp-seat-sample | opencode 1.18.30 `opencode acp` seat (opencode-go/deepseek-v4.1-flash, variant low), the same 4 turns | the opencode stub's default transcript: `AcpSeats`, `AcpLaunch`, `AcpClose` |
-| opencode-acp-resume-sample | the same for OpenCode: a new process reattaching the seat's session | `AcpSeats`: a send to a stopped OpenCode seat; `AcpClose`: an abandoned turn; `Pushes` |
-| grok-acp-sample, opencode-acp-sample | 4-turn ACP transcripts at the CLI's default effort | `tests/test_wires.py` `AcpClient`: the round trips |
+| opencode-acp-seat-sample | opencode 1.18.30 `opencode acp` seat (opencode-go/deepseek-v4.1-flash, variant low), 4 turns on one process: two replies, a shell `sleep` the client cancelled, a file write; `{t,dir,msg}` lines | the opencode stub's default transcript: `AcpSeats`, `AcpLaunch`, `AcpClose`, `SlowLaunch` |
+| opencode-acp-resume-sample | the same session reattached by a new process: initialize, session/resume, effort set again, one prompt | `AcpSeats`: a send to a stopped OpenCode seat; `AcpClose`: an abandoned turn, a seat that ends with its turn; `Pushes`: a relaunch |
+| opencode-acp-sample | a 4-turn ACP transcript at the CLI's default effort | `tests/test_wires.py` `AcpClient`: the round trip |
 | claude-stdin-sample | claude 2.1.274 `--input-format stream-json` seat (haiku), 3 turns on one process with Bash tool calls | `ClaudeSeats`: a recorded three-turn seat, last answer `ZEBRA-42` |
 | codex-appserver-sample | codex-cli 0.160.0 app-server on stdio (read-only, approvals never), two processes, four turns: one steered mid-turn (a wrong-id steer refused), one interrupted, one after it, one on a new process's `thread/resume` | `CodexSeats`: a recorded wire across a relaunch (ok/cancelled/ok/ok; strays; per-turn usage); the stream log leaves out fragments and the re-sent diff (the test adds two `turn/diff/updated` to turn 1) |
-| grok-events-sample | a 3-turn grok-4.6 seat's `events.jsonl` (228 lines, 3 tool calls, a mail round) | `tests/test_cli.py` `EventsView` |
-| claude-events-sample | the same 3 turns on Claude (43 lines) | `tests/test_cli.py` `EventsView` |
+| opencode-seat-events-sample | derived, not recorded: the `events.jsonl` (115 lines) of a stub seat replaying opencode-acp-seat-sample through `tests/stubs/opencode` as `AcpSeats` runs it (start with `--idle 60`, three sends, stop), under `TZ=UTC` | `tests/test_cli.py` `EventsView`: a long stream renders to a few readable lines |
+| claude-events-sample | a 3-turn seat's `events.jsonl` on Claude (43 lines, a mail round) | `tests/test_cli.py` `EventsView` |
 | opencode-events-sample | the same 3 turns on OpenCode (34 lines); tool inputs arrive in a later update | `tests/test_cli.py` `EventsView`: a late input rides one ↳ line |
 | claude-stream-sample | `claude -p --output-format stream-json`, one turn | `ClaudeSeats`: a recorded claude stream |
 | claude-stream-ratelimit.jsonl | a claude 2.1.300 haiku probe (hook events before init) | test_quota.py test_41: 5h 12.0, week 37.0; `resetsAt` shifted by one constant so the reading predates no reset |
@@ -58,8 +53,6 @@ identity values are fake by construction; a test asserts they never reach `quota
 | quota-codex-two-window.json | a 5-hour primary and weekly secondary window, in the app-server shape; identities faked | test_43, test_45: windows named by their length, never by the provider's key |
 | quota-codex-absent-pct.json | synthetic: a window with no used percent | unknown, never a made-up 0 |
 | quota-codex-no-login.json | an app-server answer with an empty `CODEX_HOME` (JSON-RPC error) | unknown; `why` is its message (test_13) |
-| quota-grok-happy.json | a live billing response | ok; weekly 71 |
-| quota-grok-fresh-period.json | a weekly rollover: the gateway omits a zero usage field | ok; weekly used 0 |
-| quota-claude-429.json | an Anthropic error envelope (shape approximated); served by the grok stub, since the parse is the same for every pool | unknown; `why` is the provider message |
+| quota-claude-429.json | an Anthropic error envelope (shape approximated); served by the opencode stub, since the parse is the same for every pool | unknown; `why` is the provider message |
 | quota-opencode-happy.json | OpenCode Go usage shape with distinct synthetic values | rolling 0, weekly 8, monthly 22 |
 | quota-opencode-404.html | the page OpenCode's site serves for a missing endpoint | unknown; the reply is not JSON |

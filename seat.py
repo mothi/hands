@@ -125,15 +125,15 @@ def read_lines(path, offset):
 # Failure types. They come from a provider's error fields and the CLI's stderr, never from what
 # the model wrote: a model that quotes an error message does not fail its turn.
 
-# Subscription windows and balances, then API-key billing: Anthropic's credit balance, OpenAI's
+# Subscription windows, then API-key billing: Anthropic's credit balance, OpenAI's
 # insufficient_quota, and a gateway's 402 (OpenRouter's wording) under an opencode seat.
-QUOTA_TEXT = re.compile(r'usage balance exhausted|hit your (usage|session|weekly) limit|'
-                        r'usage limit reached|quota exceeded|spending.?limit|'
-                        r'(run )?out of credits|credit balance is too low|insufficient[_ ]quota|'
+QUOTA_TEXT = re.compile(r'hit your (usage|session|weekly) limit|'
+                        r'usage limit reached|quota exceeded|'
+                        r'credit balance is too low|insufficient[_ ]quota|'
                         r'exceeded your current quota|insufficient credits', re.I)
 RESET_TEXT = re.compile(r'resets? (at )?[A-Za-z0-9:. apm/-]{3,40}|again at [A-Za-z0-9:, ]{3,40}',
                         re.I)
-AUTH_TEXT = re.compile(r'grok login|not logged in|login required|unauthorized|'
+AUTH_TEXT = re.compile(r'not logged in|login required|unauthorized|'
                        r'invalid[ _-]?(api[ _-]?)?key|missing api[ _-]?key|oauth session expired|'
                        r'failed to authenticate|requires a credential', re.I)
 
@@ -557,7 +557,7 @@ def run_push(argv):
 # command it runs, the variable that holds the session's id (which outlives the address: a
 # Claude Code restart changes the socket and token, never the session id), and how a push
 # reaches that session. A host counts when all its address variables are set, and the first one
-# that counts wins. Grok names no session to its commands, so a grok driver runs `wait` instead.
+# that counts wins.
 DRIVER_HOSTS = {
     'claude': (('CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN'),
                'CLAUDE_CODE_SESSION_ID', post_to_inbox),
@@ -1233,7 +1233,7 @@ class Wrapper:
 
         def on_update(update):
             for line in wires.acp_events(update, turn, now(), self.provider):
-                if line['kind'] == 'file':   # grok reports one edit twice
+                if line['kind'] == 'file':   # one edit reported twice is one file event
                     key = (line.get('call'), line.get('path'))
                     if key in seen_files:
                         continue

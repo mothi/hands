@@ -72,7 +72,7 @@ class CommandLine(unittest.TestCase):
         self.assertEqual({k: envelope(job)[k] for k in ('status', 'provider', 'model', 'rc')},
                          {'status': 'error', 'provider': 'gemini',
                           'model': 'gemini-3.8-flash-high', 'rc': 2})
-        self.assertIn("unknown provider 'gemini' (claude|codex|grok|opencode)", run.err)
+        self.assertIn("unknown provider 'gemini' (claude|codex|opencode)", run.err)
 
     def test_a_missing_task_file_is_refused_with_a_full_envelope(self):
         job, run = SB.buy('missing-task', 'claude:sonnet', task=SB.path('nope.md'))
@@ -148,6 +148,19 @@ class CommandLine(unittest.TestCase):
         self.assertEqual(SB.send(seat_dir, SB.path('nope.md')).rc, 2)
         self.assertEqual(SB.hands('send', seat_dir).rc, 2)
 
+    def test_a_send_to_a_seat_whose_provider_hands_does_not_run_is_refused_in_one_line(self):
+        job, _ = SB.buy('unrun-provider', 'claude:sonnet')
+        path = os.path.join(job, 'session')
+        handle = dict(json.loads(read_text(path)), provider='gone', model='gone-1')
+        with open(path, 'w') as f:   # a handle naming a provider hands does not run
+            json.dump(handle, f)
+        launched = len(SB.stub_log(job).launches())
+        run = SB.send(job)
+        self.assertEqual((run.rc, run.out), (2, ''))
+        self.assertEqual(run.err, "hands: %s names provider 'gone', which hands does not run "
+                                  "(claude|codex|opencode)\n" % job)
+        self.assertEqual(len(SB.stub_log(job).launches()), launched)
+
 
 class SeatPrompt(unittest.TestCase):
     """prompt.txt: the seat box, a blank line, the task, a blank line, the job-dir line."""
@@ -155,31 +168,30 @@ class SeatPrompt(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         os.makedirs(SB.path('elsewhere'))
-        cls.grok, _ = SB.start('prompt-grok', 'grok:grok-4.6', '--effort', 'low', '--cwd', SB.work)
         cls.opencode, _ = SB.start('prompt-opencode', 'opencode:opencode-go/deepseek-v4.1-flash',
                                    '--effort', 'low', '--cwd', SB.path('elsewhere'))
         cls.claude, _ = SB.buy('prompt-claude', 'claude:sonnet')
-        for job in (cls.grok, cls.opencode):
-            SB.wait(job)
-            SB.stop(job)
+        SB.wait(cls.opencode)
+        SB.stop(cls.opencode)
 
     def test_the_prompt_is_the_box_the_task_and_the_job_dir_line(self):
-        expected = hands.SEAT_BOX + '\ntask\n\n' + hands.seat_line(self.grok)
-        prompt = read_text(os.path.join(self.grok, 'prompt.txt'))
+        expected = hands.SEAT_BOX + '\ntask\n\n' + hands.seat_line(self.opencode)
+        prompt = read_text(os.path.join(self.opencode, 'prompt.txt'))
         self.assertTrue(prompt.startswith('SEAT BOX.'))
         self.assertEqual(prompt, expected)
-        agent = SB.stub_log(self.grok).seats()[0]
+        agent = SB.stub_log(self.opencode).seats()[0]
         first = next(params for method, params in agent.messages() if method == 'session/prompt')
         self.assertEqual(first['prompt'], [{'type': 'text', 'text': prompt}])   # byte for byte
 
     def test_two_seats_given_one_task_differ_only_after_it(self):
         shared = hands.SEAT_BOX + '\n' + read_text(SB.task)
-        prompts = [read_text(os.path.join(job, 'prompt.txt')) for job in (self.grok, self.opencode)]
+        prompts = [read_text(os.path.join(job, 'prompt.txt'))
+                   for job in (self.opencode, self.claude)]
         self.assertTrue(all(p.startswith(shared) for p in prompts))
         self.assertNotEqual(prompts[0], prompts[1])
 
     def test_the_inbox_and_outbox_exist_empty_before_the_seat_starts(self):
-        for job in (self.grok, self.claude):
+        for job in (self.opencode, self.claude):
             for name in ('inbox.jsonl', 'outbox.jsonl'):
                 path = os.path.join(job, name)
                 self.assertTrue(os.path.isfile(path) and os.path.getsize(path) == 0, path)
@@ -217,21 +229,21 @@ class Probe(unittest.TestCase):
             self.skipTest('a provider CLI is on the system path')
         run = SB.hands('--probe', 'all', PATH=SYSTEM_PATH, HOME=SB.root)
         lines = [json.loads(line) for line in run.out.split('\n') if line.strip()]
-        self.assertEqual(len(lines), 4)
+        self.assertEqual(len(lines), 3)
         for line in lines:
             self.assertEqual((line['status'], line['dir']), ('not-installed', None))
             self.assertIn('usage', line)
 
     @unittest.skipUnless(on_system_path('python3'), 'no python3 on the system path')
     def test_the_probe_never_writes_through_a_planted_link(self):
-        if on_system_path('grok'):
-            self.skipTest('grok is on the system path')
+        if on_system_path('opencode'):
+            self.skipTest('opencode is on the system path')
         tmp = SB.path('probe-tmp')
         os.makedirs(tmp)
         victim = SB.write('victim', 'keep')
         # sh's exec keeps its pid, so the links sit at the names an old probe would have used
         plant = ('ln -s "$1" "$2/hands-probe-lines-$$"; ln -s "$1" "$2/hands-probe-$$.txt"; '
-                 'exec "$3" --probe grok')
+                 'exec "$3" --probe opencode')
         SB.run(['sh', '-c', plant, '_', victim, tmp, harness.HANDS], PATH=SYSTEM_PATH,
                HOME=SB.root, TMPDIR=tmp)
         self.assertEqual(read_text(victim), 'keep')
@@ -412,29 +424,28 @@ class EventsView(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.views = {}
-        for cli in ('grok', 'claude', 'opencode'):
+        for cli in ('opencode-seat', 'claude', 'opencode'):
             job = SB.path('view-' + cli)
             os.makedirs(job)
             shutil.copy(os.path.join(harness.FIXTURES, '%s-events-sample.jsonl' % cli),
                         os.path.join(job, 'events.jsonl'))
             cls.views[cli] = (job, SB.hands('events', job).out)
 
-    def test_the_grok_stream_renders_to_a_few_readable_lines(self):
-        lines = self.views['grok'][1].split('\n')[:-1]
-        self.assertTrue(20 <= len(lines) <= 25, len(lines))
+    def test_a_seat_stream_renders_to_a_few_readable_lines(self):
+        lines = self.views['opencode-seat'][1].split('\n')[:-1]   # 115 events
+        self.assertTrue(25 <= len(lines) <= 30, len(lines))
         self.assertFalse([line for line in lines if line.startswith('{')])
-        self.assertEqual(len([line for line in lines if line.startswith('> t')]), 3)
+        self.assertEqual(len([line for line in lines if line.startswith('> t')]), 4)
+        self.assertEqual(len([line for line in lines if line.startswith('~ ')]), 4)
         tools = [line for line in lines if line.startswith('$ ')]
-        self.assertEqual([t.split(' {')[0] for t in tools],
-                         ['$ read_file', '$ read_file', '$ run_terminal_command'])
+        self.assertEqual([t.split(' {')[0] for t in tools], ['$ bash', '$ write'])
         self.assertTrue(all(len(t) <= 340 for t in tools))
         text = '\n'.join(lines)
         self.assertEqual(re.findall(r'^── turn (\d) ([a-z]+) · \d\d:\d\d:\d\d$', text, re.M),
-                         [('1', 'ok'), ('2', 'ok'), ('3', 'ok')])
+                         [('1', 'ok'), ('2', 'ok'), ('3', 'cancelled'), ('4', 'ok')])
         hits = re.findall(r'^· usage .* cache hit (\d+)%', text, re.M)
-        self.assertEqual(hits, ['0', '99', '98'])
-        self.assertLessEqual({'READY', 'HERON-7 | The second codeword is OTTER-3.', 'HERON-7'},
-                             set(lines))
+        self.assertEqual(hits, ['14', '99', '98'])
+        self.assertLessEqual({'PONG', 'DONE'}, set(lines))
 
     def test_the_view_is_the_same_whole_or_fed_line_by_line(self):
         for cli, (job, once) in self.views.items():

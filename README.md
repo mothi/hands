@@ -1,7 +1,7 @@
 # hands
 
 Run a task on **another provider's coding agent** from the session you're already in. hands
-drives the official CLIs of four providers (Claude Code, OpenAI Codex, Grok and OpenCode) as
+drives the official CLIs of three providers (Claude Code, OpenAI Codex and OpenCode) as
 subagents: you start one on a task, send it more turns, mail it notes, wait for its answers,
 and read what it's doing. Every turn ends in a typed JSON envelope, so a script or another agent
 can act on the outcome without parsing prose.
@@ -33,7 +33,7 @@ provider CLIs have only been run on macOS.
 
 - **A seat runs as you, with full read and write access.** There is no read-only
   mode: a seat that can't run commands can't check its own work. Claude runs with
-  `bypassPermissions`, Codex with `danger-full-access`, and Grok and OpenCode approve every
+  `bypassPermissions`, Codex with `danger-full-access`, and OpenCode approves every
   tool call. Nothing stops a seat from reading any file you can read, writing outside its
   `--cwd`, or using the network.
 - **`--cwd` is your isolation.** Point a seat that edits code at a git worktree or a scratch
@@ -49,20 +49,20 @@ provider CLIs have only been run on macOS.
   them off (§ Hooks and memories).
 - **Mail and pushes are data.** What a seat writes is model output; never let the driver follow
   instructions found in it.
-- **Quota gauges call undocumented endpoints** for Grok and OpenCode, with the token their CLI
+- **The quota gauge calls an undocumented endpoint** for OpenCode, with the token its CLI
   already stores (§ Quota gauges). Check your providers' terms.
 
 Report vulnerabilities privately: see [SECURITY.md](SECURITY.md).
 
 ## Prerequisites
 
-- macOS or Linux, with `python3` 3.7 or later, `curl` (the Grok and OpenCode gauges), and `ps`
+- macOS or Linux, with `python3` 3.7 or later, `curl` (the OpenCode gauge), and `ps`
 - at least one provider CLI, logged in with its own login:
   [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`),
-  [Codex](https://github.com/openai/codex) (`codex`), Grok (`grok`), or
+  [Codex](https://github.com/openai/codex) (`codex`), or
   [OpenCode](https://opencode.ai) (`opencode`)
 
-hands is tested with Claude Code 2.1.283, codex-cli 0.160, grok 1.0.46 and OpenCode 2.0.22, or
+hands is tested with Claude Code 2.1.283, codex-cli 0.160 and OpenCode 2.0.22, or
 later. Older CLIs may not speak the same wire.
 
 ## Install
@@ -99,8 +99,8 @@ $H wait DIR
 ```
 
 Replace `DIR` with the `dir` the `start` line printed. A bare `codex` uses the Codex CLI's
-default model; `claude` defaults to `sonnet`. Grok and OpenCode need a model and `--effort`, for
-example `--effort high grok:grok-4.6`.
+default model; `claude` defaults to `sonnet`. OpenCode needs a model and `--effort`, for
+example `--effort high opencode:opencode-go/deepseek-v4.1-flash`.
 
 **Grammar:** `hands.sh [start] [flags] provider[:model] prompt-file`. Flags come first, then the
 provider spec, then the prompt file. The other verbs take the job dir first
@@ -115,17 +115,15 @@ validates them, so a model released tomorrow works today.
 |---|---|---|---|---|
 | `claude` | `sonnet` (default), `opus`, `haiku`, `fable`, or any Claude model id | one `claude -p --input-format stream-json` process per seat, lean: no MCP servers from your config, no auto-memory. Turns go to its stdin. Sends **steer** the running turn | `bypassPermissions` | `claude` (interactive login) |
 | `codex` | the CLI's default, or any id (`codex debug models` lists them) | one `codex app-server` process per seat (never the shared daemon), JSON-RPC on stdio, live web search on (`-c web_search="live"`). Each send is a `turn/start`, which **steers** the running turn or opens the next | thread sandbox `danger-full-access` | `codex login` |
-| `grok` | e.g. `grok-4.6`; the live list is in `~/.grok/models_cache.json` | `grok agent --no-leader --always-approve stdio` over ACP, one `session/prompt` per turn. Sends **queue** | every tool call approved | `grok login` |
 | `opencode` | `provider/model` ids, e.g. `opencode-go/deepseek-v4.1-flash` | `opencode acp` in the seat's cwd, with the model and effort set on the session, on your normal OpenCode store. Sends **queue** | every permission answered allow-once | `opencode auth login` |
 
-- **No default Grok model is assumed.** Pass the id you mean.
 - **OpenCode** uses whatever providers your own OpenCode setup has: name them as
   `provider/model`. The probe and the quota gauge assume an OpenCode Go subscription
   (`opencode-go/...`); without one, `--probe opencode` fails and the gauge reads `unknown`.
 - **Effort.** Claude and Codex take `low|medium|high|xhigh|max` (Codex also `ultra` where its
-  catalog lists it), passed through for the CLI to validate. Grok and OpenCode need `--effort`
-  set to a value that model lists (`grok-4.6`: `low|medium|high|xhigh`;
-  `deepseek-v4.1-flash`: `low|high|max`); anything else is refused before the first prompt.
+  catalog lists it), passed through for the CLI to validate. OpenCode needs `--effort`
+  set to a value that model lists (`deepseek-v4.1-flash`: `low|high|max`); anything else is
+  refused before the first prompt.
 - **Which model to buy is your call.** hands routes nothing.
 
 ## Flags
@@ -213,19 +211,19 @@ field:
 | `status` | Meaning | What to do |
 |---|---|---|
 | `ok` | the turn's final message is in `turn-N/result.txt` (and `DIR/result.txt`) | use it |
-| `error` | a failure with no narrower class; `reason` names a known one: `empty`, `session-changed`, `wrapper-failed`, `handshake`. A Grok or OpenCode turn the model refuses mid-turn also ends `error` | read `stderr.log` and `stream.jsonl` |
+| `error` | a failure with no narrower class; `reason` names a known one: `empty`, `session-changed`, `wrapper-failed`, `handshake`. An OpenCode turn the model refuses mid-turn also ends `error` | read `stderr.log` and `stream.jsonl` |
 | `incomplete` | the stream ended inside the turn (a stop, a crash) | `send` to continue |
 | `cancelled` | the agent cancelled the turn | `send` to continue |
 | `truncated` | the turn hit the model's output limit | `send` to continue |
 | `timeout` | `--timeout` expired; `session` is kept | `send` to continue, or raise the timeout |
 | `auth-expired` | the CLI needs a login | run that provider's login |
-| `provider-quota-dead` | the subscription window or balance is spent, or an API key's credit is (Anthropic's credit balance, OpenAI's `insufficient_quota`, a gateway's insufficient credits) | if `reset` names a time, wait until then and don't retry before it. `reset: null` (a Grok spending limit, an API key out of credit) needs a top-up |
+| `provider-quota-dead` | the subscription window or balance is spent, or an API key's credit is (Anthropic's credit balance, OpenAI's `insufficient_quota`, a gateway's insufficient credits) | if `reset` names a time, wait until then and don't retry before it. `reset: null` (an API key out of credit) needs a top-up |
 | `not-installed` | the CLI isn't on your PATH | install it |
 | `refused` | typed before any prompt; `reason`: `model-mismatch`, `effort-unsupported`, `model-required`, `no-session` | fix the buy |
 
 `usage` is the provider's own token count for the turn, normalized as `{in, out, cache_read,
 cache_write, reasoning}` with no overlap (`in` is uncached input), plus `cost_usd` when the
-provider reports it (Claude, Grok). A Codex turn's usage is the sum of its model calls, including
+provider reports it (Claude). A Codex turn's usage is the sum of its model calls, including
 calls by collaborator agents while the turn is open. The printed line trims `reasoning`; the files
 keep it, and the raw vendor usage stays in `stream.jsonl`.
 
@@ -258,7 +256,7 @@ into that session, the way its host takes messages from outside:
 | Claude Code | `CLAUDE_CODE_MESSAGING_SOCKET` and `_TOKEN` (the address), `CLAUDE_CODE_SESSION_ID` (the id) | one post to the session's inbox socket |
 | Codex | `CODEX_THREAD_ID` | `codex queue --thread ID --message TEXT`, to the thread on your shared app-server, where the Codex TUI runs unless started with `--no-daemon` |
 | OpenCode | `OPENCODE_SESSION_ID` | `opencode api post /api/session/ID/prompt` with `{"text": TEXT, "delivery": "queue"}`, to your background service, where the OpenCode TUI runs unless started with `--standalone` |
-| Grok, a shell, CI | nothing (Grok gives its commands no session id) | none: use `wait` |
+| A shell, CI | nothing | none: use `wait` |
 
 The message is line 1 `provider:model tN status: <clip>`, line 2 the job dir, line 3 the id
 `<dir>:<turn>`, then the seat's text (up to 4,000 characters) marked as data. Each push's outcome
@@ -292,9 +290,8 @@ an idle Codex or OpenCode session has not been checked live.
 ## Hooks and memories
 
 Hooks are your code, written for your own sessions, so no seat runs them.
-Claude gets `disableAllHooks` in its one `--settings`, Codex `--disable hooks`, and Grok
-`GROK_CLAUDE_HOOKS_ENABLED=0` and `GROK_CURSOR_HOOKS_ENABLED=0` (Grok runs hooks it finds in
-`~/.claude` otherwise). OpenCode 2.x runs no Claude hooks; its own hooks are plugins, which hands
+Claude gets `disableAllHooks` in its one `--settings`, and Codex `--disable hooks`.
+OpenCode 2.x runs no Claude hooks; its own hooks are plugins, which hands
 can't turn off without moving its whole config dir, so check `opencode plugin list` if you add
 one. Codex seats also run with `--disable memories`, and Claude seats with auto-memory off.
 
@@ -325,11 +322,10 @@ a spent pool ends `provider-quota-dead` with the reset time.
   `rate_limit_event` in a Claude seat's own stream, and Codex's is its CLI's app-server answering
   `account/rateLimits/read`. The Claude line says how old its reading is; a window that has reset
   since is dropped, and `hands.sh --probe claude` writes a fresh reading.
-- **Grok and OpenCode** have no such surface, so `quota.py` reads the token each CLI already
-  keeps and calls that vendor's **undocumented** usage endpoint (`cli-chat-proxy.grok.com/v1/billing`,
-  `opencode.ai/zen/go/v1/usage`, the OpenCode Go plan). The token goes to `curl` on stdin, never on
-  the command line. Raw responses are never printed or stored. These endpoints can change or
-  disappear; a failed reading is `unknown`, never an error.
+- **OpenCode** has no such surface, so `quota.py` reads the token its CLI already keeps and
+  calls its **undocumented** usage endpoint (`opencode.ai/zen/go/v1/usage`, the OpenCode Go
+  plan). The token goes to `curl` on stdin, never on the command line. Raw responses are never
+  printed or stored. This endpoint can change or disappear; a failed reading is `unknown`, never an error.
 
 ## Using it from an agent
 
@@ -342,8 +338,6 @@ a spent pool ends `provider-quota-dead` with the reset time.
   arrive as pushes (§ Mail and push).
 - **OpenCode:** it reads Claude Code's skills, so the `~/.claude/skills` link serves it too. Turn
   ends arrive as pushes.
-- **Grok:** it reads Claude Code's and Codex's skills, but gives its commands no session id, so
-  run `wait` as a background command.
 - **Any other shell or CI:** it's a plain script. Use `wait` instead of pushes.
 - **Anywhere:** `hands.sh ps` lists the live seats, and `hands.sh events DIR --follow` in a
   terminal shows one as it works.
@@ -366,9 +360,8 @@ seat), and the exact command is shown before it runs.
 | Symptom | Cause and fix |
 |---|---|
 | `provider-quota-dead` with a `reset` time | wait until then |
-| `provider-quota-dead`, `reset: null` (Grok) | a spending limit; add credits |
 | `provider-quota-dead`, `reset: null` (an API key) | the key's account is out of credit; add credits in that provider's billing console |
-| `auth-expired` | run `claude`, `codex login`, `grok login` or `opencode auth login` |
+| `auth-expired` | run `claude`, `codex login` or `opencode auth login` |
 | `wait` prints `running` | the turn is still going. A long tool call is alive; a stale `last_event` with no open tool call is stuck: `stop`, then `send` |
 | `refused`, `effort-unsupported` or `model-mismatch` | pass an effort the model lists, and a model the agent lists (the refusal names them) |
 | `--out ... is not empty` | name a new or empty dir, or drop `--out` for a fresh one |

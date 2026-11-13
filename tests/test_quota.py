@@ -7,7 +7,7 @@ import json, os, subprocess, sys, tempfile, time, unittest
 TESTS = os.path.dirname(os.path.abspath(__file__))
 QUOTA = os.path.join(os.path.dirname(TESTS), 'quota.py')
 FX = os.path.join(TESTS, 'fixtures')
-POOLS = ('claude', 'codex', 'grok', 'opencode')
+POOLS = ('claude', 'codex', 'opencode')
 
 # A run inside a Claude Code session inherits the driver's inbox socket; nothing here may reach it.
 # opencode's key file resolves XDG_DATA_HOME first and the codex stub CODEX_HOME before HOME, as
@@ -26,7 +26,6 @@ hdrs=$(for a in "$@"; do echo "$a"; done; for a in "$@"; do [ "$a" = @- ] && cat
 [ -n "${QUOTA_AUTH_LOG:-}" ] && printf '%s\n' "$hdrs" | grep '^Authorization:' >>"$QUOTA_AUTH_LOG"
 pick() { [ "$1" = FAIL ] && exit 6; cat "$1"; exit 0; }
 case "$url" in
-  *grok.com*)    pick "${QUOTA_STUB_GROK:-@FX@/quota-grok-happy.json}" ;;
   *opencode.ai*) pick "${QUOTA_STUB_OPENCODE:-@FX@/quota-opencode-happy.json}" ;;
   *) exit 6 ;;
 esac
@@ -139,8 +138,6 @@ class Quota(unittest.TestCase):
             write(os.path.join(sb, 'bin', name), TRIPWIRE % name, 0o755)
         write(os.path.join(sb, 'home', '.codex', 'auth.json'),
               '{"tokens":{"access_token":"tok-test","account_id":"acct-test"}}')
-        write(os.path.join(sb, 'home', '.grok', 'auth.json'),
-              '{"https://auth.x.ai::test-client":{"key":"tok-test"}}')
         write(os.path.join(sb, 'home', '.local', 'share', 'opencode', 'auth.json'),
               '{"opencode-go":{"key":"sk-test"}}')
         # the default jobs root: a fresh claude stream with two readings, the last one wins
@@ -172,7 +169,7 @@ class Quota(unittest.TestCase):
     def windows(self, reading):
         return [(w['name'], w['used_pct']) for w in reading['windows']]
 
-    def test_01_all_four_pools_read(self):
+    def test_01_all_three_pools_read(self):
         pools = self.pools()
         self.assertEqual(list(pools), list(POOLS))
         self.assertTrue(all(p['status'] == 'ok' for p in pools.values()), pools)
@@ -193,11 +190,6 @@ class Quota(unittest.TestCase):
             out = self.run_quota(*args)
             self.assertNotRegex(out, 'FAKEFIXTUREID|fixture-must-never-appear')
 
-    def test_05_grok(self):
-        grok = self.pools('grok')['grok']
-        self.assertEqual(self.windows(grok), [('week', 71.0)])
-        self.assertTrue(grok['windows'][0]['resets_at'])
-
     def test_06_opencode_lists_its_three_windows_longest_first(self):
         opencode = self.pools('opencode')['opencode']
         self.assertEqual(self.windows(opencode), [('month', 22), ('week', 8), ('rolling', 0)])
@@ -209,11 +201,12 @@ class Quota(unittest.TestCase):
         self.assertEqual(opencode['opencode']['windows'], [])
 
     def test_08_an_error_reply_carries_the_provider_message(self):
-        # the parse is the same for every pool: an Anthropic 429 envelope, served as grok's reply
-        grok = self.pools('grok', QUOTA_STUB_GROK=FX + '/quota-claude-429.json')['grok']
-        self.assertEqual(grok['status'], 'unknown')
-        self.assertEqual(grok['why'], 'Number of requests has exceeded your rate limit. '
-                                      'Please try again later.')
+        # the parse is the same for every pool: an Anthropic 429 envelope, served as opencode's
+        opencode = self.pools('opencode',
+                              QUOTA_STUB_OPENCODE=FX + '/quota-claude-429.json')['opencode']
+        self.assertEqual(opencode['status'], 'unknown')
+        self.assertEqual(opencode['why'], 'Number of requests has exceeded your rate limit. '
+                                          'Please try again later.')
 
     def test_09_an_absent_percentage_is_no_window_never_zero(self):
         codex = self.pools('codex', QUOTA_STUB_CODEX=FX + '/quota-codex-absent-pct.json')['codex']
@@ -243,7 +236,6 @@ class Quota(unittest.TestCase):
         self.assertTrue(pools['claude']['why'].startswith('no claude reading'))
         self.assertEqual(pools['codex']['why'],
                          'codex account authentication required to read rate limits')
-        self.assertTrue(pools['grok']['why'].startswith('no login in '))
         self.assertTrue(pools['opencode']['why'].startswith('no login in '))
 
     def test_15_one_board_line_per_pool(self):
@@ -251,27 +243,16 @@ class Quota(unittest.TestCase):
         self.assertEqual([line.split()[0] for line in lines], list(POOLS))
 
     def test_16_provider_arguments_pick_the_pools_in_order(self):
-        self.assertEqual(list(self.pools('codex', 'grok')), ['codex', 'grok'])
+        self.assertEqual(list(self.pools('codex', 'opencode')), ['codex', 'opencode'])
 
     def test_17_an_unknown_argument_is_ignored(self):
-        self.assertEqual(len(self.run_quota('--bogus-flag').splitlines()), 4)   # and exit 0
-
-    def test_18_a_new_grok_period_reads_zero(self):
-        # the gateway leaves out a zero value: the period's end shows the reply is a real one
-        grok = self.pools('grok', QUOTA_STUB_GROK=FX + '/quota-grok-fresh-period.json')['grok']
-        self.assertEqual((grok['status'], self.windows(grok)), ('ok', [('week', 0.0)]))
-
-    def test_19_a_grok_reply_without_its_period_stays_unknown(self):
-        write(self.path('grok-alien.json'), '{"config":{"somethingElse":1}}')
-        grok = self.pools('grok', QUOTA_STUB_GROK=self.path('grok-alien.json'))['grok']
-        self.assertEqual((grok['status'], grok['why']),
-                         ('unknown', 'the reply has no usage windows'))
+        self.assertEqual(len(self.run_quota('--bogus-flag').splitlines()), 3)   # and exit 0
 
     def test_20_an_odd_reply_makes_only_its_own_pool_unknown(self):
-        write(self.path('grok-cfg-list.json'), '{"config":["x"]}')
-        pools = self.pools(QUOTA_STUB_GROK=self.path('grok-cfg-list.json'))
-        self.assertEqual(pools['grok']['why'], 'the reply has an unexpected shape')
-        self.assertEqual([pools[p]['status'] for p in ('claude', 'codex', 'opencode')], ['ok'] * 3)
+        write(self.path('opencode-usage-list.json'), '{"usage":["x"]}')
+        pools = self.pools(QUOTA_STUB_OPENCODE=self.path('opencode-usage-list.json'))
+        self.assertEqual(pools['opencode']['why'], 'the reply has an unexpected shape')
+        self.assertEqual([pools[p]['status'] for p in ('claude', 'codex')], ['ok'] * 2)
 
     def test_21_a_claude_utilization_that_is_text_is_unknown(self):
         state = self.path('t21')
@@ -292,7 +273,7 @@ class Quota(unittest.TestCase):
         write(self.path('leak.json'), '{"type":"error","error":{"type":"auth_error","message":'
               '"Bad token sk-ant-oat01-LEAKLEAKLEAKLEAK and id 0123456789012345678901234567890123'
               '456789ABCD were rejected. Re-authenticate."}}')
-        why = self.pools('grok', QUOTA_STUB_GROK=self.path('leak.json'))['grok']['why']
+        why = self.pools('opencode', QUOTA_STUB_OPENCODE=self.path('leak.json'))['opencode']['why']
         self.assertNotRegex(why, 'sk-ant|LEAK|0123456789')
         self.assertIn('Re-authenticate', why)
         self.assertLessEqual(len(why), 200)
@@ -418,9 +399,8 @@ class Quota(unittest.TestCase):
 
     def test_52_the_bearer_never_rides_argv(self):
         argv_log, auth_log = self.path('argv52'), self.path('auth52')
-        self.run_quota('grok', 'opencode', QUOTA_ARGV_LOG=argv_log, QUOTA_AUTH_LOG=auth_log)
-        self.assertEqual(sorted(read(auth_log).splitlines()),
-                         ['Authorization: Bearer sk-test', 'Authorization: Bearer tok-test'])
+        self.run_quota('opencode', QUOTA_ARGV_LOG=argv_log, QUOTA_AUTH_LOG=auth_log)
+        self.assertEqual(sorted(read(auth_log).splitlines()), ['Authorization: Bearer sk-test'])
         argv = read(argv_log)
         self.assertTrue(argv)
         self.assertNotIn('Bearer', argv)

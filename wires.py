@@ -3,7 +3,7 @@
 
 The wrapper (seat.py) calls launch() to start a seat's CLI and run its handshake. It then hands
 the CLI each message and turns what the CLI says into events: StreamTranslator does that for
-claude and codex, acp_events() for grok and opencode.
+claude and codex, acp_events() for opencode.
 
 PROVIDERS is the provider table. For each provider it says how the wrapper talks to the CLI
 (the family), what a message sent to a busy seat does (the delivery), and how to start the CLI
@@ -74,11 +74,11 @@ USAGE_FIELDS = (
     ('cache_read', 'cache_read_input_tokens', 'cached_input_tokens', 'cachedReadTokens',
      'cachedInputTokens'),
     ('cache_write', 'cache_creation_input_tokens', 'cache_write_input_tokens',
-     'cachedWriteTokens', 'cacheCreationTokens', 'cacheWriteInputTokens'),
-    ('reasoning', 'reasoning_output_tokens', 'thoughtTokens', 'reasoningTokens',
+     'cachedWriteTokens', 'cacheWriteInputTokens'),
+    ('reasoning', 'reasoning_output_tokens', 'thoughtTokens',
      'reasoningOutputTokens', 'output_tokens_details.thinking_tokens'),
 )
-CACHE_INSIDE_INPUT = ('codex', 'grok')      # their input count includes the cached tokens
+CACHE_INSIDE_INPUT = ('codex',)             # its input count includes the cached tokens
 REASONING_OUTSIDE_OUTPUT = ('opencode',)    # its output count leaves out the reasoning tokens
 
 
@@ -419,7 +419,7 @@ class Rpc(Cli):
 
 
 # ---------------------------------------------------------------------------------------------
-# ACP agents: grok and opencode
+# ACP agents: opencode
 
 ACP_STOP_STATUS = {   # stopReason -> the turn's status; anything else is an error
     'end_turn': 'ok',
@@ -435,7 +435,7 @@ ACP_SESSION_STATE = ('available_commands_update', 'config_option_update', 'sessi
 
 
 class AcpAgent(Rpc):
-    """An Agent Client Protocol (v1) agent: `grok agent stdio` or `opencode acp`.
+    """An Agent Client Protocol (v1) agent: `opencode acp`.
 
     It never calls `authenticate`: each seat runs on its own CLI's login."""
 
@@ -448,24 +448,20 @@ class AcpAgent(Rpc):
         Rpc.__init__(self, argv, cwd, env, log, stderr_path, self._on_notification)
 
     def _on_notification(self, message):
-        """A session update (grok also sends _x.ai/session_notification): track it, pass it on."""
+        """A session update: track it, pass it on."""
         update = message['params'].get('update')
         if not isinstance(update, dict) or 'sessionUpdate' not in update:
-            return   # grok's queue, model and session chatter: logged only
+            return   # any other notification: logged only
         kind = update['sessionUpdate']
         if kind == 'config_option_update' and isinstance(update.get('configOptions'), list):
             self.options = update['configOptions']
         turn = self.turn
         on_update = self.on_update
         if turn is not None:
-            if kind == 'response_completed':
-                turn.bounded = True
-            elif kind in ('agent_message_chunk', 'agent_thought_chunk') and update.get('messageId'):
+            if kind in ('agent_message_chunk', 'agent_thought_chunk') and update.get('messageId'):
                 turn.bounded = True
             if kind == 'agent_message_chunk':
                 turn.add_text(update.get('messageId'), update_text(update))
-            elif kind == 'response_completed':
-                turn.end_message()
             elif kind in ('tool_call', 'tool_call_update'):
                 turn.add_tool()
                 call_id = update.get('toolCallId')
@@ -569,7 +565,7 @@ class AcpAgent(Rpc):
         owner's loop runs the turn.
 
         on_update gets a turn_start record, each session update of the turn, then a cancelled
-        tool_call_update for each tool call left open (grok sends none after a cancel).
+        tool_call_update for each tool call left open (an agent that went away sends none).
         on_done gets the prompt's result plus _client, sessionId, answer and final, and error
         (an error answer) or incomplete (the agent went away first)."""
         if not self.session_id:
@@ -611,15 +607,8 @@ def update_text(update):
     return ''
 
 
-def grok_tool(update):
-    """grok names a tool and its kind in _meta["x.ai/tool"]."""
-    meta = update.get('_meta') if isinstance(update.get('_meta'), dict) else {}
-    tool = meta.get('x.ai/tool')
-    return tool if isinstance(tool, dict) else {}
-
-
 def tool_name(update):
-    return update.get('name') or update.get('title') or grok_tool(update).get('name')
+    return update.get('name') or update.get('title')
 
 
 def touched_paths(update):
@@ -627,7 +616,7 @@ def touched_paths(update):
     deletes or moves (a shell tool's location is just its cwd)."""
     content = update.get('content') if isinstance(update.get('content'), list) else []
     paths = [c.get('path') for c in content if isinstance(c, dict) and c.get('type') == 'diff']
-    if (update.get('kind') or grok_tool(update).get('kind')) in ACP_FILE_KINDS:
+    if update.get('kind') in ACP_FILE_KINDS:
         paths += [x.get('path') for x in update.get('locations') or [] if isinstance(x, dict)]
     return list(dict.fromkeys(p for p in paths if p))
 
@@ -681,7 +670,7 @@ def acp_events(update, turn, at=None, provider=None):
                      context_size=update.get('size'), cost=update.get('cost'))]
     if kind in ACP_SESSION_STATE:
         return []
-    return [make('progress', text=str(kind))]   # grok's own kinds: hooks, response ends
+    return [make('progress', text=str(kind))]   # any other kind
 
 
 def acp_turn_end(result, make, provider):
@@ -698,10 +687,8 @@ def acp_turn_end(result, make, provider):
     events = []
     if isinstance(raw, dict):
         usage = normalize_usage(raw, provider) or {}
-        ticks = number(raw.get('costUsdTicks'))   # grok: one tick is 1e-10 USD
         if any(usage.values()):
-            cost = ticks / 1e10 if ticks is not None else None
-            events.append(make('usage', usage=usage, cost_usd=cost))
+            events.append(make('usage', usage=usage))
         else:   # opencode reports 0 for a cancelled turn: unknown, not free
             events.append(make('usage', usage_unknown=True))
     error = result.get('error') if isinstance(result.get('error'), dict) else {}
@@ -721,8 +708,8 @@ def acp_turn_end(result, make, provider):
 #
 # No seat runs the user's hooks: hooks are the user's own code, written for their own sessions.
 # Each command turns them off with its CLI's own switch: claude disableAllHooks, codex
-# --disable hooks, grok its claude and cursor hook scanners. opencode runs no claude hooks, and
-# its plugins have no switch short of replacing its whole config dir.
+# --disable hooks. opencode runs no claude hooks, and its plugins have no switch short of
+# replacing its whole config dir.
 
 
 def claude_command(handle):
@@ -759,19 +746,6 @@ def codex_command(handle):
     return argv, {}
 
 
-def grok_command(handle):
-    """grok: an ACP agent -> (argv, env).
-
-    -m pins the model. The effort is a session option (acp_handshake sets it): grok's own
-    --reasoning-effort never reaches an ACP session. The autoupdater is off."""
-    argv = [handle.get('cli') or 'grok', 'agent', '--no-leader', '--always-approve']
-    if handle.get('model'):
-        argv += ['-m', handle['model']]
-    env = {'GROK_DISABLE_AUTOUPDATER': '1', 'GROK_CLAUDE_HOOKS_ENABLED': '0',
-           'GROK_CURSOR_HOOKS_ENABLED': '0'}
-    return argv + ['stdio'], env
-
-
 def opencode_command(handle):
     """opencode: an ACP agent -> (argv, env).
 
@@ -793,7 +767,6 @@ Provider = collections.namedtuple('Provider', 'family delivery command')
 PROVIDERS = {
     'claude': Provider('stdin', 'steer', claude_command),
     'codex': Provider('rpc', 'steer', codex_command),
-    'grok': Provider('acp', 'queue', grok_command),
     'opencode': Provider('acp', 'queue', opencode_command),
 }
 

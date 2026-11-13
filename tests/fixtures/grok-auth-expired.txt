@@ -1,1 +1,0 @@
-grok-token: no token found — run `grok login` to authenticate

@@ -36,10 +36,8 @@ for _name in list(os.environ):
 SPECS = {
     'claude': 'claude:sonnet',
     'codex': 'codex:gpt-5.6-terra',
-    'grok': 'grok:grok-4.6',
     'opencode': 'opencode:opencode-go/deepseek-v4.1-flash',
 }
-GROK_SESSION = '01a0d38a-6416-74d3-82f8-80174c82f422'      # in grok-acp-seat-sample.jsonl
 OPENCODE_SESSION = 'ses_f2c74432dffeoPDAL0Eq6RHjaI'        # in opencode-acp-seat-sample.jsonl
 
 
