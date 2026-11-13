@@ -431,28 +431,37 @@ class DriverSocket:
     def __init__(self, path):
         self.path = path
         self.reply = None
-        self.connections = []
+        self.served = []   # (the order its connection came in, its lines)
         self.server = socket.socket(socket.AF_UNIX)
         self.server.bind(path)
         self.server.listen(8)
         threading.Thread(target=self._accept, daemon=True).start()
 
+    @property
+    def connections(self):
+        """Each connection's lines, in the order the connections came (each is read by a thread
+        of its own, so they may finish in another order)."""
+        return [lines for _, lines in sorted(self.served, key=lambda item: item[0])]
+
     def _accept(self):
+        number = 0
         while True:
             try:
                 connection = self.server.accept()[0]
             except OSError:
                 return
-            threading.Thread(target=self._serve, args=(connection,), daemon=True).start()
+            threading.Thread(target=self._serve, args=(connection, number), daemon=True).start()
+            number += 1
 
-    def _serve(self, connection):
+    def _serve(self, connection, number):
         data = b''
         while data.count(b'\n') < 2:
             chunk = connection.recv(65536)
             if not chunk:
                 break
             data += chunk
-        self.connections.append([json.loads(line) for line in data.split(b'\n') if line.strip()])
+        self.served.append((number, [json.loads(line) for line in data.split(b'\n')
+                                     if line.strip()]))
         try:
             if self.reply == 'HOLD':
                 time.sleep(3)

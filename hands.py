@@ -538,19 +538,11 @@ class EventView:
         elif kind == 'progress' and line.get('expect'):
             out += '> t%s %s\n' % (line['expect'], line.get('text'))
         elif kind == 'progress' and line.get('push') == 'failed':
-            out += '!! %s: %s%s\n' % (line.get('text'), line.get('error'), held(line))
-        elif kind == 'progress' and line.get('push') == 'held':
-            out += '!! %s behind a failed one%s\n' % (line.get('text'), held(line))
+            pending = ' (%d pending)' % line['pending'] if line.get('pending') else ''
+            out += '!! %s: %s%s\n' % (line.get('text'), line.get('error'), pending)
         elif kind == 'progress' and line.get('push') == 'posted' and line.get('late'):
-            out += '· %s %ds late%s\n' % (line.get('text'), line['late'], held(line))
-        elif kind == 'progress' and line.get('parked'):
-            out += '!! %s\n' % line.get('text')
+            out += '· %s %ds late\n' % (line.get('text'), line['late'])
         return out
-
-
-def held(line):
-    """A push event's count of what is still held, as its view line ends."""
-    return ' (%d held)' % line['held'] if line.get('held') else ''
 
 
 def usage_line(line):
@@ -588,23 +580,20 @@ def events(job_dir, follow):
 
 def ps():
     """Print one line per live seat: its provider and model, what it is doing, when its last
-    event came, how many pushes it holds for a driver it could not reach (when any), and its
-    dir; then one per ended seat in the jobs root that parked pushes it could not deliver."""
+    event came, how many pushes its driver has not taken yet (when any), and its dir; then one
+    per ended seat in the jobs root with pushes pending."""
     job_dirs = seat.live_seats()
-    parked = [job_dir for job_dir in seat.parked_seats() if job_dir not in job_dirs]
-    if not job_dirs and not parked:
+    ended = [job_dir for job_dir in seat.seats_with_pending() if job_dir not in job_dirs]
+    if not job_dirs and not ended:
         say('no live seats')
-    for job_dir in job_dirs + parked:
+    for job_dir in job_dirs + ended:
         handle = seat.read_json(os.path.join(job_dir, 'session')) or {}
         state = seat.SeatState(job_dir).read()
         name = ':'.join(part for part in (handle.get('provider'), handle.get('model')) if part)
-        if job_dir in parked:
-            what = 'ended after turn %d' % state.ended
-            held = ' · %d push(es) parked' % state.held_pushes
-        else:
-            what = doing(job_dir, state)
-            held = ' · %d push(es) held' % state.held_pushes if state.held_pushes else ''
-        print('%-24s %s · %s%s · %s' % (name, what, ago(state.last_event), held, job_dir))
+        what = 'ended after turn %d' % state.ended if job_dir in ended else doing(job_dir, state)
+        count = seat.pending_count(job_dir)
+        pending = ' · %d push(es) pending' % count if count else ''
+        print('%-24s %s · %s%s · %s' % (name, what, ago(state.last_event), pending, job_dir))
     return 0
 
 
@@ -752,17 +741,15 @@ def probe_line(status, provider, rc):
 
 
 def rebind():
-    """Point this session's live seats at its address now, and send what its ended seats parked.
-    A Claude Code restart moves a resumed session to a new socket and token: its live seats held
-    the pushes they could not send, and send them once their DIR/driver changes; its ended seats
-    parked theirs, and this command sends them."""
-    rebound = seat.rebind_seats()
+    """Point this session's seats at its address now, and send the pushes they have pending.
+    A Claude Code restart moves a resumed session to a new socket and token, so the pushes its
+    seats sent meanwhile failed; this command sends them."""
+    rebound, served = seat.rebind_seats()
     if rebound:
-        say("this session's address changed (a restart?): %d live seat(s) now push to it, and "
-            "send the pushes they held: %s" % (len(rebound), ' '.join(rebound)))
-    served = seat.deliver_parked()
+        say("this session's address changed (a restart?): %d seat(s) now push to it: %s"
+            % (len(rebound), ' '.join(rebound)))
     if served:
-        say('%d ended seat(s) had parked pushes this session missed; they are posted now: %s'
+        say('%d seat(s) had pending pushes this session missed; they are posted now: %s'
             % (len(served), ' '.join(served)))
 
 

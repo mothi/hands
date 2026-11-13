@@ -158,7 +158,7 @@ to keep.
 | `mail DIR TEXT` | appends a driver line to `DIR/inbox.jsonl`; the live wrapper delivers it as `MAIL from driver` (it never cancels a running turn) | nothing, 0. 1 when no wrapper is live, as between turns: the line waits for the next `send`. 2 when the inbox is a link or not a regular file |
 | `wait DIR [--for turn\|mail\|exit] [--timeout S]` | blocks, spending nothing, until every sent turn ends (`turn`), the seat's next outbox line (`mail`), or the wrapper exits (`exit`) | the answer if ok, then the envelope; 0 if ok, else 1. At the timeout: `{"status":"running","last_event","open_tool_calls",...}`, 1 |
 | `events DIR [--follow]` | a readable view of `DIR/events.jsonl`: text blocks, one line per tool call, turn and usage lines with the cache-hit %, errors. `--follow` ends when the seat does. The raw stream is `tail -f DIR/events.jsonl` | text, 0 |
-| `ps` | every live seat on this machine, found by its wrapper's command line (so `--out` dirs too): provider and model, `running turn N` (with how many are queued), `starting turn N` or `idle after turn N <status>`, the age of its last event, `N push(es) held` when its driver could not be reached (§ Mail and push), and its dir; then every ended seat in the jobs root that parked pushes, as `ended after turn N · N push(es) parked` | one line per seat, 0. With none: `hands: no live seats` on stderr, 0 |
+| `ps` | every live seat on this machine, found by its wrapper's command line (so `--out` dirs too): provider and model, `running turn N` (with how many are queued), `starting turn N` or `idle after turn N <status>`, the age of its last event, `N push(es) pending` when its driver could not be reached (§ Mail and push), and its dir; then every ended seat in the jobs root with pushes pending, as `ended after turn N · N push(es) pending` | one line per seat, 0. With none: `hands: no live seats` on stderr, 0 |
 | `quota [--json] [provider ...]` | the quota board: one line per provider (§ Quota gauges). Read-only: it never spends | the board, 0 |
 | `stop DIR` | ends a turn in flight: the wrapper closes its CLI as at its deadline (stdin EOF, then TERM at 2 s, KILL at 4 s) and types the open turn and every queued one `incomplete`, rc 143; what is left at 10 s is TERMed, then KILLed. A seat whose turns have all ended is gone already | the envelope, 0 (1 if a wrapper survived) |
 
@@ -266,19 +266,16 @@ or `failed` with the reason. A Codex or OpenCode push command gets 15 seconds. W
 host's variables are set, the first row wins.
 
 **When the driver moves.** A Claude Code restart (an app update, a quit and reopen) gives the
-resumed session a new socket and token under the same session id, and deletes the old socket. A
-push that fails is held, not dropped: its event says `failed` (or `held`, behind an earlier one)
-with `held` counting what waits, and `ps` shows `N push(es) held`. Every `hands.sh` command a
-session runs points that session's live seats at its address now (it says so on stderr), and
-each seat then sends what it held, in order, marked `(late Nm)` on line 1. A seat also tries
-again on its own, after 30 seconds and then less often, up to every 10 minutes, for a host that
-comes back at the same address. A wrapper that ends (its last turn done, a stop, a deadline)
-while it still holds pushes parks them in `DIR/held.jsonl` and says so (`N push(es) parked`). The
-seat's next launch sends them first, in order, and so does any `hands.sh` command the driver
-session runs, which `ps` shows as `ended after turn N · N push(es) parked` until they go (a seat
-started with `--out` outside the jobs root is found only by its next launch). So after a restart,
-run `hands.sh ps` once. A seat started before its `DIR/driver` recorded a session id can't be
-rebound: `send` to it records the session again.
+resumed session a new socket and token under the same session id, and deletes the old socket.
+Each push is logged in `DIR/pushes.jsonl` before it is sent, with a cursor that counts the pushes
+the host took. A push that fails stays pending: its event says `failed`, with `pending` counting
+what waits, and `ps` shows `N push(es) pending`, for an ended seat in the jobs root too. Pending
+pushes go in order, marked `(late Ns)` or `(late Nm)` on line 1, with the seat's next push, when
+its wrapper exits or next launches, and with any `hands.sh` command the driver session runs,
+which first points the session's seats at its address now (it says so on stderr). So after a
+restart, run `hands.sh ps` once. An ended seat started with `--out` outside the jobs root is
+found only by its next launch. A seat started before its `DIR/driver` recorded a session id
+can't be rebound: `send` to it records the session again.
 
 A seat's own CLI names the seat's session to the commands it runs, so a seat that starts a seat
 records no driver (a live seat's session is never pushed to) and gets its answers by `wait`. A
@@ -384,6 +381,7 @@ hands.sh start codex task.md
       │                          ├─ one select loop: in.fifo and inbox.jsonl in,
       │                          │  the CLI's output out to events.jsonl
       │                          └─ each turn's end: turn-N/result.txt, envelope.json, a push
+      │                             (logged in pushes.jsonl, then sent)
       └─ prints {"status":"spawned",...} once the wrapper has the first message
 ```
 

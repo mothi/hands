@@ -1381,6 +1381,7 @@ class Pushes(unittest.TestCase):
     def test_no_socket_is_no_push_and_a_dead_one_is_survived(self):
         job, _ = SB.buy('push-none', CLAUDE)
         self.assertFalse(os.path.exists(os.path.join(job, 'driver')))
+        self.assertFalse(os.path.exists(os.path.join(job, 'pushes.jsonl')))
         self.assertEqual(self.outcomes(job), [])
         self.assertEqual(envelope(job)['status'], 'ok')
         job, _ = SB.buy('push-dead', CLAUDE, '--cwd', SB.path('tmp'),
@@ -1389,11 +1390,15 @@ class Pushes(unittest.TestCase):
         self.assertTrue(os.path.getsize(os.path.join(job, 'driver')))
         self.assertEqual(envelope(job)['status'], 'ok')
         self.assertOutcome(job, 'failed', 'No such file')
+        self.assertEqual(self.outcomes(job)[0]['pending'], 1)
+        self.assertEqual([e for e in progress(job) if 'parked' in e], [])
+        self.assertFalse(os.path.exists(os.path.join(job, 'held.jsonl')))
+        self.assertEqual(seat.pending_count(job), 1)   # it waits for the driver's next command
 
     def test_a_restarted_driver_gets_the_pushes_its_old_socket_missed(self):
         """A Claude Code restart gives the resumed session a new socket and token under the same
-        session id. The seat holds what it could not push, in order; the session's next hands.sh
-        command points the seat at the new address, and the held pushes go there."""
+        session id. What the seat could not push stays pending, in order; the session's next
+        hands.sh command points the seat at the new address and sends the pending pushes there."""
         old = harness.DriverSocket(SB.path('restart-old.sock'))
         session = dict(CLAUDE_CODE_SESSION_ID='ses-restart')
         job, _ = SB.start('push-restart', CLAUDE, '--cwd', SB.path('tmp'), STUB_MODE='park',
@@ -1411,12 +1416,13 @@ class Pushes(unittest.TestCase):
         with open(outbox, 'a') as f:
             f.write('{"text":"still waiting"}\n')
         self.assertTrue(wait_until(lambda: len(self.outcomes(job)) == 2))
-        self.assertEqual([(e['push'], e.get('held')) for e in self.outcomes(job)],
-                         [('failed', 1), ('held', 2)])
-        self.assertIn('No such file', self.outcomes(job)[0]['error'])
+        self.assertEqual([(e['push'], e.get('pending')) for e in self.outcomes(job)],
+                         [('failed', 1), ('failed', 2)])
+        for outcome in self.outcomes(job):
+            self.assertIn('No such file', outcome['error'])
         listed = [x for x in SB.hands('ps').out.splitlines() if x.endswith(' · ' + job)]
         self.assertEqual(len(listed), 1)
-        self.assertIn(' · 2 push(es) held · ', listed[0])
+        self.assertIn(' · 2 push(es) pending · ', listed[0])
 
         # Another session's command, and one that names no session id, leave the seat alone.
         stranger = SB.hands('ps', CLAUDE_CODE_MESSAGING_SOCKET=self.socket.path,
@@ -1427,18 +1433,22 @@ class Pushes(unittest.TestCase):
         self.assertNotIn('address changed', stranger.err + nameless.err)
         self.assertEqual(read_json(driver)['address'], [old.path, 'tok-old'])
 
-        time.sleep(2)   # so both held pushes are measurably late: lateness counts whole seconds
+        time.sleep(2)   # so both pending pushes are measurably late: lateness counts whole seconds
         new = harness.DriverSocket(SB.path('restart-new.sock'))   # the resumed session
         try:
             resumed = SB.hands('ps', CLAUDE_CODE_MESSAGING_SOCKET=new.path,
                                CLAUDE_CODE_MESSAGING_TOKEN='tok-new', **session)
-            self.assertIn("this session's address changed", resumed.err)
-            self.assertIn(job, resumed.err)
+            said = resumed.err.splitlines()
+            self.assertEqual(len(said), 2)
+            self.assertIn("this session's address changed", said[0])
+            self.assertIn('had pending pushes', said[1])   # the command sent them, not the seat
+            self.assertTrue(said[0].endswith(job) and said[1].endswith(job))
             self.assertEqual(read_json(driver), {'host': 'claude',
                                                  'address': [new.path, 'tok-new'],
                                                  'session': 'ses-restart'})
             self.assertEqual(os.stat(driver).st_mode & 0o777, 0o600)
-            self.assertTrue(wait_until(lambda: len(new.connections) >= 2))
+            self.assertEqual(seat.pending_count(job), 0)
+            self.assertTrue(wait_until(lambda: len(new.connections) >= 2, 2))
             time.sleep(0.5)
             self.assertEqual(len(new.connections), 2)
             auths = [lines[0] for lines in new.connections]
@@ -1449,10 +1459,10 @@ class Pushes(unittest.TestCase):
             self.assertEqual([text[4] for text in texts], ['BLOCKED: which table?',
                                                            'still waiting'])   # in order
             posted = [e for e in self.outcomes(job) if e['push'] == 'posted']
-            self.assertEqual([(e.get('held'), 'late' in e) for e in posted],
-                             [(1, True), (None, True)])
+            self.assertEqual([(e.get('pending'), 'late' in e) for e in posted],
+                             [(None, True), (None, True)])
             listed = [x for x in SB.hands('ps').out.splitlines() if x.endswith(' · ' + job)]
-            self.assertNotIn('held', listed[0])
+            self.assertNotIn('pending', listed[0])
             with open(outbox, 'a') as f:   # what comes next goes straight to the new socket
                 f.write('{"text":"thanks"}\n')
             self.assertTrue(wait_until(lambda: len(new.connections) == 3))
@@ -1460,52 +1470,52 @@ class Pushes(unittest.TestCase):
                              r'^claude:sonnet t1 mail to driver: thanks\n')
             view = [x for x in SB.hands('events', job).out.splitlines() if 'push' in x]
             self.assertEqual(len(view), 4)
-            self.assertRegex(view[0], r'^!! push mail failed: .*No such file.* \(1 held\)$')
-            self.assertEqual(view[1], '!! push mail held behind a failed one (2 held)')
-            self.assertRegex(view[2], r'^· push mail posted \d+s late \(1 held\)$')
+            self.assertRegex(view[0], r'^!! push mail failed: .*No such file.* \(1 pending\)$')
+            self.assertRegex(view[1], r'^!! push mail failed: .*No such file.* \(2 pending\)$')
+            self.assertRegex(view[2], r'^· push mail posted \d+s late$')
             self.assertRegex(view[3], r'^· push mail posted \d+s late$')
         finally:
             SB.stop(job)
             new.close()
 
-    def parked_line(self, job):
+    def pending_line(self, job):
         return [x for x in SB.hands('ps').out.splitlines() if x.endswith(' · ' + job)]
 
-    def test_pushes_parked_by_an_ended_seat_reach_the_resumed_driver(self):
+    def test_pending_pushes_of_an_ended_seat_reach_the_resumed_driver(self):
         """The app restarts while a seat's turn runs. The turn ends, its push fails, and the
-        wrapper ends with the push parked. The resumed session's next hands.sh command, whatever
+        wrapper ends with the push pending. The resumed session's next hands.sh command, whatever
         it is, posts it to the session's new address and points the seat there."""
-        old = harness.DriverSocket(SB.path('parked-old.sock'))
-        session = dict(CLAUDE_CODE_SESSION_ID='ses-parked')
+        old = harness.DriverSocket(SB.path('pending-old.sock'))
+        session = dict(CLAUDE_CODE_SESSION_ID='ses-pending')
         run = SB.hands('start', '--cwd', SB.path('tmp'), CLAUDE, SB.task, STUB_MODE='slow',
-                       STUB_SLEEP='3', STUB_LOG=SB.path('push-parked.stub.jsonl'),
+                       STUB_SLEEP='3', STUB_LOG=SB.path('push-pending.stub.jsonl'),
                        CLAUDE_CODE_MESSAGING_SOCKET=old.path, CLAUDE_CODE_MESSAGING_TOKEN='tok-old',
                        **session)
         job = run.json['dir']   # in the jobs root, where ps and the other commands look
         old.close()   # the app quits mid-turn: its socket is deleted
         SB.wait(job, '--timeout', '30')
         self.assertTrue(harness.gone(job))
-        parked = os.path.join(job, 'held.jsonl')
-        self.assertTrue(os.path.isfile(parked))
-        self.assertEqual([(e['push'], e.get('held')) for e in self.outcomes(job)],
+        log = os.path.join(job, 'pushes.jsonl')
+        self.assertEqual([sorted(line) for line in harness.read_jsonl(log)],
+                         [['at', 'kind', 'text', 'turn', 'what']])   # one push, no cursor
+        self.assertFalse(os.path.exists(os.path.join(job, 'held.jsonl')))
+        self.assertEqual([(e['push'], e.get('pending')) for e in self.outcomes(job)],
                          [('failed', 1)])
-        self.assertEqual([(e['parked'], e['held']) for e in progress(job) if e.get('parked')],
-                         [(1, 1)])
-        listed = self.parked_line(job)
+        listed = self.pending_line(job)
         self.assertEqual(len(listed), 1)
         self.assertIn(' ended after turn 1 · ', listed[0])
-        self.assertIn(' · 1 push(es) parked · ', listed[0])
+        self.assertIn(' · 1 push(es) pending · ', listed[0])
         stranger = SB.hands('ps', CLAUDE_CODE_MESSAGING_SOCKET=self.socket.path,
                             CLAUDE_CODE_MESSAGING_TOKEN='tok-stranger',
                             CLAUDE_CODE_SESSION_ID='ses-other')   # another session: left alone
-        self.assertNotIn('parked', stranger.err)
-        self.assertTrue(os.path.isfile(parked))
-        time.sleep(2)   # so the parked push is measurably late: lateness counts whole seconds
-        new = harness.DriverSocket(SB.path('parked-new.sock'))   # the resumed session
+        self.assertNotIn(job, stranger.err)
+        self.assertEqual(seat.pending_count(job), 1)
+        time.sleep(2)   # so the pending push is measurably late: lateness counts whole seconds
+        new = harness.DriverSocket(SB.path('pending-new.sock'))   # the resumed session
         try:
             resumed = SB.hands('quota', CLAUDE_CODE_MESSAGING_SOCKET=new.path,
                                CLAUDE_CODE_MESSAGING_TOKEN='tok-new', **session)
-            self.assertIn('parked pushes', resumed.err)
+            self.assertIn('pending pushes', resumed.err)
             self.assertIn(job, resumed.err)
             self.assertTrue(wait_until(lambda: len(new.connections) >= 1))
             auth, user = new.connections[0][:2]
@@ -1513,22 +1523,41 @@ class Pushes(unittest.TestCase):
             text = user['message']['content'].split('\n')
             self.assertRegex(text[0], r'^claude:sonnet t1 ok \(late \d+s\): turn 1 pid ')
             self.assertEqual(text[1:3], [job, 'id %s:1' % job])
-            self.assertFalse(os.path.exists(parked))
+            self.assertEqual(harness.read_jsonl(log)[-1], {'sent': 1})
             self.assertEqual(read_json(os.path.join(job, 'driver')),
                              {'host': 'claude', 'address': [new.path, 'tok-new'],
-                              'session': 'ses-parked'})
+                              'session': 'ses-pending'})
             posted = [e for e in self.outcomes(job) if e['push'] == 'posted']
-            self.assertEqual([(e.get('held'), 'late' in e) for e in posted], [(None, True)])
-            self.assertEqual(self.parked_line(job), [])
+            self.assertEqual([(e.get('pending'), 'late' in e) for e in posted], [(None, True)])
+            self.assertEqual(self.pending_line(job), [])
             view = [x for x in SB.hands('events', job).out.splitlines() if 'push' in x]
-            self.assertEqual(len(view), 3)
-            self.assertRegex(view[0], r'^!! push turn_end failed: .*No such file.* \(1 held\)$')
-            self.assertRegex(view[1], r'^!! 1 push\(es\) parked: ')
-            self.assertRegex(view[2], r'^· push turn_end posted \d+s late$')
+            self.assertEqual(len(view), 2)
+            self.assertRegex(view[0],
+                             r'^!! push turn_end failed: .*No such file.* \(1 pending\)$')
+            self.assertRegex(view[1], r'^· push turn_end posted \d+s late$')
         finally:
             new.close()
 
-    def test_a_relaunch_sends_the_parked_pushes_first(self):
+    def test_two_driver_commands_at_once_send_a_pending_push_once(self):
+        """Two hands.sh commands of the driver session serve an ended seat at once: one sends,
+        the other finds the log taken and goes on."""
+        thread = dict(CODEX_THREAD_ID='test-th-race')
+        run = SB.hands('start', '--cwd', SB.path('tmp'), CLAUDE, SB.task, STUB_PUSH_RC='3',
+                       STUB_LOG=SB.path('push-race.stub.jsonl'), **thread)
+        job = run.json['dir']   # in the jobs root, where the driver's commands look
+        SB.wait(job, '--timeout', '30')
+        self.assertTrue(harness.gone(job))
+        self.assertEqual(seat.pending_count(job), 1)
+        log = SB.path('push-race-driver.stub.jsonl')
+        commands = [SB.popen('ps', STUB_PUSH_SLEEP='1', STUB_LOG=log, **thread)
+                    for _ in range(2)]
+        said = [command.communicate(timeout=60)[1] for command in commands]
+        self.assertEqual(len(harness.StubLog(log).events('push')), 1)
+        self.assertEqual(sum('had pending pushes' in err for err in said), 1)
+        self.assertEqual(harness.read_jsonl(os.path.join(job, 'pushes.jsonl'))[-1], {'sent': 1})
+        self.assertEqual([e['push'] for e in self.outcomes(job)], ['failed', 'posted'])
+
+    def test_a_relaunch_sends_the_pending_pushes_first(self):
         old = harness.DriverSocket(SB.path('relaunch-old.sock'))
         job, _ = SB.start('push-relaunch', CLAUDE, '--cwd', SB.path('tmp'), STUB_MODE='slow',
                           STUB_SLEEP='3', CLAUDE_CODE_MESSAGING_SOCKET=old.path,
@@ -1536,20 +1565,85 @@ class Pushes(unittest.TestCase):
         old.close()
         SB.wait(job, '--timeout', '30')
         self.assertTrue(harness.gone(job))
-        self.assertTrue(os.path.isfile(os.path.join(job, 'held.jsonl')))
-        time.sleep(2)   # so the parked push is measurably late
+        self.assertEqual(seat.pending_count(job), 1)
+        time.sleep(2)   # so the pending push is measurably late
         SB.send(job, **self.driver_env())   # the send records the driver's address again
         SB.wait(job, '--timeout', '30')
         self.assertTrue(harness.gone(job))
-        self.assertFalse(os.path.exists(os.path.join(job, 'held.jsonl')))
+        self.assertEqual(seat.pending_count(job), 0)
         firsts = [lines[1]['message']['content'].split('\n')[0] for lines in self.socket.connections
                   if len(lines) == 2 and lines[1]['message']['content'].split('\n')[1:2] == [job]]
         self.assertEqual(len(firsts), 2)
-        self.assertRegex(firsts[0], r'^claude:sonnet t1 ok \(late \d+s\): ')   # the parked one first
+        self.assertRegex(firsts[0], r'^claude:sonnet t1 ok \(late \d+s\): ')   # the pending one first
         self.assertRegex(firsts[1], r'^claude:sonnet t2 ok: ')
-        outcomes = [(e['push'], e.get('held'), 'late' in e) for e in self.outcomes(job)]
+        outcomes = [(e['push'], e.get('pending'), 'late' in e) for e in self.outcomes(job)]
         self.assertEqual(outcomes, [('failed', 1, False), ('posted', None, True),
                                     ('posted', None, False)])
+
+    def test_the_sender_goes_in_order_once_under_its_lock_and_never_through_a_link(self):
+        job = SB.path('send-pending')
+        os.makedirs(job)
+        handle = {'provider': 'claude', 'model': 'sonnet'}
+        log = os.path.join(job, 'pushes.jsonl')
+        for turn in (1, 2, 3):
+            seat.append_json(log, {'at': time.time(), 'turn': turn, 'kind': 'turn_end',
+                                   'what': 'ok', 'text': 'answer %d' % turn})
+        dead = [SB.path('send-pending-dead.sock'), 'tok-stub']
+        self.assertEqual(seat.send_pending(job, handle, 'claude', dead), 'failed')
+        self.assertEqual(seat.read_pushes(job)[1], 0)   # no cursor
+        self.assertFalse(os.path.exists(os.path.join(job, 'events.jsonl')))   # it logged none
+        live = harness.DriverSocket(SB.path('send-pending.sock'))
+        address = [live.path, 'tok-stub']
+        try:
+            with open(log, 'rb') as taken:   # another sender holds the log
+                fcntl.flock(taken, fcntl.LOCK_EX)
+                self.assertEqual(seat.send_pending(job, handle, 'claude', address), 'busy')
+            time.sleep(0.3)
+            self.assertEqual(live.connections, [])
+            self.assertEqual(seat.send_pending(job, handle, 'claude', address), 'sent')
+            self.assertTrue(wait_until(lambda: len(live.connections) == 3))
+            texts = [lines[1]['message']['content'].split('\n') for lines in live.connections]
+            self.assertEqual([text[4] for text in texts], ['answer 1', 'answer 2', 'answer 3'])
+            self.assertEqual(harness.read_jsonl(log)[-1], {'sent': 3})
+            self.assertEqual([e['push'] for e in events(job)], ['posted'] * 3)
+            # A link planted in the log's place: nothing is read through it, nothing is sent.
+            os.rename(log, log + '.moved')
+            elsewhere = SB.write('send-pending-elsewhere', json.dumps(
+                {'at': time.time(), 'turn': 4, 'kind': 'mail', 'what': 'mail', 'text': 'x'}) + '\n')
+            os.symlink(elsewhere, log)
+            self.assertEqual(seat.send_pending(job, handle, 'claude', address), 'sent')
+            self.assertEqual(seat.pending_count(job), 0)
+            time.sleep(0.3)
+            self.assertEqual(len(live.connections), 3)
+        finally:
+            live.close()
+
+    def test_a_malformed_line_in_the_log_is_skipped_by_every_reader(self):
+        """The seat can write anything into its own job dir; no line it writes may make the
+        driver's commands fail."""
+        job = SB.path('send-malformed')
+        os.makedirs(job)
+        log = os.path.join(job, 'pushes.jsonl')
+        good = {'turn': 1, 'kind': 'mail', 'what': 'mail to driver'}
+        seat.append_json(log, dict(good, at=time.time(), text='first'))
+        for bad in ({'at': 1}, dict(good, at=True, text='a bool'), dict(good, at=1.0, turn='1',
+                    text='a text turn'), dict(good, at=1.0, text=None), [1, 2], 'text'):
+            seat.append_json(log, bad)
+        with open(log, 'a') as f:
+            f.write('{"at": NaN, "turn": 1, "kind": "mail", "what": "w", "text": "t"}\n')
+        seat.append_json(log, dict(good, at=time.time(), text='second'))
+        self.assertEqual(seat.pending_count(job), 2)
+        live = harness.DriverSocket(SB.path('send-malformed.sock'))
+        try:
+            self.assertEqual(seat.send_pending(job, {'provider': 'claude'}, 'claude',
+                                               [live.path, 'tok-stub']), 'sent')
+            self.assertTrue(wait_until(lambda: len(live.connections) == 2))
+            bodies = [lines[1]['message']['content'].split('\n')[4] for lines in live.connections]
+            self.assertEqual(bodies, ['first', 'second'])
+            self.assertEqual(harness.read_jsonl(log)[-1], {'sent': 2})
+            self.assertEqual(seat.pending_count(job), 0)
+        finally:
+            live.close()
 
     def test_a_push_reads_no_reply_and_never_waits_for_one(self):
         replies = {'held': b'{"type":"result","delivered":false,"reason":"held for approval"}\n',
@@ -1583,6 +1677,8 @@ class Pushes(unittest.TestCase):
         answer = result(job, 1).strip()
         self.assertGreater(len(answer), 4000)
         self.assertEqual('\n'.join(text[4:]), answer[:4000] + '...[%d chars]' % len(answer))
+        logged = harness.read_jsonl(os.path.join(job, 'pushes.jsonl'))[0]['text']
+        self.assertEqual(logged, '\n'.join(text[4:]))   # clipped once, when it was logged
         self.assertTrue(text[0].startswith('claude:sonnet t1 ok: SEAT BOX. '))
         self.assertLess(len(text[0]), 160)   # line 1 stays one short line
         self.assertEqual([e.get('id') for e in self.outcomes(job)], ['%s:1' % job])
@@ -1735,16 +1831,54 @@ class HostPushes(unittest.TestCase):
         job, _ = SB.buy('host-fail', CLAUDE, '--cwd', SB.path('tmp'), CODEX_THREAD_ID='test-th-2',
                         STUB_PUSH_RC='3', STUB_PUSH_SAYS='thread not found')
         found = self.outcome(job)
-        self.assertEqual((found['push'], found['error']),
-                         ('failed', 'codex exit 3: thread not found'))
+        self.assertEqual((found['push'], found['error'], found['pending']),
+                         ('failed', 'codex exit 3: thread not found', 1))
         self.assertEqual(envelope(job)['status'], 'ok')
+        self.assertTrue(harness.gone(job))
+        self.assertEqual(len(self.pushes(job, 2)), 2)   # when it was logged, and the exit's retry
+        self.assertEqual(seat.pending_count(job), 1)
         # started, not bought: a stop gives what is in flight 10 s, then ends it
         job, _ = SB.start('host-hang', CLAUDE, '--cwd', SB.path('tmp'),
                           OPENCODE_SESSION_ID='test-ses-2', STUB_PUSH_SLEEP='60')
         try:
             found = self.outcome(job)
-            self.assertEqual((found['push'], found['error']), ('failed', 'opencode took over 15 s'))
+            self.assertEqual((found['push'], found['error'], found['pending']),
+                             ('failed', 'opencode took over 15 s', 1))
             self.assertEqual(envelope(job)['status'], 'ok')
+            began = time.time()
+            self.assertEqual(SB.stop(job).rc, 0)   # the exit's retry hangs too, and is cut
+            self.assertLess(time.time() - began, 20)
+            self.assertEqual(len(self.pushes(job, 2)), 2)
+        finally:
+            SB.stop(job)
+
+    def test_a_push_a_slow_host_took_in_the_call_that_logged_it_is_not_late(self):
+        """The first mail cannot go; the second mail's call sends it, which takes the host two
+        seconds, then the second mail, which is not late."""
+        job, _ = SB.start('host-slow', CLAUDE, '--cwd', SB.path('tmp'), STUB_MODE='park',
+                          CODEX_THREAD_ID='test-th-slow', STUB_PUSH_SLEEP='2')
+        driver = os.path.join(job, 'driver')
+        recorded = read_text(driver)
+        outbox = os.path.join(job, 'outbox.jsonl')
+        try:
+            self.assertTrue(wait_until(lambda: agent(job).parked))
+            with open(driver, 'w') as f:   # names no host: the first mail fails
+                f.write('{}\n')
+            with open(outbox, 'a') as f:
+                f.write('{"text":"first"}\n')
+            self.assertTrue(wait_until(lambda: [e for e in events(job) if 'push' in e]))
+            with open(driver, 'w') as f:
+                f.write(recorded)
+            time.sleep(1.5)   # so the first is measurably late
+            with open(outbox, 'a') as f:
+                f.write('{"text":"second"}\n')
+            self.assertTrue(wait_until(lambda: len([e for e in events(job) if 'push' in e]) == 3,
+                                       20))
+            outcomes = [(e['push'], 'late' in e) for e in events(job) if 'push' in e]
+            self.assertEqual(outcomes, [('failed', False), ('posted', True), ('posted', False)])
+            firsts = [push['argv'][4].split('\n')[0] for push in self.pushes(job, 2)]
+            self.assertRegex(firsts[0], r'^claude:sonnet t1 mail to driver \(late \d+s\): first$')
+            self.assertEqual(firsts[1], 'claude:sonnet t1 mail to driver: second')
         finally:
             SB.stop(job)
 

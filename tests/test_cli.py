@@ -448,7 +448,7 @@ class LiveSeats(unittest.TestCase):
     def test_ps_with_no_live_seat_says_so(self):
         err = io.StringIO()
         with mock.patch.object(hands.seat, 'live_seats', return_value=[]), \
-                mock.patch.object(hands.seat, 'parked_seats', return_value=[]), \
+                mock.patch.object(hands.seat, 'seats_with_pending', return_value=[]), \
                 contextlib.redirect_stderr(err):
             self.assertEqual(hands.ps(), 0)
         self.assertEqual(err.getvalue(), 'hands: no live seats\n')

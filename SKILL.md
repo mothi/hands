@@ -36,9 +36,9 @@ $H quota                           # the quota board: read-only, it never spends
   output is the user's view, and none of it reaches you unless you read it (don't; the push or
   `wait` brings the answer). `hands.sh ps` lists every live seat.
 - After your host restarts (an app update, a resumed session), run `hands.sh ps` once. Any
-  hands.sh command points your live seats at your session's new address, and posts the pushes
-  your ended seats parked; each live seat then sends what it held while it couldn't reach you.
-  Late pushes say `(late Nm)`; until then `ps` shows `N push(es) held` or `parked` on such seats.
+  hands.sh command points your seats at your session's new address, and posts the pushes they
+  couldn't deliver meanwhile. Late pushes say `(late Ns)` or `(late Nm)`; until they go, `ps`
+  shows `N push(es) pending` on such seats.
 - A seat's CLI runs while it has a turn, and ends by itself when its last turn ends; the next
   `send` resumes the session.
   `stop` is for a turn in flight, never kill a process. A seat has no deadline unless
