@@ -6,7 +6,7 @@ the CLI each message and turns what the CLI says into events: StreamTranslator d
 claude and codex, AcpSeat for opencode.
 
 PROVIDERS is the provider table. For each provider it says how the wrapper talks to the CLI
-(the family), what a message sent to a busy seat does (the delivery), and how to start the CLI
+(the client), what a message sent to a busy seat does (the delivery), and how to start the CLI
 (the command).
 
 Python 3 standard library only.
@@ -16,6 +16,7 @@ import datetime
 import errno
 import json
 import os
+import re
 import select
 import signal
 import stat
@@ -96,11 +97,46 @@ def read_tail(path, offset, limit=4000):
         return ''
 
 
+def append_json(path, value):
+    """Append one JSON line in a single write, so concurrent writers never interleave. Text
+    that is not valid UTF-8 (half an emoji a CLI cut) is written with '?' in its place."""
+    fd = open_regular(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+    try:
+        os.write(fd, (json.dumps(value, ensure_ascii=False) + '\n').encode('utf-8', 'replace'))
+    finally:
+        os.close(fd)
+
+
 def exit_code(returncode):
     """A process's exit code as a shell reports it: one that signal N ended reads 128 + N."""
     if returncode is None or returncode >= 0:
         return returncode
     return 128 - returncode
+
+
+# Failure types, from a provider's error fields and the CLI's stderr (seat.py's failure_status
+# adds the deadline's timeout).
+# Subscription windows, then API-key billing: Anthropic's credit balance, OpenAI's
+# insufficient_quota, and a gateway's 402 (OpenRouter's wording) under an opencode seat.
+QUOTA_TEXT = re.compile(r'hit your (usage|session|weekly) limit|'
+                        r'usage limit reached|quota exceeded|'
+                        r'credit balance is too low|insufficient[_ ]quota|'
+                        r'exceeded your current quota|insufficient credits', re.I)
+RESET_TEXT = re.compile(r'resets? (at )?[A-Za-z0-9:. apm/-]{3,40}|again at [A-Za-z0-9:, ]{3,40}',
+                        re.I)
+AUTH_TEXT = re.compile(r'not logged in|login required|unauthorized|'
+                       r'invalid[ _-]?(api[ _-]?)?key|missing api[ _-]?key|oauth session expired|'
+                       r'failed to authenticate|requires a credential', re.I)
+
+
+def classify(text):
+    """Error text -> (status, reset): provider-quota-dead, auth-expired or error."""
+    if QUOTA_TEXT.search(text):
+        reset = RESET_TEXT.search(text)
+        return 'provider-quota-dead', reset.group(0).replace('"', '') if reset else ''
+    if AUTH_TEXT.search(text):
+        return 'auth-expired', ''
+    return 'error', ''
 
 
 # Each usage field, and the names the CLIs give it. A dotted name is a nested field.
@@ -749,12 +785,31 @@ class AcpSeat(AcpAgent):
     CodexSeat and StreamTranslator call the same owner. forget_session is ACP's alone, and only
     claude's StreamTranslator asks expected()."""
 
-    def __init__(self, argv, cwd, env, log, stderr_path, provider, last_turn, owner):
-        AcpAgent.__init__(self, argv, cwd, env, log, stderr_path)
+    session = None       # the wrapper's handle holds the session (keep_session)
+    latest_turn = None   # the wrapper's events.jsonl holds the latest turn
+
+    def __init__(self, argv, cwd, env, stderr_path, stream_path, handle, last_turn, owner):
+        self.stream_path = stream_path
+        AcpAgent.__init__(self, argv, cwd, env, self.log_stream, stderr_path)
         self.stderr_path = stderr_path
-        self.provider = provider
+        self.provider = handle['provider']
         self.next_number = last_turn + 1   # the turn the next prompt opens
         self.owner = owner
+
+    def log_stream(self, line, direction):
+        log_rpc(self.stream_path, line, direction)
+
+    def handshake(self, handle):
+        return acp_handshake(self, handle)
+
+    def cut(self):
+        return None   # an ACP turn always closes inside close(): end of file answers its prompt
+
+    def interrupt(self):
+        """Nothing to do: the wrapper's close ends the running prompt."""
+
+    def linger(self):
+        return 0   # the wrapper holds every message the agent has not taken
 
     def hand_over(self, records):
         """Prompt the first of the wrapper's waiting records as the next turn, unless a turn
@@ -867,19 +922,6 @@ def opencode_command(handle):
     return [handle.get('cli') or 'opencode', 'acp'], {}
 
 
-# family:   how the wrapper talks to the CLI: 'stdin' (claude's stream-json on its stdin and
-#           stdout), 'rpc' (codex's app-server) or 'acp' (Agent Client Protocol)
-# delivery: what a message sent to a busy seat does: 'steer' joins the running turn, 'queue'
-#           waits for it to end (ACP v1 takes no input during a turn)
-# command:  handle -> (argv, environment overrides)
-Provider = collections.namedtuple('Provider', 'family delivery command')
-PROVIDERS = {
-    'claude': Provider('stdin', 'steer', claude_command),
-    'codex': Provider('rpc', 'steer', codex_command),
-    'opencode': Provider('acp', 'queue', opencode_command),
-}
-
-
 def forget_command(provider, session, cli=None):
     """The command that deletes the stored session of a turn whose agent went away mid-turn,
     or None when the provider keeps nothing to resume.
@@ -940,33 +982,24 @@ def acp_handshake(agent, handle):
     return None
 
 
-def launch(handle, wrap, log=None, stderr_path=None, last_turn=0, owner=None):
+def launch(handle, wrap, stderr_path, stream_path, last_turn, owner):
     """Start a seat's CLI and run its handshake -> (cli, None), or (cli or None, (status,
     reason, why)) when the launch fails or is refused before any turn.
 
-    wrap(argv) puts the CLI under the caller's reaper. The seat numbers its turns after
-    last_turn and reports them to owner (see AcpSeat)."""
-    family, _, command = PROVIDERS[handle['provider']]
+    wrap(argv) puts the CLI under the caller's reaper. The CLI's stderr goes to stderr_path, and
+    its client logs what it says to stream_path. The seat numbers its turns after last_turn and
+    reports them to owner (see AcpSeat)."""
+    provider = PROVIDERS[handle['provider']]
     try:
-        argv, env = command(handle)
+        argv, env = provider.command(handle)
     except ValueError as refusal:
         return None, ('refused',) + refusal.args
-    if family == 'stdin':
-        return ClaudeSeat(wrap(argv), handle['cwd'], env, log, stderr_path, handle, last_turn,
-                          owner), None
-    if family == 'rpc':
-        cli = CodexSeat(wrap(argv), handle['cwd'], env, log, stderr_path, handle, last_turn, owner)
-        try:   # the thread its handshake opened, before the first turn/start names it
-            cli.translator.session = codex_handshake(handle, cli)
-        except WireError as error:
-            return cli, ('error', 'handshake', str(error))
-        return cli, None
-    agent = AcpSeat(wrap(argv), handle['cwd'], env, log, stderr_path, handle['provider'],
-                    last_turn, owner)
+    cli = provider.client(wrap(argv), handle['cwd'], env, stderr_path, stream_path, handle,
+                          last_turn, owner)
     try:
-        return agent, acp_handshake(agent, handle)
+        return cli, cli.handshake(handle)
     except WireError as error:
-        return agent, ('error', 'handshake', str(error))
+        return cli, ('error', 'handshake', str(error))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -977,7 +1010,7 @@ def input_record(provider, text):
     """A message as the line the wrapper reads from in.fifo.
 
     For claude that is claude's own stdin line, which the wrapper passes straight through."""
-    if PROVIDERS[provider].family == 'stdin':
+    if PROVIDERS[provider].client is ClaudeSeat:
         content = [{'type': 'text', 'text': text}]
         return {'type': 'user', 'message': {'role': 'user', 'content': content}}
     return {'message': {'content': text}}
@@ -1001,6 +1034,14 @@ def repeats(message):
     method = message.get('method') if isinstance(message, dict) else None
     return isinstance(method, str) and (method.lower().endswith('delta')
                                         or method == 'turn/diff/updated')
+
+
+def log_rpc(stream_path, line, direction):
+    """stream.jsonl for a JSON-RPC seat (codex, ACP): each line, both ways, with its time, but
+    for the lines that only repeat what the file holds whole (repeats)."""
+    message = parse_json(line)
+    if not repeats(message):
+        append_json(stream_path, {'t': now(), 'dir': direction, 'msg': message})
 
 
 CODEX_TOOL_ITEMS = {   # codex item type -> (tool name, the item field that holds its input)
@@ -1277,11 +1318,23 @@ class ClaudeSeat(Cli):
     steers each one itself, and its StreamTranslator turns what it prints into events. Its owner
     is the wrapper (see AcpSeat)."""
 
-    def __init__(self, argv, cwd, env, log, stderr_path, handle, last_turn, owner):
+    def __init__(self, argv, cwd, env, stderr_path, stream_path, handle, last_turn, owner):
         # Before the process starts: everything it prints is translated.
         self.translator = StreamTranslator('claude', last_turn, handle.get('session'), owner)
         self.handed = 0   # the messages handed to it this launch
-        Cli.__init__(self, argv, cwd, env, log, stderr_path, self.translator.take)
+        self.stream_path = stream_path
+        Cli.__init__(self, argv, cwd, env, self.log_stream, stderr_path, self.translator.take)
+
+    def log_stream(self, line, direction):
+        """stream.jsonl: claude's stdout as it is (a Cli logs only the lines it reads)."""
+        with open(self.stream_path, 'ab') as f:
+            f.write(line.encode() + b'\n')
+
+    def handshake(self, handle):
+        return None   # claude needs none: it reads its first message from stdin as it starts
+
+    def interrupt(self):
+        """Nothing to do: the wrapper's close ends claude's turn."""
 
     @property
     def session(self):
@@ -1321,13 +1374,24 @@ class CodexSeat(Rpc):
     StreamTranslator turns the notifications into events. Its owner is the wrapper (see
     AcpSeat)."""
 
-    def __init__(self, argv, cwd, env, log, stderr_path, handle, last_turn, owner):
+    def __init__(self, argv, cwd, env, stderr_path, stream_path, handle, last_turn, owner):
         # Before the process starts: what it says during the handshake is translated too.
         self.translator = StreamTranslator('codex', last_turn, handle.get('session'), owner)
         self.turn_start_pending = False   # a turn/start not answered yet
         self.effort = handle.get('effort')
         self.owner = owner
-        Rpc.__init__(self, argv, cwd, env, log, stderr_path, self.translator.take)
+        self.stream_path = stream_path
+        Rpc.__init__(self, argv, cwd, env, self.log_stream, stderr_path, self.translator.take)
+
+    def log_stream(self, line, direction):
+        log_rpc(self.stream_path, line, direction)
+
+    def handshake(self, handle):
+        """codex_handshake, keeping the thread it opened for the first turn/start to name."""
+        self.translator.session = codex_handshake(handle, self)
+
+    def linger(self):
+        return 0   # each turn/start's answer says where its message went: none waits in codex
 
     @property
     def session(self):
@@ -1385,3 +1449,20 @@ class CodexSeat(Rpc):
                                                         'turnId': self.translator.turn_id}, 5)
             except WireError:
                 pass
+
+
+# ---------------------------------------------------------------------------------------------
+# The provider table itself, below the clients it names (each provider's command is above)
+#
+# client:   the class that runs the seat's CLI and talks to it: ClaudeSeat (claude's stream-json
+#           on its stdin and stdout), CodexSeat (codex's app-server) or AcpSeat (Agent Client
+#           Protocol)
+# delivery: what a message sent to a busy seat does: 'steer' joins the running turn, 'queue'
+#           waits for it to end (ACP v1 takes no input during a turn)
+# command:  handle -> (argv, environment overrides)
+Provider = collections.namedtuple('Provider', 'client delivery command')
+PROVIDERS = {
+    'claude': Provider(ClaudeSeat, 'steer', claude_command),
+    'codex': Provider(CodexSeat, 'steer', codex_command),
+    'opencode': Provider(AcpSeat, 'queue', opencode_command),
+}

@@ -1938,12 +1938,12 @@ class Hermetic(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------
-# Failure text: what seat.classify makes of a provider's own words
+# Failure text: what wires.classify makes of a provider's own words
 
 
 class FailureText(unittest.TestCase):
     def classify(self, fixture):
-        return seat.classify(read_text(os.path.join(harness.FIXTURES, fixture)))
+        return wires.classify(read_text(os.path.join(harness.FIXTURES, fixture)))
 
     def test_usage_limits_are_provider_quota_dead_with_their_reset(self):
         for name in ('claude-session-limit', 'codex-usage-limit'):
@@ -1961,7 +1961,7 @@ class FailureText(unittest.TestCase):
             self.assertEqual(self.classify(name + '.txt')[0], 'auth-expired', name)
 
     def test_other_text_is_an_error(self):
-        self.assertEqual(seat.classify('plain unrelated failure text')[0], 'error')
+        self.assertEqual(wires.classify('plain unrelated failure text')[0], 'error')
 
 
 class SlowLaunch(unittest.TestCase):

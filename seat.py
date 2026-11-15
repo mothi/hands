@@ -22,7 +22,6 @@ import fcntl
 import json
 import math
 import os
-import re
 import select
 import signal
 import socket
@@ -34,8 +33,8 @@ import traceback
 import urllib.parse
 
 import wires
-from wires import (clip, closed_turn, event, exit_code, file_size, now, open_regular, parse_json,
-                   read_tail)
+from wires import (append_json, classify, clip, closed_turn, event, exit_code, file_size,
+                   open_regular, parse_json, read_tail)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -55,16 +54,6 @@ NOTE = ('turn-N/result.txt + envelope.json land at each turn_end (absent = not f
 
 # ---------------------------------------------------------------------------------------------
 # Files in a job dir
-
-
-def append_json(path, value):
-    """Append one JSON line in a single write, so concurrent writers never interleave. Text
-    that is not valid UTF-8 (half an emoji a CLI cut) is written with '?' in its place."""
-    fd = open_regular(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
-    try:
-        os.write(fd, (json.dumps(value, ensure_ascii=False) + '\n').encode('utf-8', 'replace'))
-    finally:
-        os.close(fd)
 
 
 def write_atomic(path, text, mode=None):
@@ -108,29 +97,6 @@ def read_lines(path, offset):
 # ---------------------------------------------------------------------------------------------
 # Failure types. They come from a provider's error fields and the CLI's stderr, never from what
 # the model wrote: a model that quotes an error message does not fail its turn.
-
-# Subscription windows, then API-key billing: Anthropic's credit balance, OpenAI's
-# insufficient_quota, and a gateway's 402 (OpenRouter's wording) under an opencode seat.
-QUOTA_TEXT = re.compile(r'hit your (usage|session|weekly) limit|'
-                        r'usage limit reached|quota exceeded|'
-                        r'credit balance is too low|insufficient[_ ]quota|'
-                        r'exceeded your current quota|insufficient credits', re.I)
-RESET_TEXT = re.compile(r'resets? (at )?[A-Za-z0-9:. apm/-]{3,40}|again at [A-Za-z0-9:, ]{3,40}',
-                        re.I)
-AUTH_TEXT = re.compile(r'not logged in|login required|unauthorized|'
-                       r'invalid[ _-]?(api[ _-]?)?key|missing api[ _-]?key|oauth session expired|'
-                       r'failed to authenticate|requires a credential', re.I)
-
-
-def classify(text):
-    """Error text -> (status, reset): provider-quota-dead, auth-expired or error."""
-    if QUOTA_TEXT.search(text):
-        reset = RESET_TEXT.search(text)
-        return 'provider-quota-dead', reset.group(0).replace('"', '') if reset else ''
-    if AUTH_TEXT.search(text):
-        return 'auth-expired', ''
-    return 'error', ''
-
 
 def failure_status(status, text, rc):
     """A failed turn or launch -> (status, reset). The deadline's rc is a timeout."""
@@ -670,9 +636,8 @@ class Wrapper:
         self.first_message = first_message
         self.ack_fd = ack_fd                # tells the spawn caller the first message is in
         self.provider = handle['provider']
-        self.family, self.delivery = wires.PROVIDERS[self.provider][:2]
+        self.delivery = wires.PROVIDERS[self.provider].delivery
         self.state = SeatState(job_dir)     # events.jsonl, read on where the last read stopped
-        self.translator = None              # claude and codex: their client's StreamTranslator
         self.stopping = False               # `hands.sh stop` asked the wrapper to end
         self.past_deadline = False
         self.started_at = time.time()
@@ -733,12 +698,10 @@ class Wrapper:
         def under_reaper(argv):
             return reaper_argv(ends_at + 10 - time.time(), argv)
 
-        cli, failure = wires.launch(handle, under_reaper, self.log_stream,
-                                    self.path('stderr.log'), self.first_turn - 1, self)
+        cli, failure = wires.launch(handle, under_reaper, self.path('stderr.log'),
+                                    self.path('stream.jsonl'), self.first_turn - 1, self)
         if failure:
             return self.launch_failed(*failure, cli=cli)
-        if self.family != 'acp':   # the close-out reads claude's and codex's translator
-            self.translator = cli.translator
         self.open_fifo()
         while not self.stopping and cli.proc.poll() is None and time.time() < ends_at:
             self.tick()
@@ -752,7 +715,7 @@ class Wrapper:
                 self.read_fifo()
         # Set before the close: the turns it ends read it.
         self.past_deadline = cli.proc.poll() is None and time.time() >= ends_at
-        if not self.left and self.family == 'rpc':
+        if not self.left:
             cli.interrupt()
         # A stop that came before the first message was delivered marks it now, so the close-out
         # types its turn.
@@ -760,7 +723,7 @@ class Wrapper:
         self.release_fifo()
         rc = self.closing_rc(exit_code(cli.close(2)))
         self.push_outbox()
-        self.close_out(rc)
+        self.close_out(cli, rc)
         self.send_pushes(wait=True)   # also the one retry of a push that failed a moment ago
 
     def tick(self):
@@ -778,18 +741,6 @@ class Wrapper:
         """Give the CLI the records waiting for it, as its client takes them."""
         if self.waiting:
             cli.hand_over(self.waiting)
-
-    def log_stream(self, line, direction):
-        """stream.jsonl: claude's stdout as it is; each JSON-RPC line, both ways, with its time,
-        but for the lines that only repeat what the file holds whole (wires.repeats)."""
-        if self.family != 'stdin':
-            message = parse_json(line)
-            if not wires.repeats(message):
-                append_json(self.path('stream.jsonl'),
-                            {'t': now(), 'dir': direction, 'msg': message})
-        elif direction == 'in':
-            with open(self.path('stream.jsonl'), 'ab') as f:
-                f.write(line.encode() + b'\n')
 
     def deadline(self):
         """When the launch must end: --timeout seconds after it began, else never."""
@@ -852,7 +803,7 @@ class Wrapper:
         return state.expected > 0 and state.ended >= state.expected
 
     def leave_when_idle(self, cli):
-        """Idle for the idle grace (at least claude's linger(), while it may hold a message it
+        """Idle for the idle grace (at least cli.linger(), while the CLI may hold a message it
         queued) -> close in.fifo under the delivery lock, after one last read of it, and say so:
         the loop ends, and the CLI is closed as an idle stop closes it. A send that got its
         message in first is taken; one that comes after finds no reader, then no wrapper, and
@@ -862,7 +813,7 @@ class Wrapper:
             return False
         if self.idle_since is None:
             self.idle_since = time.time()
-        grace = max(self.idle_grace, cli.linger() if self.family == 'stdin' else 0)
+        grace = max(self.idle_grace, cli.linger())
         if time.time() - self.idle_since < grace:
             return False
         lock = self.try_delivery_lock()   # it reads in.fifo
@@ -1039,16 +990,16 @@ class Wrapper:
         os.symlink(os.path.join('turn-%d' % number, 'result.txt'), link)
         os.replace(link, self.path('result.txt'))
 
-    def close_out(self, rc):
+    def close_out(self, cli, rc):
         """The CLI is gone: close the open turn, then each turn delivered and never answered."""
-        translator = self.translator
-        if translator and translator.current:
-            self.close_turns([translator.cut()], rc)
+        cut = cli.cut()
+        if cut:
+            self.close_turns([cut], rc)
         state = self.state.read()
-        session = translator.session if translator else self.handle.get('session')
+        session = cli.session or self.handle.get('session')
         orphans = range(state.ended + 1, state.expected + 1)
         self.close_turns([closed_turn(n, 'incomplete', session=session) for n in orphans], rc)
-        last_turn = translator.turn if translator else state.turn
+        last_turn = state.turn if cli.latest_turn is None else cli.latest_turn
         self.record_event(event('progress', last_turn, text='exit rc=%s' % rc,
                                 **({'idle': True} if self.left else {})))
 
