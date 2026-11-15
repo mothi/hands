@@ -290,6 +290,18 @@ def percent(value):
     return '%g%%' % value
 
 
+UNITS = {'d': 86400, 'h': 3600, 'm': 60, 's': 1}
+
+
+def duration(seconds, units='dhms', least=1):
+    """Seconds in the largest of `units` that they hold `least` times or more, else in the
+    last: duration(125) is '2m', duration(125, 'hms', 3) is '125s'."""
+    for unit in units:
+        if seconds >= least * UNITS[unit]:
+            break
+    return '%d%s' % (seconds // UNITS[unit], unit)
+
+
 def resets_in(resets_at):
     """' (resets in 3d)' for an ISO time in the future, else ''."""
     try:
@@ -297,21 +309,12 @@ def resets_in(resets_at):
         left = int(when.timestamp() - time.time())
     except (AttributeError, TypeError, ValueError):
         return ''
-    if left <= 0:
-        return ''
-    if left >= 86400:
-        return ' (resets in %dd)' % (left // 86400)
-    if left >= 3600:
-        return ' (resets in %dh)' % (left // 3600)
-    return ' (resets in %dm)' % (left // 60)
+    return ' (resets in %s)' % duration(left, 'dhm') if left > 0 else ''
 
 
 def ago(seconds):
-    if seconds < 120:
-        return '%ds' % seconds
-    if seconds < 7200:
-        return '%dm' % (seconds // 60)
-    return '%dh' % (seconds // 3600)
+    """A reading's age: seconds under two minutes, minutes under two hours, else hours."""
+    return duration(seconds, 'hms', 2)
 
 
 def board_line(reading):

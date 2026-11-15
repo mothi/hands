@@ -1040,9 +1040,10 @@ class StreamTranslator:
         collaborator codex started reports over the same connection) is never the seat's text,
         calls or turns: while a seat turn is open, its usage counts toward that turn and its
         items and turns show as progress. Anything for a turn other than the open one (a command
-        that finishes after its turn) is stray. Each item arrives whole at item/completed: its
-        deltas are read by no one and logged nowhere (repeats()). Status chatter stays in
-        stream.jsonl."""
+        that finishes after its turn) is stray. A usage report while no turn is open is dropped:
+        every resume re-sends the thread's last one before its turn opens. Each item arrives
+        whole at item/completed: its deltas are read by no one and logged nowhere (repeats()).
+        Status chatter stays in stream.jsonl."""
         method = message.get('method')
         params = message.get('params') if isinstance(message.get('params'), dict) else {}
         item = params.get('item') if isinstance(params.get('item'), dict) else {}
@@ -1065,6 +1066,8 @@ class StreamTranslator:
         if method not in ('item/started', 'item/completed', 'thread/tokenUsage/updated',
                           'turn/completed', 'turn/plan/updated'):
             return []
+        if method == 'thread/tokenUsage/updated' and self.current is None:
+            return []   # a resume's re-sent usage: no line
         if self.current is None or turn_id != self.turn_id:
             return self.stray(' '.join(x for x in (method, item.get('type')) if x))
         kind = item.get('type')

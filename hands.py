@@ -115,13 +115,6 @@ def cli_path(provider):
     return found
 
 
-def is_empty_dir(path):
-    try:
-        return not os.listdir(path)
-    except OSError:   # not a dir, or unreadable
-        return False
-
-
 # ---------------------------------------------------------------------------------------------
 # Starting a seat
 
@@ -156,7 +149,11 @@ def make_job_dir(provider, options):
     """Make the seat's job dir -> its canonical path, or None (after saying why)."""
     if options.out:   # new or empty: a start never writes over files it did not make
         job_dir = options.out
-        if os.path.lexists(job_dir) and not is_empty_dir(job_dir):
+        try:   # anything there but an empty dir (a file, a dir it cannot read) is refused
+            taken = os.path.lexists(job_dir) and bool(os.listdir(job_dir))
+        except OSError:
+            taken = True
+        if taken:
             say('--out %s is not empty — name a new or empty dir, or omit --out for a fresh one '
                 'in the jobs root' % job_dir)
             return None
@@ -320,8 +317,6 @@ def run_verb(args):
         return 2 if parsed is None else wait(job_dir, handle, *parsed)
     if verb == 'events':
         return events(job_dir, '--follow' in args)
-    if verb != 'stop':
-        return 2
     rc = stop(job_dir)
     envelope = seat.read_json(os.path.join(job_dir, 'envelope.json'))
     if envelope:
@@ -478,7 +473,7 @@ class EventView:
     A run of streamed text is one block, and a run of thoughts one clipped line. Each tool call
     is a line (its input clipped), plus a ↳ line when the call learns its input later. Each
     delivered input, turn start and turn end is a line, and so is each turn's usage with its
-    cache-hit rate, each error, each failed tool result and each push the host did not take.
+    cache-hit rate, each error, each failed tool result, and each push that failed or went late.
     The rest stays in the raw file. The same events always render the same text, however they
     arrive: a block ends at the next event, never at a pause."""
 
@@ -535,12 +530,12 @@ class EventView:
             out += '  ! %s %s: %s\n' % (line.get('tool') or call, line.get('status'), output)
         elif kind == 'error':
             out += '!! %s\n' % flat(line.get('text') or '', 300)
-        elif kind == 'progress' and line.get('expect'):
+        elif kind == 'progress' and line.get('expect'):   # a delivered input
             out += '> t%s %s\n' % (line['expect'], line.get('text'))
         elif kind == 'progress' and line.get('push') == 'failed':
             pending = ' (%d pending)' % line['pending'] if line.get('pending') else ''
             out += '!! %s: %s%s\n' % (line.get('text'), line.get('error'), pending)
-        elif kind == 'progress' and line.get('push') == 'posted' and line.get('late'):
+        elif kind == 'progress' and line.get('late'):   # a push posted late (on time: no line)
             out += '· %s %ds late\n' % (line.get('text'), line['late'])
         return out
 
@@ -615,10 +610,7 @@ def ago(stamp):
         seconds = time.time() - datetime.datetime.fromisoformat(stamp).timestamp()
     except (TypeError, ValueError):
         return 'no events yet'
-    for unit, size in (('d', 86400), ('h', 3600), ('m', 60)):
-        if seconds >= size:
-            return 'last event %d%s ago' % (seconds // size, unit)
-    return 'last event %ds ago' % max(0, seconds)
+    return 'last event %s ago' % quota.duration(max(0, seconds))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -790,9 +782,6 @@ def main(args):
         elif flag in ('-h', '--help'):
             print(__doc__.rstrip())
             return 0
-        elif flag == '--':
-            args = args[1:]
-            break
         elif flag.startswith('-'):
             say('unknown flag %s' % flag)
             return 2

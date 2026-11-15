@@ -582,9 +582,9 @@ class CodexSeats(SeatChecks):
         self.assertEqual([result(job, n) for n in (1, 2, 3, 4)], ['SECOND', '', 'AFTER', 'STEERED'])
         self.assertEqual(len(SB.stub_log(job).seats()), 2)
         self.assertTrue(all(envelope(job, n)['session'] == thread for n in (1, 2, 3, 4)))
-        # turn 1's command finished 14 s after turn 1 completed: a stray, never turn 2's
-        self.assertEqual(strays(job), ['item/completed commandExecution',
-                                       'thread/tokenUsage/updated'])
+        # turn 1's command finished 14 s after turn 1 completed: a stray, never turn 2's. The
+        # usage the resume re-sends before turn 4 opens is dropped without a line.
+        self.assertEqual(strays(job), ['item/completed commandExecution'])
         late = 'exec-fb7fdd53-11e2-4278-b1ed-c5d03bdf103c'
         self.assertEqual([e['turn'] for e in found if e.get('call') == late], [1])
         self.assertFalse([e for e in found if e['kind'] == 'text' and e['turn'] == 1
@@ -1206,6 +1206,25 @@ class ClaudeSeats(SeatChecks):
         self.assertEqual([result(job, n) for n in (3, 4, 5)],   # the waiting line rides once
                          ['turn two\n', 'MAIL from driver:\ndriver while out', 'turn two\n'])
         self.assertFalse(os.path.exists(os.path.join(job, 'turn-6')))
+
+    def test_a_relaunch_answers_the_send_and_the_mail_it_hands_on_together(self):
+        """A stopped seat with mail waiting gets a send: the relaunch hands claude both before
+        any turn opens, claude answers each in a turn of its own, and the wrapper stays for the
+        second."""
+        job, _ = SB.start('claude-relaunch-mail', CLAUDE, '--cwd', SB.path('tmp'))
+        SB.wait(job, '--timeout', '10')
+        self.assertGone(job)
+        self.assertEqual(SB.hands('mail', job, 'mail while down').rc, 1)
+        SB.send(job, STUB_MODE='slow', STUB_SLEEP='3')
+        self.assertTrue(harness.gone(job, timeout=30))
+        relaunch = SB.stub_log(job).seats()[1]
+        self.assertEqual([json.loads(line)['message']['content'][0]['text']
+                          for line in relaunch.lines],
+                         [read_text(SB.turn_two), 'MAIL from driver:\nmail while down'])
+        self.assertEqual(relaunch.ended, ['eof'])   # closed after both turns, not mid-turn
+        self.assertEqual(turn_ends(job), [(1, 'ok'), (2, 'ok'), (3, 'ok')])
+        self.assertEqual([envelope(job, n)['status'] for n in (2, 3)], ['ok', 'ok'])
+        self.assertTrue(result(job, 3).startswith('turn 2 pid '))
 
     def test_the_wrapper_never_waits_for_the_delivery_lock(self):
         job, _ = SB.start('claude-lock', CLAUDE, '--cwd', SB.path('tmp'), HANDS_IDLE='60',
@@ -1898,6 +1917,16 @@ class HostPushes(unittest.TestCase):
             self.assertEqual(SB.stub_log(parent).events('push'), [])
         finally:
             SB.stop(parent)
+
+
+class AtomicWrite(unittest.TestCase):
+    def test_a_link_planted_as_the_temporary_file_is_never_written_through(self):
+        victim = SB.write('atomic-victim', 'keep')
+        path = SB.path('atomic-target')
+        os.symlink(victim, '%s.tmp%d' % (path, os.getpid()))
+        seat.write_atomic(path, 'new')
+        self.assertEqual((read_text(victim), read_text(path)), ('keep', 'new'))
+        self.assertFalse(os.path.islink(path))
 
 
 class Hermetic(unittest.TestCase):

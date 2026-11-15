@@ -84,12 +84,22 @@ def append_json(path, value):
         os.close(fd)
 
 
-def write_atomic(path, text):
-    """Replace a file's whole content at once, by rename (as UTF-8, as append_json writes)."""
+def write_atomic(path, text, mode=None):
+    """Replace a file's whole content at once, by rename (as UTF-8, as append_json writes). The
+    temporary file is made new, never through a link the seat planted; `mode` sets its
+    permissions (default: as open() makes a file)."""
     temporary = '%s.tmp%d' % (path, os.getpid())
-    with open(temporary, 'w', encoding='utf-8', errors='replace') as f:
-        f.write(text)
-    os.replace(temporary, path)
+    if os.path.lexists(temporary):
+        os.remove(temporary)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 0o666 if mode is None else mode)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', errors='replace') as f:
+            f.write(text)
+        os.replace(temporary, path)
+    except OSError:
+        os.remove(temporary)
+        raise
 
 
 def read_json(path):
@@ -150,8 +160,8 @@ def classify(text):
 
 
 def failure_status(status, text, rc):
-    """A failed turn or launch -> (status, reset). rc 142 is the deadline: a timeout."""
-    found, reset = ('timeout', '') if rc == 142 else classify(text)
+    """A failed turn or launch -> (status, reset). The deadline's rc is a timeout."""
+    found, reset = ('timeout', '') if rc == DEADLINE_RC else classify(text)
     return (status if found == 'error' else found), reset
 
 
@@ -254,6 +264,8 @@ def signal_groups(groups, sig=signal.SIGTERM):
 
 
 NO_LIMIT = float('inf')   # a seat started without --timeout has no deadline
+DEADLINE_RC = 142         # the rc of a CLI ended at its deadline (the reaper exits with it)
+STOP_RC = 143             # the rc of a CLI a stop ended: 128 + TERM, as a TERM's reads
 
 
 def reap(seconds, argv):
@@ -300,7 +312,7 @@ def reap(seconds, argv):
     signal.alarm(0)
     end_group(4 if timed_out else 2)
     if timed_out:
-        return 142
+        return DEADLINE_RC
     return 128 - status if status < 0 else status
 
 
@@ -367,26 +379,14 @@ def write_driver(job_dir, host, session, address):
     """Replace DIR/driver (mode 0600) in one rename, so a wrapper never reads it half written.
     A link or other non-regular file the seat planted there is left alone -> whether written."""
     path = os.path.join(job_dir, 'driver')
-    try:
-        if os.path.lexists(path) and not stat.S_ISREG(os.lstat(path).st_mode):
-            return False
-        temporary = '%s.tmp%d' % (path, os.getpid())
-        if os.path.lexists(temporary):
-            os.remove(temporary)
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    except OSError:
-        return False
     driver = {'host': host, 'address': address}
     if session:
         driver['session'] = session
     try:
-        os.write(fd, (json.dumps(driver) + '\n').encode())
-    finally:
-        os.close(fd)
-    try:
-        os.replace(temporary, path)
+        if os.path.lexists(path) and not stat.S_ISREG(os.lstat(path).st_mode):
+            return False
+        write_atomic(path, json.dumps(driver) + '\n', 0o600)
     except OSError:
-        os.remove(temporary)
         return False
     return True
 
@@ -561,7 +561,7 @@ def run_push(argv):
                           capture_output=True, text=True)
     if done.returncode == 0:
         return None
-    if done.returncode == 142:
+    if done.returncode == DEADLINE_RC:
         return '%s took over %d s' % (argv[0], PUSH_LIMIT)
     said = (done.stderr.strip() or done.stdout.strip()).split('\n')[-1]
     return clip('%s exit %d: %s' % (argv[0], done.returncode, said), 200)
@@ -582,9 +582,9 @@ DRIVER_HOSTS = {
 DRIVER_NAMES = sorted({name for names, id_name, _ in DRIVER_HOSTS.values()
                        for name in names + (id_name,)})
 PUSH_LIMIT = 15        # seconds a push command may run
-STEER_GRACE = 30       # seconds a seat stays after a turn that a message reached mid-way: claude
-                       # queues or steers such a message itself, and says which only by starting
-                       # the next turn (its init line), so an idle leave waits for that
+STEER_GRACE = 30       # seconds a seat stays idle while claude was handed more messages than it
+                       # started turns: it queues or steers each message itself, and says which
+                       # only by starting the next turn (its init line), so an idle leave waits
 
 
 # ---------------------------------------------------------------------------------------------
@@ -672,8 +672,9 @@ def mail_text(line):
     return 'MAIL from driver:\n%s' % line.get('text')
 
 
-def whole_records(job_dir, lines):
-    """in.fifo lines -> the whole records among them. A torn line is dropped and logged."""
+def whole_records(job_dir, lines, state):
+    """in.fifo lines -> the whole records among them. A torn line is dropped and logged, under
+    the latest turn that started (state: the seat's SeatState)."""
     records = []
     for line in lines:
         if not line.strip():
@@ -683,7 +684,7 @@ def whole_records(job_dir, lines):
             continue
         torn = clip(line.decode('utf-8', 'replace'), 120)
         append_json(os.path.join(job_dir, 'events.jsonl'),
-                    event('progress', SeatState(job_dir).read().turn,
+                    event('progress', state.read().turn,
                           text='torn input dropped: ' + torn))
     return records
 
@@ -707,6 +708,7 @@ class Wrapper:
         self.ack_fd = ack_fd                # tells the spawn caller the first message is in
         self.provider = handle['provider']
         self.family, self.delivery = wires.PROVIDERS[self.provider][:2]
+        self.state = SeatState(job_dir)     # events.jsonl, read on where the last read stopped
         self.translator = None              # claude and codex: one StreamTranslator per launch
         self.errors = []                    # the error events of the CLI message being handled
         self.stopping = False               # `hands.sh stop` asked the wrapper to end
@@ -729,7 +731,7 @@ class Wrapper:
                                             # tried yet
         self.idle_grace = idle_grace        # seconds an idle seat waits for a send
         self.idle_since = None              # when the seat last became idle
-        self.unsure = False                 # claude got a message mid-turn: queued, or steered?
+        self.handed = 0                     # claude: the messages handed to it this launch
         self.left = False                   # the loop ended because the seat was idle
 
     def path(self, *names):
@@ -741,7 +743,6 @@ class Wrapper:
             self.errors.append(line)
         if line['kind'] == 'turn_start':
             self.keep_session(line.get('session'))
-            self.unsure = False   # the turn a queued message was waiting for
 
     def keep_session(self, session):
         """Save the first session a turn shows in the handle: it is what a relaunch resumes."""
@@ -751,7 +752,7 @@ class Wrapper:
 
     def input_waiting(self):
         """Whether a delivered message has no turn yet."""
-        return SeatState(self.job_dir).read().expected > self.translator.turn
+        return self.state.read().expected > self.translator.turn
 
     # -- the loop
 
@@ -761,11 +762,11 @@ class Wrapper:
         self.stderr_offset = file_size(self.path('stderr.log'))
         # A wrapper killed before its close-out left turns delivered and never answered. They
         # close now, so this launch numbers its turns after them.
-        state = SeatState(self.job_dir).read()
+        state = self.state.read()
         orphans = range(state.ended + 1, state.expected + 1)
         self.close_turns([closed_turn(n, 'incomplete', session=handle.get('session'))
                           for n in orphans], None)
-        self.first_turn = SeatState(self.job_dir).read().next_turn(self.delivery, False)
+        self.first_turn = state.read().next_turn(self.delivery, False)
         self.next_acp_turn = self.first_turn
         ends_at = self.deadline()
 
@@ -831,8 +832,7 @@ class Wrapper:
         if not self.waiting:
             return
         if self.family == 'stdin':   # claude queues or steers each message itself
-            if self.translator.current:
-                self.unsure = True   # a queued one shows only as the next turn's init line
+            self.handed += len(self.waiting)
             cli.write(b''.join(record + b'\n' for record in self.waiting))
             self.waiting = []
         elif self.family == 'acp' and not cli.busy():   # ACP: one prompt at a time
@@ -864,9 +864,9 @@ class Wrapper:
         """The rc of a turn the wrapper's own close ended: 142 at the deadline and 143 at a stop
         (what the reaper's limit and a TERM read), else the CLI's own."""
         if self.past_deadline:
-            return 142
+            return DEADLINE_RC
         if self.stopping:
-            return 143
+            return STOP_RC
         return rc
 
     # -- messages in
@@ -889,7 +889,7 @@ class Wrapper:
             if not chunk:
                 return
             *lines, self.fifo_partial = (self.fifo_partial + chunk).split(b'\n')
-            self.waiting.extend(whole_records(self.job_dir, lines))
+            self.waiting.extend(whole_records(self.job_dir, lines, self.state))
 
     def release_fifo(self):
         """The CLI is done: close in.fifo, so a send finds the seat gone (unless the idle leave
@@ -914,22 +914,24 @@ class Wrapper:
             return False
         if cli.busy() if self.family == 'acp' else self.translator.current:
             return False
-        state = SeatState(self.job_dir).read()
+        state = self.state.read()
         return state.expected > 0 and state.ended >= state.expected
 
     def leave_when_idle(self, cli):
-        """Idle for the idle grace (STEER_GRACE at least after a turn a message reached
-        mid-way, in case claude queued it) -> close in.fifo under the delivery lock, after one
-        last read of it, and say so: the loop ends, and the CLI is closed as an idle
-        stop closes it. A send that got its message in first is taken; one that comes after
-        finds no reader, then no wrapper, and relaunches the seat. A mail that landed meanwhile
-        is delivered first."""
+        """Idle for the idle grace (STEER_GRACE at least while claude may hold a message it
+        queued) -> close in.fifo under the delivery lock, after one last read of it, and say so:
+        the loop ends, and the CLI is closed as an idle stop closes it. A send that got its
+        message in first is taken; one that comes after finds no reader, then no wrapper, and
+        relaunches the seat. A mail that landed meanwhile is delivered first."""
         if not self.idle(cli):
             self.idle_since = None
             return False
         if self.idle_since is None:
             self.idle_since = time.time()
-        grace = max(self.idle_grace, STEER_GRACE if self.unsure else 0)
+        # Each message claude queued starts a turn of its own; a steered one never does. So
+        # while it was handed more messages than it started turns, one may still be queued.
+        started = self.translator.turn - (self.first_turn - 1) if self.translator else 0
+        grace = max(self.idle_grace, STEER_GRACE if self.handed > started else 0)
         if time.time() - self.idle_since < grace:
             return False
         lock = self.try_delivery_lock()   # it reads in.fifo
@@ -1003,7 +1005,7 @@ class Wrapper:
                     lines = f.read(self.inbox_size).split(b'\n')[:-1]
             except OSError:
                 return
-            state = SeatState(self.job_dir).read()
+            state = self.state.read()
             for number, line in enumerate(lines, 1):
                 mail = parse_json(line.decode('utf-8', 'replace'))
                 if number <= state.mailed or not isinstance(mail, dict):
@@ -1015,7 +1017,7 @@ class Wrapper:
     def push_outbox(self):
         """Push each new outbox line (the seat's mail) to the driver."""
         text, self.outbox_offset = read_lines(self.path('outbox.jsonl'), self.outbox_offset)
-        turn = SeatState(self.job_dir).read().turn if text else 0
+        turn = self.state.read().turn if text else 0
         for line in text.split('\n')[:-1]:
             if not line.strip():
                 continue
@@ -1123,7 +1125,7 @@ class Wrapper:
         translator = self.translator
         if translator and translator.current:
             self.close_turns([translator.cut()], rc)
-        state = SeatState(self.job_dir).read()
+        state = self.state.read()
         session = translator.session if translator else self.handle.get('session')
         orphans = range(state.ended + 1, state.expected + 1)
         self.close_turns([closed_turn(n, 'incomplete', session=session) for n in orphans], rc)
@@ -1142,7 +1144,7 @@ class Wrapper:
             status, reset = failure_status(status, why + '\n' + stderr, rc)
             reset = reset or clip(why)
             if self.stopping:   # a stop during the launch ended it, as it ends any turn
-                status, rc, reset = 'incomplete', 143, ''
+                status, rc, reset = 'incomplete', STOP_RC, ''
         self.record_event(event('error', self.first_turn, text=clip('%s: %s' % (reason, why))))
         write_envelope(self.job_dir, status, self.provider, self.handle.get('model'), rc,
                        int(time.time() - self.started_at), reset, None, self.handle.get('effort'),
@@ -1384,11 +1386,8 @@ def main(args):
     if command not in ('spawn', 'send') or len(args) < 3 or not os.path.isdir(args[1]):
         print(__doc__.strip(), file=sys.stderr)
         return 2
+    # hands.py names the canonical dir, so the wrapper's command line (how it is found) does too
     job_dir = os.path.realpath(args[1])
-    if command == 'spawn' and args[1] != job_dir:
-        # The wrapper is found by its command line, so that must name the canonical dir.
-        os.execv(sys.executable, [sys.executable, os.path.join(HERE, 'seat.py'), 'spawn', job_dir]
-                 + args[2:])
     handle = read_json(os.path.join(job_dir, 'session'))
     if not handle or not os.path.isfile(args[2]):
         print('seat.py: %s needs a persistent seat dir (a session handle) and an existing FILE'
