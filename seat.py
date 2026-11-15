@@ -296,8 +296,8 @@ def reaper_argv(seconds, argv):
 
 
 # ---------------------------------------------------------------------------------------------
-# Pushes to the driver: the session that started the seat. Each turn's end, each line the seat
-# mails, and each stream error is pushed there, through the way in that the driver's host offers.
+# Pushes to the driver: the session that started the seat. Each turn's end and each line the
+# seat mails is pushed there, through the way in that the driver's host offers.
 #
 # DIR/driver names that session twice: by the address that reaches it now, and by its id, which
 # outlives the address. A Claude Code restart (an app update, a quit) gives the resumed session a
@@ -676,7 +676,6 @@ class Wrapper:
         self.family, self.delivery = wires.PROVIDERS[self.provider][:2]
         self.state = SeatState(job_dir)     # events.jsonl, read on where the last read stopped
         self.translator = None              # claude and codex: one StreamTranslator per launch
-        self.errors = []                    # the error events of the CLI message being handled
         self.stopping = False               # `hands.sh stop` asked the wrapper to end
         self.past_deadline = False
         self.started_at = time.time()
@@ -690,7 +689,6 @@ class Wrapper:
         self.fifo_writer = None             # held open, so in.fifo never reads end of file
         self.fifo_partial = b''             # the start of an in.fifo line not yet ended
         self.waiting = []                   # delivered records not yet handed to the CLI
-        self.turn_start_pending = False     # codex: a turn/start not answered yet
         self.pushes_due = True              # send the pending pushes on the next pass: the last
                                             # try found another sender, or the launch has not
                                             # tried yet
@@ -704,8 +702,6 @@ class Wrapper:
 
     def record_event(self, line):
         append_json(self.path('events.jsonl'), line)
-        if line['kind'] == 'error':
-            self.errors.append(line)
         if line['kind'] == 'turn_start':
             self.keep_session(line.get('session'))
 
@@ -715,9 +711,9 @@ class Wrapper:
             self.handle['session'] = session
             write_atomic(self.path('session'), json.dumps(self.handle) + '\n')
 
-    def input_waiting(self):
-        """Whether a delivered message has no turn yet."""
-        return self.state.read().expected > self.translator.turn
+    def expected(self):
+        """The latest turn a delivery expects."""
+        return self.state.read().expected
 
     # -- the loop
 
@@ -741,17 +737,19 @@ class Wrapper:
         def under_reaper(argv):
             return reaper_argv(ends_at + 10 - time.time(), argv)
 
-        if self.family != 'acp':   # an ACP turn is translated through its prompt's callback
+        # claude's translator. codex's client builds its own, and an ACP turn is translated
+        # through its prompt's callback.
+        if self.family == 'stdin':
             self.translator = wires.StreamTranslator(self.provider, self.first_turn - 1,
-                                                     handle.get('session'), self.record_event,
-                                                     self.input_waiting)
+                                                     handle.get('session'), self)
         cli, failure = wires.launch(handle, under_reaper, self.log_stream,
-                                    self.path('stderr.log'), self.on_cli_message,
+                                    self.path('stderr.log'),
+                                    self.translator.take if self.translator else None,
                                     self.first_turn - 1, self)
         if failure:
             return self.launch_failed(*failure, cli=cli)
-        if self.translator and cli.session_id:   # codex: the thread its handshake opened
-            self.translator.session = cli.session_id
+        if self.family == 'rpc':   # the close-out reads codex's translator too
+            self.translator = cli.translator
         self.open_fifo()
         while not self.stopping and cli.proc.poll() is None and time.time() < ends_at:
             self.tick()
@@ -765,13 +763,8 @@ class Wrapper:
                 self.read_fifo()
         # Set before the close: the turns it ends read it.
         self.past_deadline = cli.proc.poll() is None and time.time() >= ends_at
-        translator = self.translator
-        if not self.left and cli.proc.poll() is None and translator and translator.turn_id:
-            try:   # codex: interrupt the running turn before the close
-                cli.wait_for_answer('turn/interrupt', {'threadId': translator.session,
-                                                       'turnId': translator.turn_id}, 5)
-            except wires.WireError:
-                pass
+        if not self.left and self.family == 'rpc':
+            cli.interrupt()
         # A stop that came before the first message was delivered marks it now, so the close-out
         # types its turn.
         self.send_first_message(5)
@@ -800,11 +793,8 @@ class Wrapper:
             self.handed += len(self.waiting)
             cli.write(b''.join(record + b'\n' for record in self.waiting))
             self.waiting = []
-        elif self.family == 'acp':   # ACP: one prompt at a time
+        else:   # ACP: one prompt at a time; codex: one turn/start at a time
             cli.hand_over(self.waiting)
-        elif self.family == 'rpc' and not self.turn_start_pending:
-            # codex: one turn/start at a time, so each steers the turn its predecessor started
-            self.start_codex_turn(cli, self.waiting.pop(0))
 
     def log_stream(self, line, direction):
         """stream.jsonl: claude's stdout as it is; each JSON-RPC line, both ways, with its time,
@@ -873,9 +863,9 @@ class Wrapper:
     def idle(self, cli):
         """Whether the seat has nothing to do: its first message in, every delivered turn ended,
         no record waiting for the CLI, and no turn open."""
-        if not self.first_sent or self.waiting or self.turn_start_pending:
+        if not self.first_sent or self.waiting:
             return False
-        if cli.busy() if self.family == 'acp' else self.translator.current:
+        if cli.busy() if self.family != 'stdin' else self.translator.current:
             return False
         state = self.state.read()
         return state.expected > 0 and state.ended >= state.expected
@@ -1015,18 +1005,6 @@ class Wrapper:
 
     # -- turns
 
-    def on_cli_message(self, message):
-        """What a claude or codex CLI said -> its events, and the turns it closed. A stream error
-        that closed no turn is pushed to the driver on its own."""
-        if not isinstance(message, dict):
-            self.translator.emit('progress', text='non-JSON line: ' + clip(message, 120))
-            return
-        self.errors = []
-        turns = self.translator.feed(message)
-        self.close_turns(turns, self.closing_rc(None))
-        for error in self.errors if not turns else []:
-            self.push(error['turn'], 'error', 'stream error', error.get('text'))
-
     def close_turns(self, turns, rc):
         """Each closed turn -> its status, result.txt, envelope, usage and turn_end events, and a
         push to the driver. Every provider's turns end here."""
@@ -1115,34 +1093,6 @@ class Wrapper:
         self.ack(0)
         if cli and status == 'refused':   # a failed CLI was closed above, for its rc
             cli.close(2)
-
-    # -- codex
-
-    def start_codex_turn(self, cli, record):
-        """Send one message as a turn/start. The app-server steers it into the running turn or
-        starts a turn with it, so the wrapper never guesses whether a turn is open. The seat's
-        effort goes with each one."""
-        text_input = [{'type': 'text', 'text': wires.record_text(record)}]
-        params = {'threadId': self.translator.session, 'input': text_input}
-        if self.handle.get('effort'):
-            params['effort'] = self.handle['effort']
-        self.turn_start_pending = True
-        cli.request('turn/start', params, self.on_turn_start_answer)
-
-    def on_turn_start_answer(self, answer):
-        """The next message may go. A refusal while no turn runs is a turn of its own, failed."""
-        self.turn_start_pending = False
-        if answer is None or 'error' not in answer:
-            return
-        error = answer['error']
-        if not isinstance(error, dict):
-            error = {'message': str(error)}
-        why = 'turn/start refused: %s %s' % (error.get('code'), error.get('message'))
-        translator = self.translator
-        opened = translator.open_turn() if translator.current is None else None
-        translator.emit('error', text=clip(why))
-        if opened is not None:
-            self.close_turns(opened + [translator.close('error', '', None, 'none', why)], None)
 
     # -- ACP
 

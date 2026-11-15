@@ -249,7 +249,7 @@ last, after your task, so seats given one task share a prompt prefix.
 The engine opens inboxes and outboxes without following links, regular files only.
 
 **Push.** Every `start` and `send` records the session it runs in, from the variables the host
-gives every command it runs: the address that reaches it, and its id. Each turn end, outbox line and stream error then pushes one message
+gives every command it runs: the address that reaches it, and its id. Each turn end and outbox line then pushes one message
 into that session, the way its host takes messages from outside:
 
 | Driver | Names its session | A push is |

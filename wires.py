@@ -227,8 +227,6 @@ class Cli:
     whole line the CLI prints goes to on_line(). log(line, direction) sees every line, with
     direction 'in' (from the CLI) or 'out' (to it)."""
 
-    session_id = None   # the conversation, once a handshake names it
-
     def __init__(self, argv, cwd, env=None, log=None, stderr_path=None, on_message=None):
         self.cwd = cwd
         self.log = log
@@ -742,11 +740,14 @@ def acp_turn_end(result, make, provider):
 class AcpSeat(AcpAgent):
     """An ACP agent running a seat's turns, one prompt at a time.
 
-    Its owner is the wrapper (seat.py's Wrapper). The client calls it for:
+    Its owner is the wrapper (seat.py's Wrapper). The clients call it for:
       record_event(line)             write one event to events.jsonl
       close_turns(turns, rc)         close turns: envelopes, result files, pushes
       closing_rc(rc)                 the rc of a turn the wrapper's own close ended
-      forget_session(session, turn)  delete the stored session of a turn abandoned mid-turn"""
+      forget_session(session, turn)  delete the stored session of a turn abandoned mid-turn
+      expected()                     the latest turn a delivery expects
+    CodexSeat and StreamTranslator call the same owner. forget_session is ACP's alone, and only
+    claude's StreamTranslator asks expected()."""
 
     def __init__(self, argv, cwd, env, log, stderr_path, provider, last_turn, owner):
         AcpAgent.__init__(self, argv, cwd, env, log, stderr_path)
@@ -943,8 +944,8 @@ def launch(handle, wrap, log=None, stderr_path=None, on_message=None, last_turn=
     """Start a seat's CLI and run its handshake -> (cli, None), or (cli or None, (status,
     reason, why)) when the launch fails or is refused before any turn.
 
-    wrap(argv) puts the CLI under the caller's reaper. on_message gets what a claude or codex
-    CLI says. An ACP seat numbers its turns after last_turn and reports them to owner (see
+    wrap(argv) puts the CLI under the caller's reaper. on_message gets what a claude CLI says.
+    A codex or ACP seat numbers its turns after last_turn and reports them to owner (see
     AcpSeat)."""
     family, _, command = PROVIDERS[handle['provider']]
     try:
@@ -954,9 +955,9 @@ def launch(handle, wrap, log=None, stderr_path=None, on_message=None, last_turn=
     if family == 'stdin':
         return Cli(wrap(argv), handle['cwd'], env, log, stderr_path, on_message), None
     if family == 'rpc':
-        cli = Rpc(wrap(argv), handle['cwd'], env, log, stderr_path, on_message)
-        try:
-            cli.session_id = codex_handshake(handle, cli)
+        cli = CodexSeat(wrap(argv), handle['cwd'], env, log, stderr_path, handle, last_turn, owner)
+        try:   # the thread its handshake opened, before the first turn/start names it
+            cli.translator.session = codex_handshake(handle, cli)
         except WireError as error:
             return cli, ('error', 'handshake', str(error))
         return cli, None
@@ -1019,16 +1020,16 @@ CLAUDE_FILE_TOOLS = {   # claude tool -> the input field that names the file it 
 class StreamTranslator:
     """Turns what a claude or codex CLI says into events.
 
-    feed() takes one message, emits its events through emit_event, and returns the turns it
-    closed (usually none, sometimes one). The method for each provider is named after it."""
+    take() handles one message: feed() records its events with the owner (see AcpSeat) and
+    returns the turns it closed (usually none, sometimes one), and take() closes them there. The
+    method for each provider is named after it."""
 
-    def __init__(self, provider, last_turn, session, emit_event, input_waiting):
+    def __init__(self, provider, last_turn, session, owner):
         self.provider = provider
         self.turn = last_turn               # the open turn's number, or the last one's
         self.before_first = last_turn       # until a turn opens, any line opens one
         self.session = session
-        self.emit_event = emit_event
-        self.input_waiting = input_waiting  # () -> whether a delivered message has no turn yet
+        self.owner = owner
         self.current = None                 # the open turn's Turn
         self.turn_id = None                 # codex: the open turn's id
         self.notes = []                     # codex: this turn's error notices
@@ -1036,7 +1037,7 @@ class StreamTranslator:
         self.spent = 0                      # claude: its cumulative cost before this turn
 
     def emit(self, kind, **fields):
-        self.emit_event(event(kind, self.turn, **fields))
+        self.owner.record_event(event(kind, self.turn, **fields))
 
     def open_turn(self):
         """A turn begins -> the turn that was open, closed as cut, if any."""
@@ -1051,7 +1052,7 @@ class StreamTranslator:
         or None: once a turn has ended, only a delivered message opens the next one."""
         if self.current:
             return []
-        if self.turn == self.before_first or self.input_waiting():
+        if self.turn == self.before_first or self.owner.expected() > self.turn:
             return self.open_turn()
         return None
 
@@ -1078,6 +1079,14 @@ class StreamTranslator:
         if field and isinstance(tool_input, dict) and tool_input.get(field):
             self.emit('file', path=tool_input[field], tool=name, call=call)
         self.current.add_tool()
+
+    def take(self, message):
+        """What the CLI said -> its events, and the turns it closed, closed by the owner."""
+        if not isinstance(message, dict):
+            self.emit('progress', text='non-JSON line: ' + clip(message, 120))
+            return
+        turns = self.feed(message)
+        self.owner.close_turns(turns, self.owner.closing_rc(None))
 
     def feed(self, message):
         return getattr(self, self.provider)(message)
@@ -1253,3 +1262,78 @@ class StreamTranslator:
             if isinstance(change, dict) and change.get('path'):
                 self.emit('file', path=change['path'], tool=name, call=item_id)
         self.current.add_tool()
+
+
+# ---------------------------------------------------------------------------------------------
+# codex's app-server
+
+
+class CodexSeat(Rpc):
+    """codex's app-server running a seat's turns: each message is a turn/start, and its
+    StreamTranslator turns the notifications into events. Its owner is the wrapper (see
+    AcpSeat)."""
+
+    def __init__(self, argv, cwd, env, log, stderr_path, handle, last_turn, owner):
+        # Before the process starts: what it says during the handshake is translated too.
+        self.translator = StreamTranslator('codex', last_turn, handle.get('session'), owner)
+        self.turn_start_pending = False   # a turn/start not answered yet
+        self.effort = handle.get('effort')
+        self.owner = owner
+        Rpc.__init__(self, argv, cwd, env, log, stderr_path, self.translator.take)
+
+    @property
+    def session(self):
+        return self.translator.session
+
+    @property
+    def latest_turn(self):
+        return self.translator.turn
+
+    def busy(self):
+        return self.turn_start_pending or self.translator.current is not None
+
+    def cut(self):
+        """The open turn, closed as cut, or None."""
+        return self.translator.cut() if self.translator.current else None
+
+    def hand_over(self, records):
+        """Send the first of the wrapper's waiting records as a turn/start, unless one is not
+        answered yet: one at a time, so each steers the turn its predecessor started."""
+        if records and not self.turn_start_pending:
+            self.start_turn(records.pop(0))
+
+    def start_turn(self, record):
+        """Send one message as a turn/start. The app-server steers it into the running turn or
+        starts a turn with it, so the wrapper never guesses whether a turn is open. The seat's
+        effort goes with each one."""
+        text_input = [{'type': 'text', 'text': record_text(record)}]
+        params = {'threadId': self.translator.session, 'input': text_input}
+        if self.effort:
+            params['effort'] = self.effort
+        self.turn_start_pending = True
+        self.request('turn/start', params, self.on_turn_start_answer)
+
+    def on_turn_start_answer(self, answer):
+        """The next message may go. A refusal while no turn runs is a turn of its own, failed."""
+        self.turn_start_pending = False
+        if answer is None or 'error' not in answer:
+            return
+        error = answer['error']
+        if not isinstance(error, dict):
+            error = {'message': str(error)}
+        why = 'turn/start refused: %s %s' % (error.get('code'), error.get('message'))
+        translator = self.translator
+        opened = translator.open_turn() if translator.current is None else None
+        translator.emit('error', text=clip(why))
+        if opened is not None:
+            self.owner.close_turns(opened + [translator.close('error', '', None, 'none', why)],
+                                   None)
+
+    def interrupt(self):
+        """Interrupt the running turn, before the wrapper's close."""
+        if self.proc.poll() is None and self.translator.turn_id:
+            try:
+                self.wait_for_answer('turn/interrupt', {'threadId': self.translator.session,
+                                                        'turnId': self.translator.turn_id}, 5)
+            except WireError:
+                pass
