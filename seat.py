@@ -18,7 +18,6 @@ result.txt, driver, pushes.jsonl and job.log.
 
 Python 3 standard library only.
 """
-import errno
 import fcntl
 import json
 import math
@@ -35,7 +34,8 @@ import traceback
 import urllib.parse
 
 import wires
-from wires import clip, closed_turn, event, now, parse_json
+from wires import (clip, closed_turn, event, exit_code, file_size, now, open_regular, parse_json,
+                   read_tail)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -55,23 +55,6 @@ NOTE = ('turn-N/result.txt + envelope.json land at each turn_end (absent = not f
 
 # ---------------------------------------------------------------------------------------------
 # Files in a job dir
-
-
-def file_size(path):
-    try:
-        return os.path.getsize(path)
-    except OSError:
-        return 0
-
-
-def open_regular(path, flags):
-    """Open a job-dir file the seat itself could have replaced: never through a symlink, and
-    only a regular file (O_NONBLOCK, so a FIFO planted there cannot block the open)."""
-    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644)
-    if not stat.S_ISREG(os.fstat(fd).st_mode):
-        os.close(fd)
-        raise OSError(errno.EINVAL, 'not a regular file', path)
-    return fd
 
 
 def append_json(path, value):
@@ -108,16 +91,6 @@ def read_json(path):
             return json.load(f)
     except (OSError, ValueError):
         return None
-
-
-def read_tail(path, offset, limit=4000):
-    """Up to the last `limit` bytes after `offset`, as text."""
-    try:
-        with os.fdopen(open_regular(path, os.O_RDONLY), 'rb') as f:
-            f.seek(max(offset, file_size(path) - limit))
-            return f.read().decode('utf-8', 'replace')
-    except OSError:
-        return ''
 
 
 def read_lines(path, offset):
@@ -320,13 +293,6 @@ def reaper_argv(seconds, argv):
     """argv under reap, with a limit of `seconds` (NO_LIMIT: none)."""
     limit = 0 if seconds == NO_LIMIT else max(1, int(seconds))
     return [sys.executable, os.path.join(HERE, 'seat.py'), 'reap', str(limit)] + argv
-
-
-def exit_code(returncode):
-    """A process's exit code as a shell reports it: one that signal N ended reads 128 + N."""
-    if returncode is None or returncode >= 0:
-        return returncode
-    return 128 - returncode
 
 
 # ---------------------------------------------------------------------------------------------
@@ -724,7 +690,6 @@ class Wrapper:
         self.fifo_writer = None             # held open, so in.fifo never reads end of file
         self.fifo_partial = b''             # the start of an in.fifo line not yet ended
         self.waiting = []                   # delivered records not yet handed to the CLI
-        self.next_acp_turn = 0
         self.turn_start_pending = False     # codex: a turn/start not answered yet
         self.pushes_due = True              # send the pending pushes on the next pass: the last
                                             # try found another sender, or the launch has not
@@ -767,7 +732,6 @@ class Wrapper:
         self.close_turns([closed_turn(n, 'incomplete', session=handle.get('session'))
                           for n in orphans], None)
         self.first_turn = state.read().next_turn(self.delivery, False)
-        self.next_acp_turn = self.first_turn
         ends_at = self.deadline()
 
         # The wrapper ends the CLI itself, at the deadline as at a stop: stdin's end first, and
@@ -782,7 +746,8 @@ class Wrapper:
                                                      handle.get('session'), self.record_event,
                                                      self.input_waiting)
         cli, failure = wires.launch(handle, under_reaper, self.log_stream,
-                                    self.path('stderr.log'), self.on_cli_message)
+                                    self.path('stderr.log'), self.on_cli_message,
+                                    self.first_turn - 1, self)
         if failure:
             return self.launch_failed(*failure, cli=cli)
         if self.translator and cli.session_id:   # codex: the thread its handshake opened
@@ -835,10 +800,8 @@ class Wrapper:
             self.handed += len(self.waiting)
             cli.write(b''.join(record + b'\n' for record in self.waiting))
             self.waiting = []
-        elif self.family == 'acp' and not cli.busy():   # ACP: one prompt at a time
-            text = wires.record_text(self.waiting.pop(0))
-            self.start_acp_turn(cli, self.next_acp_turn, text)
-            self.next_acp_turn += 1
+        elif self.family == 'acp':   # ACP: one prompt at a time
+            cli.hand_over(self.waiting)
         elif self.family == 'rpc' and not self.turn_start_pending:
             # codex: one turn/start at a time, so each steers the turn its predecessor started
             self.start_codex_turn(cli, self.waiting.pop(0))
@@ -1183,57 +1146,13 @@ class Wrapper:
 
     # -- ACP
 
-    def start_acp_turn(self, agent, turn, text):
-        """Send turn `turn`'s prompt; end_acp_turn closes the turn when the agent answers."""
-        seen_files = set()
-        stderr_offset = file_size(self.path('stderr.log'))
-        started = time.time()
-
-        def on_update(update):
-            for line in wires.acp_events(update, turn, now(), self.provider):
-                if line['kind'] == 'file':   # one edit reported twice is one file event
-                    key = (line.get('call'), line.get('path'))
-                    if key in seen_files:
-                        continue
-                    seen_files.add(key)
-                self.record_event(line)
-
-        def on_done(result):
-            self.end_acp_turn(agent, turn, result, stderr_offset, started)
-
-        agent.prompt(text, on_update, on_done)
-
-    def end_acp_turn(self, agent, turn, result, stderr_offset, started):
-        *head, end = wires.acp_events(result, turn, now(), self.provider)
-        usage_event = ([e for e in head if e['kind'] == 'usage'] or [{}])[0]
-        for line in head:
-            if line['kind'] == 'error':
-                self.record_event(line)
-        rc = None
-        error_text = ''
-        if end['status'] != 'ok':
-            # Did the agent go with the turn? A killed agent reports it as incomplete,
-            # cancelled or an error; an agent that lives on (a provider refusal) leaves rc None.
-            wait = 10 if end['status'] in ('incomplete', 'cancelled') else 3
-            try:
-                rc = exit_code(agent.proc.wait(wait))
-            except subprocess.TimeoutExpired:
-                pass
-            error = result.get('error') or result.get('incomplete') or ''
-            error_text = (json.dumps(error, ensure_ascii=False) + '\n'
-                          + read_tail(self.path('stderr.log'), stderr_offset))
-            if rc is not None and not self.past_deadline:   # it went mid-turn
-                self.forget_session(agent.session_id, turn)
-            rc = self.closing_rc(rc)
-        extra = {k: usage_event[k] for k in ('usage_unknown', 'cost_usd') if k in usage_event}
-        self.close_turns([closed_turn(turn, end['status'], end.get('text'),
-                                      usage_event.get('usage'), end.get('final'), error_text,
-                                      end.get('session'), started, extra)], rc)
-
     def forget_session(self, session, turn):
         """Delete the stored session of a turn whose agent went away mid-turn (a stop, a crash,
         a kill), so nothing resumes it later: opencode's background service would. It runs
-        before the turn's envelope is written, so a sync buy's stop never races it."""
+        before the turn's envelope is written, so a sync buy's stop never races it. A turn the
+        deadline ended keeps its session."""
+        if self.past_deadline:
+            return
         argv = wires.forget_command(self.provider, session, self.handle.get('cli'))
         if not argv:
             return

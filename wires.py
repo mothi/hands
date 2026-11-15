@@ -3,7 +3,7 @@
 
 The wrapper (seat.py) calls launch() to start a seat's CLI and run its handshake. It then hands
 the CLI each message and turns what the CLI says into events: StreamTranslator does that for
-claude and codex, acp_events() for opencode.
+claude and codex, AcpSeat for opencode.
 
 PROVIDERS is the provider table. For each provider it says how the wrapper talks to the CLI
 (the family), what a message sent to a busy seat does (the delivery), and how to start the CLI
@@ -13,10 +13,12 @@ Python 3 standard library only.
 """
 import collections
 import datetime
+import errno
 import json
 import os
 import select
 import signal
+import stat
 import subprocess
 import time
 import traceback
@@ -65,6 +67,40 @@ def parse_json(line):
         return json.loads(line)
     except ValueError:
         return line
+
+
+def file_size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def open_regular(path, flags):
+    """Open a job-dir file the seat itself could have replaced: never through a symlink, and
+    only a regular file (O_NONBLOCK, so a FIFO planted there cannot block the open)."""
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError(errno.EINVAL, 'not a regular file', path)
+    return fd
+
+
+def read_tail(path, offset, limit=4000):
+    """Up to the last `limit` bytes after `offset`, as text."""
+    try:
+        with os.fdopen(open_regular(path, os.O_RDONLY), 'rb') as f:
+            f.seek(max(offset, file_size(path) - limit))
+            return f.read().decode('utf-8', 'replace')
+    except OSError:
+        return ''
+
+
+def exit_code(returncode):
+    """A process's exit code as a shell reports it: one that signal N ended reads 128 + N."""
+    if returncode is None or returncode >= 0:
+        return returncode
+    return 128 - returncode
 
 
 # Each usage field, and the names the CLIs give it. A dotted name is a nested field.
@@ -703,6 +739,78 @@ def acp_turn_end(result, make, provider):
     return events
 
 
+class AcpSeat(AcpAgent):
+    """An ACP agent running a seat's turns, one prompt at a time.
+
+    Its owner is the wrapper (seat.py's Wrapper). The client calls it for:
+      record_event(line)             write one event to events.jsonl
+      close_turns(turns, rc)         close turns: envelopes, result files, pushes
+      closing_rc(rc)                 the rc of a turn the wrapper's own close ended
+      forget_session(session, turn)  delete the stored session of a turn abandoned mid-turn"""
+
+    def __init__(self, argv, cwd, env, log, stderr_path, provider, last_turn, owner):
+        AcpAgent.__init__(self, argv, cwd, env, log, stderr_path)
+        self.stderr_path = stderr_path
+        self.provider = provider
+        self.next_number = last_turn + 1   # the turn the next prompt opens
+        self.owner = owner
+
+    def hand_over(self, records):
+        """Prompt the first of the wrapper's waiting records as the next turn, unless a turn
+        runs (ACP v1 takes no input during a turn)."""
+        if records and not self.busy():
+            text = record_text(records.pop(0))
+            self.start_turn(self.next_number, text)
+            self.next_number += 1
+
+    def start_turn(self, turn, text):
+        """Send turn `turn`'s prompt; end_turn closes the turn when the agent answers."""
+        seen_files = set()
+        stderr_offset = file_size(self.stderr_path)
+        started = time.time()
+
+        def on_update(update):
+            for line in acp_events(update, turn, now(), self.provider):
+                if line['kind'] == 'file':   # one edit reported twice is one file event
+                    key = (line.get('call'), line.get('path'))
+                    if key in seen_files:
+                        continue
+                    seen_files.add(key)
+                self.owner.record_event(line)
+
+        def on_done(result):
+            self.end_turn(turn, result, stderr_offset, started)
+
+        self.prompt(text, on_update, on_done)
+
+    def end_turn(self, turn, result, stderr_offset, started):
+        *head, end = acp_events(result, turn, now(), self.provider)
+        usage_event = ([e for e in head if e['kind'] == 'usage'] or [{}])[0]
+        for line in head:
+            if line['kind'] == 'error':
+                self.owner.record_event(line)
+        rc = None
+        error_text = ''
+        if end['status'] != 'ok':
+            # Did the agent go with the turn? A killed agent reports it as incomplete,
+            # cancelled or an error; an agent that lives on (a provider refusal) leaves rc None.
+            wait = 10 if end['status'] in ('incomplete', 'cancelled') else 3
+            try:
+                rc = exit_code(self.proc.wait(wait))
+            except subprocess.TimeoutExpired:
+                pass
+            error = result.get('error') or result.get('incomplete') or ''
+            error_text = (json.dumps(error, ensure_ascii=False) + '\n'
+                          + read_tail(self.stderr_path, stderr_offset))
+            if rc is not None:   # it went mid-turn
+                self.owner.forget_session(self.session_id, turn)
+            rc = self.owner.closing_rc(rc)
+        extra = {k: usage_event[k] for k in ('usage_unknown', 'cost_usd') if k in usage_event}
+        self.owner.close_turns([closed_turn(turn, end['status'], end.get('text'),
+                                            usage_event.get('usage'), end.get('final'),
+                                            error_text, end.get('session'), started, extra)], rc)
+
+
 # ---------------------------------------------------------------------------------------------
 # The provider table
 #
@@ -831,12 +939,13 @@ def acp_handshake(agent, handle):
     return None
 
 
-def launch(handle, wrap, log=None, stderr_path=None, on_message=None):
+def launch(handle, wrap, log=None, stderr_path=None, on_message=None, last_turn=0, owner=None):
     """Start a seat's CLI and run its handshake -> (cli, None), or (cli or None, (status,
     reason, why)) when the launch fails or is refused before any turn.
 
     wrap(argv) puts the CLI under the caller's reaper. on_message gets what a claude or codex
-    CLI says; an ACP agent's updates go to each prompt's own callback."""
+    CLI says. An ACP seat numbers its turns after last_turn and reports them to owner (see
+    AcpSeat)."""
     family, _, command = PROVIDERS[handle['provider']]
     try:
         argv, env = command(handle)
@@ -851,7 +960,8 @@ def launch(handle, wrap, log=None, stderr_path=None, on_message=None):
         except WireError as error:
             return cli, ('error', 'handshake', str(error))
         return cli, None
-    agent = AcpAgent(wrap(argv), handle['cwd'], env, log, stderr_path)
+    agent = AcpSeat(wrap(argv), handle['cwd'], env, log, stderr_path, handle['provider'],
+                    last_turn, owner)
     try:
         return agent, acp_handshake(agent, handle)
     except WireError as error:
