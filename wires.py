@@ -940,20 +940,20 @@ def acp_handshake(agent, handle):
     return None
 
 
-def launch(handle, wrap, log=None, stderr_path=None, on_message=None, last_turn=0, owner=None):
+def launch(handle, wrap, log=None, stderr_path=None, last_turn=0, owner=None):
     """Start a seat's CLI and run its handshake -> (cli, None), or (cli or None, (status,
     reason, why)) when the launch fails or is refused before any turn.
 
-    wrap(argv) puts the CLI under the caller's reaper. on_message gets what a claude CLI says.
-    A codex or ACP seat numbers its turns after last_turn and reports them to owner (see
-    AcpSeat)."""
+    wrap(argv) puts the CLI under the caller's reaper. The seat numbers its turns after
+    last_turn and reports them to owner (see AcpSeat)."""
     family, _, command = PROVIDERS[handle['provider']]
     try:
         argv, env = command(handle)
     except ValueError as refusal:
         return None, ('refused',) + refusal.args
     if family == 'stdin':
-        return Cli(wrap(argv), handle['cwd'], env, log, stderr_path, on_message), None
+        return ClaudeSeat(wrap(argv), handle['cwd'], env, log, stderr_path, handle, last_turn,
+                          owner), None
     if family == 'rpc':
         cli = CodexSeat(wrap(argv), handle['cwd'], env, log, stderr_path, handle, last_turn, owner)
         try:   # the thread its handshake opened, before the first turn/start names it
@@ -1262,6 +1262,54 @@ class StreamTranslator:
             if isinstance(change, dict) and change.get('path'):
                 self.emit('file', path=change['path'], tool=name, call=item_id)
         self.current.add_tool()
+
+
+# ---------------------------------------------------------------------------------------------
+# claude's stream-json CLI
+
+STEER_GRACE = 30   # seconds a seat stays idle while claude was handed more messages than it
+                   # started turns: it queues or steers each message itself, and says which only
+                   # by starting the next turn (its init line), so an idle leave waits
+
+
+class ClaudeSeat(Cli):
+    """claude running a seat's turns: every message goes to its stdin as it is, claude queues or
+    steers each one itself, and its StreamTranslator turns what it prints into events. Its owner
+    is the wrapper (see AcpSeat)."""
+
+    def __init__(self, argv, cwd, env, log, stderr_path, handle, last_turn, owner):
+        # Before the process starts: everything it prints is translated.
+        self.translator = StreamTranslator('claude', last_turn, handle.get('session'), owner)
+        self.handed = 0   # the messages handed to it this launch
+        Cli.__init__(self, argv, cwd, env, log, stderr_path, self.translator.take)
+
+    @property
+    def session(self):
+        return self.translator.session
+
+    @property
+    def latest_turn(self):
+        return self.translator.turn
+
+    def busy(self):
+        return self.translator.current is not None
+
+    def cut(self):
+        """The open turn, closed as cut, or None."""
+        return self.translator.cut() if self.translator.current else None
+
+    def hand_over(self, records):
+        """Write all of the wrapper's waiting records to claude's stdin, in one write."""
+        self.handed += len(records)
+        self.write(b''.join(record + b'\n' for record in records))
+        records.clear()
+
+    def linger(self):
+        """Seconds the wrapper stays after the last turn. Each message claude queued starts a
+        turn of its own; a steered one never does. So while it was handed more messages than it
+        started turns this launch, one may still be queued."""
+        started = self.translator.turn - self.translator.before_first
+        return STEER_GRACE if self.handed > started else 0
 
 
 # ---------------------------------------------------------------------------------------------

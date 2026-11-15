@@ -548,9 +548,6 @@ DRIVER_HOSTS = {
 DRIVER_NAMES = sorted({name for names, id_name, _ in DRIVER_HOSTS.values()
                        for name in names + (id_name,)})
 PUSH_LIMIT = 15        # seconds a push command may run
-STEER_GRACE = 30       # seconds a seat stays idle while claude was handed more messages than it
-                       # started turns: it queues or steers each message itself, and says which
-                       # only by starting the next turn (its init line), so an idle leave waits
 
 
 # ---------------------------------------------------------------------------------------------
@@ -675,7 +672,7 @@ class Wrapper:
         self.provider = handle['provider']
         self.family, self.delivery = wires.PROVIDERS[self.provider][:2]
         self.state = SeatState(job_dir)     # events.jsonl, read on where the last read stopped
-        self.translator = None              # claude and codex: one StreamTranslator per launch
+        self.translator = None              # claude and codex: their client's StreamTranslator
         self.stopping = False               # `hands.sh stop` asked the wrapper to end
         self.past_deadline = False
         self.started_at = time.time()
@@ -694,7 +691,6 @@ class Wrapper:
                                             # tried yet
         self.idle_grace = idle_grace        # seconds an idle seat waits for a send
         self.idle_since = None              # when the seat last became idle
-        self.handed = 0                     # claude: the messages handed to it this launch
         self.left = False                   # the loop ended because the seat was idle
 
     def path(self, *names):
@@ -737,18 +733,11 @@ class Wrapper:
         def under_reaper(argv):
             return reaper_argv(ends_at + 10 - time.time(), argv)
 
-        # claude's translator. codex's client builds its own, and an ACP turn is translated
-        # through its prompt's callback.
-        if self.family == 'stdin':
-            self.translator = wires.StreamTranslator(self.provider, self.first_turn - 1,
-                                                     handle.get('session'), self)
         cli, failure = wires.launch(handle, under_reaper, self.log_stream,
-                                    self.path('stderr.log'),
-                                    self.translator.take if self.translator else None,
-                                    self.first_turn - 1, self)
+                                    self.path('stderr.log'), self.first_turn - 1, self)
         if failure:
             return self.launch_failed(*failure, cli=cli)
-        if self.family == 'rpc':   # the close-out reads codex's translator too
+        if self.family != 'acp':   # the close-out reads claude's and codex's translator
             self.translator = cli.translator
         self.open_fifo()
         while not self.stopping and cli.proc.poll() is None and time.time() < ends_at:
@@ -786,14 +775,8 @@ class Wrapper:
             self.deliver_inbox()
 
     def hand_on(self, cli):
-        """Give the CLI the records waiting for it, as its family takes them."""
-        if not self.waiting:
-            return
-        if self.family == 'stdin':   # claude queues or steers each message itself
-            self.handed += len(self.waiting)
-            cli.write(b''.join(record + b'\n' for record in self.waiting))
-            self.waiting = []
-        else:   # ACP: one prompt at a time; codex: one turn/start at a time
+        """Give the CLI the records waiting for it, as its client takes them."""
+        if self.waiting:
             cli.hand_over(self.waiting)
 
     def log_stream(self, line, direction):
@@ -863,15 +846,13 @@ class Wrapper:
     def idle(self, cli):
         """Whether the seat has nothing to do: its first message in, every delivered turn ended,
         no record waiting for the CLI, and no turn open."""
-        if not self.first_sent or self.waiting:
-            return False
-        if cli.busy() if self.family != 'stdin' else self.translator.current:
+        if not self.first_sent or self.waiting or cli.busy():
             return False
         state = self.state.read()
         return state.expected > 0 and state.ended >= state.expected
 
     def leave_when_idle(self, cli):
-        """Idle for the idle grace (STEER_GRACE at least while claude may hold a message it
+        """Idle for the idle grace (at least claude's linger(), while it may hold a message it
         queued) -> close in.fifo under the delivery lock, after one last read of it, and say so:
         the loop ends, and the CLI is closed as an idle stop closes it. A send that got its
         message in first is taken; one that comes after finds no reader, then no wrapper, and
@@ -881,10 +862,7 @@ class Wrapper:
             return False
         if self.idle_since is None:
             self.idle_since = time.time()
-        # Each message claude queued starts a turn of its own; a steered one never does. So
-        # while it was handed more messages than it started turns, one may still be queued.
-        started = self.translator.turn - (self.first_turn - 1) if self.translator else 0
-        grace = max(self.idle_grace, STEER_GRACE if self.handed > started else 0)
+        grace = max(self.idle_grace, cli.linger() if self.family == 'stdin' else 0)
         if time.time() - self.idle_since < grace:
             return False
         lock = self.try_delivery_lock()   # it reads in.fifo
