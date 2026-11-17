@@ -1,55 +1,51 @@
 # Contributing to hands
 
-Thanks for helping. hands is small on purpose, and these rules keep it that way.
-
 ## The surface is frozen
 
-The flags, the one-shot run, the six seat verbs (`start`, `send`, `mail`, `wait`, `events`,
-`stop`), `ps`, `--probe` and `quota` are the whole interface. A new capability is a separate script that calls `hands.sh`, not another flag. A new
-provider is one entry in the provider table (`PROVIDERS` in `wires.py`), not a flag.
+The one-shot run, six seat verbs (`start`, `send`, `mail`, `wait`, `events`, `stop`), `ps`,
+`--probe`, `quota` and their flags are the public interface. Build new capabilities as separate
+scripts that call `hands.sh`. Provider wiring is registered in `PROVIDERS` in `wires.py`.
 
-## Every change is tested
+## Tests
 
-Run the same test command as CI from the repository root before a commit. It must exit 0.
+Run the full CI suite from the repository root before committing. It must exit 0.
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-The tests use the stub CLIs in `tests/stubs/` and the quota stubs in `tests/stubs/quota/`.
-They make no network requests and spend no quota. To run one test, pass its class and method to
-its file, for example
-`python3 tests/test_seat_codex.py CodexSeats.test_a_seat_ends_with_its_turn_and_a_send_resumes_it`.
-The tests keep a seat's process up between turns with the environment variable `HANDS_IDLE`
-(seconds), which is not part of the interface.
+The suite uses temporary sandboxes and stub CLIs in `tests/stubs/`, including quota stubs.
+It makes no external network requests and spends no quota. To select one test, pass its class
+and method to its file, for example
 
-A new behavior lands with a test, and the test must be able to fail: revert the fix alone, run
-the test, and see it go red. A test nobody has seen fail proves nothing.
+```bash
+python3 tests/test_seat_codex.py CodexSeats.test_a_seat_ends_with_its_turn_and_a_send_resumes_it
+```
 
-Don't edit the checkout your live seats run from: a running wrapper starts new `seat.py`
-processes from the files on disk, so a half-made edit can break a live seat. Work in a separate
-clone or a `git worktree`.
+Add a test for new behavior. Before accepting a new or changed test, revert the fix and verify
+that the test fails for the expected reason. Use a separate clone or worktree when the main
+checkout serves live seats. Wrappers can start new processes from the files on disk while
+they run.
 
 ## Fixtures
 
-`tests/fixtures/` holds recorded provider output that the suites replay (see `tests/fixtures/README.md`).
-When a provider changes its error wording or stream shape, add the new recording the same
-day. Before you commit one, strip it of personal data: home paths, user and host names, account
-and session ids, emails, tokens, local timestamps, and anything else that is yours.
+Keep recorded provider output in [tests/fixtures](tests/fixtures/README.md). When a provider
+changes its error wording or stream shape, add a new recording and preserve the old one.
+Before committing a new recording, remove personal data including home paths, usernames,
+account and session ids, email addresses, tokens and local timestamps. Document its provenance,
+including any derivation from an existing recording.
 
 ## Engine rules
 
-- **One seat contract.** `SEAT_BOX` in `hands.py` is the only copy of the text every seat
-  receives first. A seat's prompt is that box, a blank line, the task file, a blank line, and its
-  job-dir line; the job dir's `prompt.txt` is exactly that input.
-- **The job dir is the only state.** No daemon, no registry, no cache file. A relaunch reads the
-  handle, and `events.jsonl` is the truth. See the [job dir reference](README.md#job-dir-reference).
-- **Typed failure, never a retry loop.** Every turn ends in an envelope with a status the caller
-  can act on; quota deaths carry their reset time.
-- **Fix the defect, don't add state.** Prefer one general rule over a provider-specific branch,
-  and remove what a change makes redundant.
+- `SEAT_BOX` in `hands.py` is the shared seat contract. `prompt.txt` holds it first, followed
+  by the task file and the job-dir line, with blank lines between them.
+- The job dir holds hands' state. A relaunch reads the handle and events. Preserve the
+  [job dir contract](README.md#job-dir-reference).
+- Give each completed turn a typed outcome. Provider quota failures carry a reset when it is
+  available. Leave retry decisions to the caller.
+- Fix the defect with existing state where possible and remove code the change makes redundant.
 
 ## Pull requests
 
-Describe what changed and why, name the tests you added, and confirm the full test run passed.
-Report security issues privately (see `SECURITY.md`).
+Describe the change and why it matters, identify new tests and confirm the full test run passed.
+Use the [private reporting process](SECURITY.md) for security issues.
