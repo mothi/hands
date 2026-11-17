@@ -26,6 +26,32 @@ import time
 import traceback
 
 
+# No seat runs the user's hooks: hooks are the user's own code, written for their own sessions.
+# Each command turns them off with its CLI's own switch: claude disableAllHooks, codex
+# --disable hooks. opencode runs no claude hooks, and its plugins have no switch short of
+# replacing its whole config dir.
+
+
+def launch(handle, wrap, stderr_path, stream_path, last_turn, owner):
+    """Start a seat's CLI and run its handshake -> (cli, None), or (cli or None, (status,
+    reason, why)) when the launch fails or is refused before any turn.
+
+    wrap(argv) puts the CLI under the caller's reaper. The CLI's stderr goes to stderr_path, and
+    its client logs what it says to stream_path. The seat numbers its turns after last_turn and
+    reports them to owner (see AcpSeat)."""
+    provider = PROVIDERS[handle['provider']]
+    try:
+        argv, env = provider.command(handle)
+    except ValueError as refusal:
+        return None, ('refused',) + refusal.args
+    cli = provider.client(wrap(argv), handle['cwd'], env, stderr_path, stream_path, handle,
+                          last_turn, owner)
+    try:
+        return cli, cli.handshake(handle)
+    except WireError as error:
+        return cli, ('error', 'handshake', str(error))
+
+
 # ---------------------------------------------------------------------------------------------
 # The vocabulary every wire shares
 
@@ -555,6 +581,58 @@ ACP_SESSION_STATE = ('available_commands_update', 'config_option_update', 'sessi
                      'current_mode_update', 'user_message_chunk')   # not turn events
 
 
+def opencode_command(handle):
+    """opencode: an ACP agent -> (argv, env).
+
+    `opencode acp` takes no model flag, so the model is a session option, like the effort
+    (acp_handshake sets both). The agent runs in the seat's cwd, and on the user's own opencode
+    login and store."""
+    if not (handle.get('model') or '').partition('/')[2]:
+        raise ValueError('model-required', 'opencode seats name provider/model; the CLI '
+                         "default is the driver's own pool")
+    return [handle.get('cli') or 'opencode', 'acp'], {}
+
+
+def forget_command(provider, session, cli=None):
+    """The command that deletes the stored session of a turn whose agent went away mid-turn,
+    or None when the provider keeps nothing to resume.
+
+    opencode keeps such a turn's claim, and the user's background opencode service would resume
+    it at its next start. --standalone runs the delete on a private server."""
+    if provider == 'opencode' and session:
+        return [cli or 'opencode', 'session', 'delete', session, '--standalone']
+    return None
+
+
+def acp_handshake(agent, handle):
+    """initialize, the session, then the model and the effort -> None, or (status, reason, why)
+    when the seat is refused.
+
+    A recorded session is resumed, never replayed. The model is set when the agent runs another
+    one it lists; a seat never runs a substitute. The effort must be one the model lists."""
+    model = handle.get('model')
+    effort = handle.get('effort')
+    agent.initialize()
+    if handle.get('session'):
+        agent.resume(handle['session'])
+    else:
+        agent.new_session()
+    running = agent.current_value('model')
+    if model and running != model and model in (agent.listed_values('model') or []):
+        running = agent.set_option('model', model)
+    efforts = agent.listed_values('thought_level') or []   # after the model: each lists its own
+    if model and running != model:
+        listed = ', '.join(agent.listed_values('model') or []) or 'no models'
+        return ('refused', 'model-mismatch', 'the agent runs %s and lists %s; the seat names %s: '
+                'never substituted' % (running, listed, model))
+    if effort not in (efforts or [None]):
+        return ('refused', 'effort-unsupported', '%s lists effort %s; the seat names %s'
+                % (running, '|'.join(efforts) or 'none', effort or 'none'))
+    if effort:
+        agent.set_option('thought_level', effort)
+    return None
+
+
 class AcpAgent(Rpc):
     """An Agent Client Protocol (v1) agent: `opencode acp`.
 
@@ -919,141 +997,6 @@ class AcpSeat(AcpAgent):
 
 
 # ---------------------------------------------------------------------------------------------
-# The provider table
-#
-# No seat runs the user's hooks: hooks are the user's own code, written for their own sessions.
-# Each command turns them off with its CLI's own switch: claude disableAllHooks, codex
-# --disable hooks. opencode runs no claude hooks, and its plugins have no switch short of
-# replacing its whole config dir.
-
-
-def claude_command(handle):
-    """claude: one process for the whole seat -> (argv, env).
-
-    Every seat has full access (bypassPermissions) and runs lean: no MCP servers from the host,
-    the per-folder prompt sections moved into the first message (so the system prompt is the
-    same in every folder), no auto-memory, and no background tasks (a turn left waiting on one
-    would park). Its one settings source refuses messages from other sessions. Every relaunch
-    sends the same flags, so a resume reuses the cached prompt."""
-    settings = {'crossSessionInbound': 'refuse', 'disableAllHooks': True}
-    argv = [handle.get('cli') or 'claude', '-p',
-            '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
-            '--model', handle.get('model') or 'sonnet',
-            '--settings', json.dumps(settings, separators=(',', ':')),
-            '--strict-mcp-config', '--exclude-dynamic-system-prompt-sections']
-    if handle.get('effort'):
-        argv += ['--effort', handle['effort']]
-    argv += ['--permission-mode', 'bypassPermissions']
-    if handle.get('session'):
-        argv += ['--resume', handle['session']]
-    env = {'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS': '1', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1'}
-    return argv, env
-
-
-def codex_command(handle):
-    """codex: one app-server process per launch, over stdio -> (argv, env).
-
-    --no-daemon keeps the seat off the user's shared app-server. Memories and hooks are off.
-    Web search is live (the app-server has no --search flag). The cwd, sandbox, model and
-    approvals go with the thread (codex_handshake), the effort with each turn/start."""
-    argv = [handle.get('cli') or 'codex', '--no-daemon', '--disable', 'memories',
-            '--disable', 'hooks', '-c', 'web_search="live"', 'app-server']
-    return argv, {}
-
-
-def opencode_command(handle):
-    """opencode: an ACP agent -> (argv, env).
-
-    `opencode acp` takes no model flag, so the model is a session option, like the effort
-    (acp_handshake sets both). The agent runs in the seat's cwd, and on the user's own opencode
-    login and store."""
-    if not (handle.get('model') or '').partition('/')[2]:
-        raise ValueError('model-required', 'opencode seats name provider/model; the CLI '
-                         "default is the driver's own pool")
-    return [handle.get('cli') or 'opencode', 'acp'], {}
-
-
-def forget_command(provider, session, cli=None):
-    """The command that deletes the stored session of a turn whose agent went away mid-turn,
-    or None when the provider keeps nothing to resume.
-
-    opencode keeps such a turn's claim, and the user's background opencode service would resume
-    it at its next start. --standalone runs the delete on a private server."""
-    if provider == 'opencode' and session:
-        return [cli or 'opencode', 'session', 'delete', session, '--standalone']
-    return None
-
-
-def codex_handshake(handle, rpc):
-    """initialize, then thread/start, or thread/resume for a seat that has a thread -> its id.
-
-    Every seat has full access and never asks for approval (no one would answer). The thread
-    is never ephemeral, so it can be resumed. With no model named, codex's own config picks."""
-    rpc.call('initialize', {'clientInfo': {'name': 'hands', 'version': '2'}})
-    rpc.notify('initialized')
-    params = {'cwd': handle['cwd'], 'sandbox': 'danger-full-access', 'approvalPolicy': 'never'}
-    if handle.get('model'):
-        params['model'] = handle['model']
-    if handle.get('session'):
-        result = rpc.call('thread/resume', dict(params, threadId=handle['session']))
-    else:
-        result = rpc.call('thread/start', dict(params, ephemeral=False))
-    thread_id = (result.get('thread') or {}).get('id')
-    if not thread_id:
-        raise WireError('the app-server answered the thread without its id')
-    return thread_id
-
-
-def acp_handshake(agent, handle):
-    """initialize, the session, then the model and the effort -> None, or (status, reason, why)
-    when the seat is refused.
-
-    A recorded session is resumed, never replayed. The model is set when the agent runs another
-    one it lists; a seat never runs a substitute. The effort must be one the model lists."""
-    model = handle.get('model')
-    effort = handle.get('effort')
-    agent.initialize()
-    if handle.get('session'):
-        agent.resume(handle['session'])
-    else:
-        agent.new_session()
-    running = agent.current_value('model')
-    if model and running != model and model in (agent.listed_values('model') or []):
-        running = agent.set_option('model', model)
-    efforts = agent.listed_values('thought_level') or []   # after the model: each lists its own
-    if model and running != model:
-        listed = ', '.join(agent.listed_values('model') or []) or 'no models'
-        return ('refused', 'model-mismatch', 'the agent runs %s and lists %s; the seat names %s: '
-                'never substituted' % (running, listed, model))
-    if effort not in (efforts or [None]):
-        return ('refused', 'effort-unsupported', '%s lists effort %s; the seat names %s'
-                % (running, '|'.join(efforts) or 'none', effort or 'none'))
-    if effort:
-        agent.set_option('thought_level', effort)
-    return None
-
-
-def launch(handle, wrap, stderr_path, stream_path, last_turn, owner):
-    """Start a seat's CLI and run its handshake -> (cli, None), or (cli or None, (status,
-    reason, why)) when the launch fails or is refused before any turn.
-
-    wrap(argv) puts the CLI under the caller's reaper. The CLI's stderr goes to stderr_path, and
-    its client logs what it says to stream_path. The seat numbers its turns after last_turn and
-    reports them to owner (see AcpSeat)."""
-    provider = PROVIDERS[handle['provider']]
-    try:
-        argv, env = provider.command(handle)
-    except ValueError as refusal:
-        return None, ('refused',) + refusal.args
-    cli = provider.client(wrap(argv), handle['cwd'], env, stderr_path, stream_path, handle,
-                          last_turn, owner)
-    try:
-        return cli, cli.handshake(handle)
-    except WireError as error:
-        return cli, ('error', 'handshake', str(error))
-
-
-# ---------------------------------------------------------------------------------------------
 # Messages in, and the claude and codex translators
 
 
@@ -1359,6 +1302,30 @@ class StreamTranslator:
 # ---------------------------------------------------------------------------------------------
 # claude's stream-json CLI
 
+
+def claude_command(handle):
+    """claude: one process for the whole seat -> (argv, env).
+
+    Every seat has full access (bypassPermissions) and runs lean: no MCP servers from the host,
+    the per-folder prompt sections moved into the first message (so the system prompt is the
+    same in every folder), no auto-memory, and no background tasks (a turn left waiting on one
+    would park). Its one settings source refuses messages from other sessions. Every relaunch
+    sends the same flags, so a resume reuses the cached prompt."""
+    settings = {'crossSessionInbound': 'refuse', 'disableAllHooks': True}
+    argv = [handle.get('cli') or 'claude', '-p',
+            '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
+            '--model', handle.get('model') or 'sonnet',
+            '--settings', json.dumps(settings, separators=(',', ':')),
+            '--strict-mcp-config', '--exclude-dynamic-system-prompt-sections']
+    if handle.get('effort'):
+        argv += ['--effort', handle['effort']]
+    argv += ['--permission-mode', 'bypassPermissions']
+    if handle.get('session'):
+        argv += ['--resume', handle['session']]
+    env = {'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS': '1', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1'}
+    return argv, env
+
+
 STEER_GRACE = 30   # seconds a seat stays idle while claude was handed more messages than it
                    # started turns: it queues or steers each message itself, and says which only
                    # by starting the next turn (its init line), so an idle leave waits
@@ -1418,6 +1385,37 @@ class ClaudeSeat(Cli):
 
 # ---------------------------------------------------------------------------------------------
 # codex's app-server
+
+
+def codex_command(handle):
+    """codex: one app-server process per launch, over stdio -> (argv, env).
+
+    --no-daemon keeps the seat off the user's shared app-server. Memories and hooks are off.
+    Web search is live (the app-server has no --search flag). The cwd, sandbox, model and
+    approvals go with the thread (codex_handshake), the effort with each turn/start."""
+    argv = [handle.get('cli') or 'codex', '--no-daemon', '--disable', 'memories',
+            '--disable', 'hooks', '-c', 'web_search="live"', 'app-server']
+    return argv, {}
+
+
+def codex_handshake(handle, rpc):
+    """initialize, then thread/start, or thread/resume for a seat that has a thread -> its id.
+
+    Every seat has full access and never asks for approval (no one would answer). The thread
+    is never ephemeral, so it can be resumed. With no model named, codex's own config picks."""
+    rpc.call('initialize', {'clientInfo': {'name': 'hands', 'version': '2'}})
+    rpc.notify('initialized')
+    params = {'cwd': handle['cwd'], 'sandbox': 'danger-full-access', 'approvalPolicy': 'never'}
+    if handle.get('model'):
+        params['model'] = handle['model']
+    if handle.get('session'):
+        result = rpc.call('thread/resume', dict(params, threadId=handle['session']))
+    else:
+        result = rpc.call('thread/start', dict(params, ephemeral=False))
+    thread_id = (result.get('thread') or {}).get('id')
+    if not thread_id:
+        raise WireError('the app-server answered the thread without its id')
+    return thread_id
 
 
 class CodexSeat(Rpc):
@@ -1503,7 +1501,7 @@ class CodexSeat(Rpc):
 
 
 # ---------------------------------------------------------------------------------------------
-# The provider table itself, below the clients it names (each provider's command is above)
+# The provider table
 #
 # client:   the class that runs the seat's CLI and talks to it: ClaudeSeat (claude's stream-json
 #           on its stdin and stdout), CodexSeat (codex's app-server) or AcpSeat (Agent Client

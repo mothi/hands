@@ -87,6 +87,70 @@ PROBE_SPECS = {   # each provider's smallest model; an ACP seat names an effort 
 }
 
 
+def main(args):
+    rebind()
+    if args[:1] == ['quota']:
+        return quota.main(args[1:])
+    if args[:1] == ['ps']:
+        if len(args) != 1:
+            say('usage: hands.sh ps')
+            return 2
+        return ps()
+    if args[:1] == ['send']:
+        if len(args) != 3:
+            say('usage: hands.sh send DIR FILE')
+            return 2
+        return send(args[1], args[2])
+    if args[:1] in (['mail'], ['wait'], ['events'], ['stop']):
+        return run_verb(args)
+    options = Options()
+    if args[:1] == ['start']:
+        options.start = True
+        args = args[1:]
+    while args:
+        flag = args[0]
+        if flag in ('--cwd', '--timeout', '--out', '--effort'):
+            if len(args) < 2:
+                say('%s needs a value' % flag)
+                return 2
+            setattr(options, flag[2:], args[1])
+            args = args[1:]
+        elif flag == '--probe':
+            if len(args) > 1 and not args[1].startswith('-'):
+                options.probe = args[1]
+                args = args[1:]
+            else:
+                options.probe = 'all'
+        elif flag in ('-h', '--help'):
+            print(__doc__.rstrip())
+            return 0
+        elif flag.startswith('-'):
+            say('unknown flag %s' % flag)
+            return 2
+        else:
+            break
+        args = args[1:]
+    if options.probe:
+        return probe(options.probe)
+    if len(args) >= 2:
+        return buy(args[0], args[1], options)
+    print(__doc__.rstrip())
+    return 2
+
+
+def rebind():
+    """Point this session's seats at its address now, and send the pushes they have pending.
+    A Claude Code restart moves a resumed session to a new socket and token, so the pushes its
+    seats sent meanwhile failed; this command sends them."""
+    rebound, served = push.rebind_seats(seat.JOBS, seat.live_seats)
+    if rebound:
+        say("this session's address changed (a restart?): %d seat(s) now push to it: %s"
+            % (len(rebound), ' '.join(rebound)))
+    if served:
+        say('%d seat(s) had pending pushes this session missed; they are posted now: %s'
+            % (len(served), ' '.join(served)))
+
+
 def seat_line(job_dir):
     return 'YOUR JOB DIR: %s (your outbox: %s/outbox.jsonl).\n' % (job_dir, job_dir)
 
@@ -684,7 +748,7 @@ def is_stale(path, cutoff):
 
 
 # ---------------------------------------------------------------------------------------------
-# The probe, and the command line
+# The probe
 
 
 def probe(which):
@@ -731,70 +795,6 @@ def probe_line(status, provider, rc):
     return json.dumps({'status': status, 'provider': provider, 'model': None, 'rc': rc,
                        'seconds': 0, 'reset': None, 'dir': None, 'usage': None},
                       separators=(',', ':'))
-
-
-def rebind():
-    """Point this session's seats at its address now, and send the pushes they have pending.
-    A Claude Code restart moves a resumed session to a new socket and token, so the pushes its
-    seats sent meanwhile failed; this command sends them."""
-    rebound, served = push.rebind_seats(seat.JOBS, seat.live_seats)
-    if rebound:
-        say("this session's address changed (a restart?): %d seat(s) now push to it: %s"
-            % (len(rebound), ' '.join(rebound)))
-    if served:
-        say('%d seat(s) had pending pushes this session missed; they are posted now: %s'
-            % (len(served), ' '.join(served)))
-
-
-def main(args):
-    rebind()
-    if args[:1] == ['quota']:
-        return quota.main(args[1:])
-    if args[:1] == ['ps']:
-        if len(args) != 1:
-            say('usage: hands.sh ps')
-            return 2
-        return ps()
-    if args[:1] == ['send']:
-        if len(args) != 3:
-            say('usage: hands.sh send DIR FILE')
-            return 2
-        return send(args[1], args[2])
-    if args[:1] in (['mail'], ['wait'], ['events'], ['stop']):
-        return run_verb(args)
-    options = Options()
-    if args[:1] == ['start']:
-        options.start = True
-        args = args[1:]
-    while args:
-        flag = args[0]
-        if flag in ('--cwd', '--timeout', '--out', '--effort'):
-            if len(args) < 2:
-                say('%s needs a value' % flag)
-                return 2
-            setattr(options, flag[2:], args[1])
-            args = args[1:]
-        elif flag == '--probe':
-            if len(args) > 1 and not args[1].startswith('-'):
-                options.probe = args[1]
-                args = args[1:]
-            else:
-                options.probe = 'all'
-        elif flag in ('-h', '--help'):
-            print(__doc__.rstrip())
-            return 0
-        elif flag.startswith('-'):
-            say('unknown flag %s' % flag)
-            return 2
-        else:
-            break
-        args = args[1:]
-    if options.probe:
-        return probe(options.probe)
-    if len(args) >= 2:
-        return buy(args[0], args[1], options)
-    print(__doc__.rstrip())
-    return 2
 
 
 if __name__ == '__main__':
