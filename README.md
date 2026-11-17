@@ -395,8 +395,9 @@ a deadline does and writes the last envelopes.
 |---|---|
 | `hands.sh` | the launcher: runs `hands.py` |
 | `hands.py` | the command line and its flags, the job dir and its handle, the seat contract (`SEAT_BOX`), the verbs, the events view, the live-seat list (`ps`), the probe and the 30-day sweep |
-| `seat.py` | the wrapper: its loop, deliveries and the delivery lock, closing turns into envelopes, pushes to the driver (one row per host), the live seats, failure types, and the reaper |
-| `wires.py` | the provider table (`PROVIDERS`), each CLI's command and handshake, the JSON-RPC and ACP clients, and the translators that turn each CLI's output into events |
+| `seat.py` | the wrapper loop, deliveries and the delivery lock, turn envelopes and failure typing, outbox reading and push timing, live-seat discovery, and the reaper |
+| `push.py` | driver addresses and rebinding, the push log and sender, and the driver host table (`DRIVER_HOSTS`) with its transports |
+| `wires.py` | the provider table (`PROVIDERS`), each CLI's command and handshake, the provider clients and event translators, the shared file helpers, and the reaper argument builder |
 | `quota.py` | the quota board behind `hands.sh quota` |
 | `SKILL.md` | the short guide agent hosts read |
 | `tests/` | `test_cli.py` (hands.py end to end), `test_seat.py` (the wrapper against stub CLIs), `test_wires.py` (the clients and translators on their own), `test_quota.py`, the `stubs/` and `harness.py` they share, and `fixtures/`, recorded provider output |

@@ -21,6 +21,7 @@ import select
 import signal
 import stat
 import subprocess
+import sys
 import time
 import traceback
 
@@ -107,11 +108,61 @@ def append_json(path, value):
         os.close(fd)
 
 
+def write_atomic(path, text, mode=None):
+    """Replace a file's whole content at once, by rename (as UTF-8, as append_json writes). The
+    temporary file is made new, never through a link the seat planted; `mode` sets its
+    permissions (default: as open() makes a file)."""
+    temporary = '%s.tmp%d' % (path, os.getpid())
+    if os.path.lexists(temporary):
+        os.remove(temporary)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 0o666 if mode is None else mode)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', errors='replace') as f:
+            f.write(text)
+        os.replace(temporary, path)
+    except OSError:
+        os.remove(temporary)
+        raise
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def read_lines(path, offset):
+    """The complete lines after `offset` -> (their text, the offset after them)."""
+    try:
+        with os.fdopen(open_regular(path, os.O_RDONLY), 'rb') as f:
+            f.seek(offset)
+            data = f.read()
+    except OSError:
+        return '', offset
+    data = data[:data.rfind(b'\n') + 1]
+    return data.decode('utf-8', 'replace'), offset + len(data)
+
+
 def exit_code(returncode):
     """A process's exit code as a shell reports it: one that signal N ended reads 128 + N."""
     if returncode is None or returncode >= 0:
         return returncode
     return 128 - returncode
+
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+NO_LIMIT = float('inf')   # a seat started without --timeout has no deadline
+DEADLINE_RC = 142         # the rc of a CLI ended at its deadline (the reaper exits with it)
+
+
+def reaper_argv(seconds, argv):
+    """argv under reap, with a limit of `seconds` (NO_LIMIT: none)."""
+    limit = 0 if seconds == NO_LIMIT else max(1, int(seconds))
+    return [sys.executable, os.path.join(HERE, 'seat.py'), 'reap', str(limit)] + argv
 
 
 # Failure types, from a provider's error fields and the CLI's stderr (seat.py's failure_status

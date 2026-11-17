@@ -52,6 +52,7 @@ import sys
 import tempfile
 import time
 
+import push
 import quota
 import seat
 import wires
@@ -239,7 +240,7 @@ def launch(provider, model, job_dir, options):
     if ack.returncode == 2:   # refused before any prompt: that envelope is the answer
         sys.stdout.write(ack.stdout)
         return 2
-    rc = wait(job_dir, seat.read_json(os.path.join(job_dir, 'session')), 'turn', None)
+    rc = wait(job_dir, wires.read_json(os.path.join(job_dir, 'session')), 'turn', None)
     sys.stdout.flush()
     stop(job_dir)
     return rc
@@ -279,7 +280,7 @@ def send(job_dir, message_file):
     if not os.path.isfile(message_file):
         say('send file not found: %s' % message_file)
         return 2
-    provider = (seat.read_json(os.path.join(job_dir, 'session')) or {}).get('provider')
+    provider = (wires.read_json(os.path.join(job_dir, 'session')) or {}).get('provider')
     if provider not in wires.PROVIDERS:   # the handle names a provider with no entry in the table
         say("%s names provider '%s', which hands does not run (%s)"
             % (job_dir, provider, PROVIDER_NAMES))
@@ -287,7 +288,7 @@ def send(job_dir, message_file):
     rc = seat.main(['send', job_dir, message_file])
     if rc != 3:
         return rc
-    handle = seat.read_json(os.path.join(job_dir, 'session'))
+    handle = wires.read_json(os.path.join(job_dir, 'session'))
     options = Options()
     options.effort = handle.get('effort') or ''
     if not handle.get('session'):
@@ -309,7 +310,7 @@ def run_verb(args):
         say('%s is not a job dir (it holds neither prompt.txt nor envelope.json)' % args[1])
         return 2
     job_dir = os.path.realpath(args[1])
-    handle = seat.read_json(os.path.join(job_dir, 'session'))
+    handle = wires.read_json(os.path.join(job_dir, 'session'))
     if verb == 'mail':
         return mail(job_dir, handle, args[2:])
     if verb == 'wait':
@@ -318,7 +319,7 @@ def run_verb(args):
     if verb == 'events':
         return events(job_dir, '--follow' in args)
     rc = stop(job_dir)
-    envelope = seat.read_json(os.path.join(job_dir, 'envelope.json'))
+    envelope = wires.read_json(os.path.join(job_dir, 'envelope.json'))
     if envelope:
         print(seat.printed(envelope))
     return rc
@@ -384,7 +385,7 @@ def wait(job_dir, handle, mode, timeout):
     while True:
         state.read()
         if mode == 'mail' and seat.file_size(outbox) > outbox_size:
-            sys.stdout.write(seat.read_lines(outbox, outbox_size)[0])
+            sys.stdout.write(wires.read_lines(outbox, outbox_size)[0])
             return 0
         if handle and mode != 'exit' and state.expected and state.ended >= state.expected:
             return print_result(job_dir)   # an idle seat mails nothing more
@@ -417,7 +418,7 @@ def print_last(job_dir, handle, state):
 
 def print_result(job_dir):
     """A turn's answer (when it is ok), then its envelope line -> the exit code."""
-    envelope = seat.read_json(os.path.join(job_dir, 'envelope.json'))
+    envelope = wires.read_json(os.path.join(job_dir, 'envelope.json'))
     if envelope is None:
         print(seat.one_line({'status': 'error', 'dir': job_dir, 'reason': 'no envelope'}))
         return 1
@@ -561,7 +562,7 @@ def events(job_dir, follow):
     offset = 0
     while True:
         live = follow and seat.wrappers(job_dir)
-        text, offset = seat.read_lines(os.path.join(job_dir, 'events.jsonl'), offset)
+        text, offset = wires.read_lines(os.path.join(job_dir, 'events.jsonl'), offset)
         sys.stdout.write(view.feed(text) + ('' if live else view.flush()))
         sys.stdout.flush()
         if not live:
@@ -578,15 +579,15 @@ def ps():
     event came, how many pushes its driver has not taken yet (when any), and its dir; then one
     per ended seat in the jobs root with pushes pending."""
     job_dirs = seat.live_seats()
-    ended = [job_dir for job_dir in seat.seats_with_pending() if job_dir not in job_dirs]
+    ended = [job_dir for job_dir in push.seats_with_pending(seat.JOBS) if job_dir not in job_dirs]
     if not job_dirs and not ended:
         say('no live seats')
     for job_dir in job_dirs + ended:
-        handle = seat.read_json(os.path.join(job_dir, 'session')) or {}
+        handle = wires.read_json(os.path.join(job_dir, 'session')) or {}
         state = seat.SeatState(job_dir).read()
         name = ':'.join(part for part in (handle.get('provider'), handle.get('model')) if part)
         what = 'ended after turn %d' % state.ended if job_dir in ended else doing(job_dir, state)
-        count = seat.pending_count(job_dir)
+        count = push.pending_count(job_dir)
         pending = ' · %d push(es) pending' % count if count else ''
         print('%-24s %s · %s%s · %s' % (name, what, ago(state.last_event), pending, job_dir))
     return 0
@@ -600,7 +601,7 @@ def doing(job_dir, state):
         return 'running turn %d%s' % (state.turn, ' (%d queued)' % queued if queued > 0 else '')
     if state.expected > state.ended or not state.ended:
         return 'starting turn %d' % max(state.expected, 1)
-    envelope = seat.read_json(os.path.join(job_dir, 'envelope.json')) or {}
+    envelope = wires.read_json(os.path.join(job_dir, 'envelope.json')) or {}
     return 'idle after turn %d %s' % (state.ended, envelope.get('status') or '')
 
 
@@ -691,7 +692,7 @@ def probe(which):
 
     Claude's ping also refreshes the quota board (its stream's rate_limit_event is the claude
     reading). A probe never pushes to the driver."""
-    env = {k: v for k, v in os.environ.items() if k not in seat.DRIVER_NAMES}
+    env = {k: v for k, v in os.environ.items() if k not in push.DRIVER_NAMES}
     providers = list(wires.PROVIDERS) if which == 'all' else which.split()
     sweep()
     rc = 0
@@ -736,7 +737,7 @@ def rebind():
     """Point this session's seats at its address now, and send the pushes they have pending.
     A Claude Code restart moves a resumed session to a new socket and token, so the pushes its
     seats sent meanwhile failed; this command sends them."""
-    rebound, served = seat.rebind_seats()
+    rebound, served = push.rebind_seats(seat.JOBS, seat.live_seats)
     if rebound:
         say("this session's address changed (a restart?): %d seat(s) now push to it: %s"
             % (len(rebound), ' '.join(rebound)))
