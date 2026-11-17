@@ -1,0 +1,11 @@
+#!/bin/sh
+url=""; for a in "$@"; do case "$a" in http*) url="$a";; esac; done
+[ -n "${QUOTA_CALL_LOG:-}" ] && echo "curl $url" >>"$QUOTA_CALL_LOG"
+[ -n "${QUOTA_ARGV_LOG:-}" ] && echo "curl $*" >>"$QUOTA_ARGV_LOG"
+hdrs=$(for a in "$@"; do echo "$a"; done; for a in "$@"; do [ "$a" = @- ] && cat; done)
+[ -n "${QUOTA_AUTH_LOG:-}" ] && printf '%s\n' "$hdrs" | grep '^Authorization:' >>"$QUOTA_AUTH_LOG"
+pick() { [ "$1" = FAIL ] && exit 6; cat "$1"; exit 0; }
+case "$url" in
+  *opencode.ai*) pick "${QUOTA_STUB_OPENCODE:-${QUOTA_FIXTURES}/quota-opencode-happy.json}" ;;
+  *) exit 6 ;;
+esac

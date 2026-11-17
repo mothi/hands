@@ -81,7 +81,8 @@ ln -sfn ~/src/hands ~/.agents/skills/hands   # Codex
 ```
 
 It takes about a minute and prints `test_cli: N passed, 0 failed`. A test that would launch a
-real CLI found in `/usr/bin` is skipped. CONTRIBUTING.md lists the other suites.
+real CLI found in `/usr/bin` is skipped. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full test
+command.
 
 ## Quickstart
 
@@ -395,7 +396,7 @@ and the wrapper closes the pipe under the delivery lock when it leaves. `mail` w
 | `wires.py` | the provider table (`PROVIDERS`), each CLI's command and handshake, the provider clients and event translators, the shared file helpers, and the reaper argument builder |
 | `quota.py` | the quota board behind `hands.sh quota` |
 | `SKILL.md` | the short guide agent hosts read |
-| `tests/` | `test_cli.py` (hands.py end to end), `test_seat.py` (the wrapper against stub CLIs), `test_wires.py` (the clients and translators on their own), `test_quota.py`, the `stubs/` and `harness.py` they share, and `fixtures/`, recorded provider output |
+| `tests/` | `test_cli.py` (hands.py end to end), `test_seat*.py` (provider seats and shared wrapper behavior), `test_push.py` (driver pushes), `test_wires.py` (clients and translators), and `test_quota.py`. The tests use `stubs/`, `harness.py`, and the recorded provider output in `fixtures/`. |
 
 To follow one seat through the code, read `main()`, `start_seat()` and `launch()` in `hands.py`, then
 `spawn()` and `Wrapper.run()` in `seat.py`, then `launch()` in `wires.py`.

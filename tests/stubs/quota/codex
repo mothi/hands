@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+import json
+import os
+import select
+import sys
+import time
+
+FIXTURES = os.environ["QUOTA_FIXTURES"]
+
+if os.environ.get("QUOTA_CALL_LOG"):
+    open(os.environ["QUOTA_CALL_LOG"], "a").write(" ".join(["codex"] + sys.argv[1:]) + "\n")
+f = os.environ.get("QUOTA_STUB_CODEX") or os.path.join(FIXTURES, "quota-codex-happy.json")
+if f == "FAIL": sys.exit(6)
+if f == "HANG": time.sleep(3600)
+linger = f == "LINGER"   # answers, then ignores stdin EOF
+if linger: f = os.path.join(FIXTURES, "quota-codex-happy.json")
+# what the live server sends between the initialize answer and the read answer, and a non-JSON line
+LIVE = "".join(json.dumps(n) + "\n" for n in (
+    {"method": "remoteControl/status/changed", "params": {"installationId": "FAKEFIXTUREID0000",
+                                                          "status": "disabled"}},
+    {"method": "account/updated", "params": {"authMode": "chatgpt"}})) + "not json\n"
+home = os.environ.get("CODEX_HOME") or os.path.join(os.environ["HOME"], ".codex")
+if not os.path.exists(os.path.join(home, "auth.json")):
+    f = os.path.join(FIXTURES, "quota-codex-no-login.json")
+buf, eof = b"", False
+while not eof:
+    c = os.read(0, 65536)
+    eof, buf = not c, buf + c
+    while b"\n" in buf:
+        line, buf = buf.split(b"\n", 1)
+        m = json.loads(line)
+        if "id" not in m: continue
+        if m["method"] == "initialize":
+            answer = {"id": m["id"], "result": {"userAgent": "stub"}}
+            sys.stdout.write(json.dumps(answer) + "\n" + LIVE)
+        else:   # the backend round trip: a stdin at EOF by its end has shut the server down
+            time.sleep(0.5)
+            if select.select([0], [], [], 0)[0]:
+                c = os.read(0, 65536)
+                if not c: sys.exit(0)
+                buf += c
+            sys.stdout.write(json.dumps(dict(json.load(open(f)), id=m["id"])) + "\n")
+        sys.stdout.flush()
+        if linger and m["method"] != "initialize": time.sleep(3600)

@@ -28,6 +28,8 @@ sys.path.insert(0, ROOT)
 # A run inside a driver session (Claude Code, Codex, OpenCode) inherits the variables that name
 # it. No test may push to it, and no stub setting from the outer environment may leak into a test.
 import push   # here, once ROOT is on the path
+import wires
+
 DRIVER_NAMES = set(push.DRIVER_NAMES)
 for _name in list(os.environ):
     if _name in DRIVER_NAMES or _name.startswith('STUB_'):
@@ -38,6 +40,7 @@ SPECS = {
     'codex': 'codex:gpt-5.6-terra',
     'opencode': 'opencode:opencode-go/deepseek-v4.1-flash',
 }
+CODEX_THREAD = 'th_stub123'
 OPENCODE_SESSION = 'ses_f2c74432dffeoPDAL0Eq6RHjaI'        # in opencode-acp-seat-sample.jsonl
 
 
@@ -115,7 +118,8 @@ class Sandbox:
                                 env=self.environment(env), stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True)
 
-    def stub_log(self, job):
+    @staticmethod
+    def stub_log(job):
         return StubLog(job + '.stub.jsonl')
 
     def seat_env(self, job, env):
@@ -154,6 +158,25 @@ class Sandbox:
             for name in dirs:
                 os.chmod(os.path.join(top, name), 0o700)
         shutil.rmtree(self.root, ignore_errors=True)
+
+
+class SeatSandbox(Sandbox):
+    def save_transcript(self, name, rows):
+        return save_transcript(self.path(name), rows)
+
+    def check_drivers(self):
+        for top, _, files in os.walk(self.root):
+            path = os.path.join(top, 'driver')
+            if 'driver' in files and not os.path.islink(path):
+                address = read_json(path)['address'][0]
+                if not address.startswith((self.root + os.sep, 'test-')):
+                    raise AssertionError('unexpected driver address in %s' % top)
+
+    def close(self):
+        try:
+            self.check_drivers()
+        finally:
+            super().close()
 
 
 # ---------------------------------------------------------------------------------------------
@@ -349,74 +372,35 @@ def save_transcript(path, rows):
     return path
 
 
-def _message(row):
+def rpc_message(row):
     return row['msg'] if isinstance(row['msg'], dict) else {}
 
 
-def _client_index(rows, method, start=0):
+def request_index(rows, method, start=0):
     return next(i for i in range(start, len(rows))
-                if rows[i]['dir'] == 'out' and _message(rows[i]).get('method') == method)
+                if rows[i]['dir'] == 'out' and rpc_message(rows[i]).get('method') == method)
 
 
 def without_cancel(rows):
     return [r for r in rows if not (r['dir'] == 'out'
-                                    and _message(r).get('method') == 'session/cancel')]
+                                    and rpc_message(r).get('method') == 'session/cancel')]
 
 
 def hung_on_first_prompt(rows):
     """The first prompt's updates, but never its answer: the turn stays open."""
-    prompt = _client_index(rows, 'session/prompt')
+    prompt = request_index(rows, 'session/prompt')
     prompt_id = rows[prompt]['msg']['id']
     answer = next(j for j in range(prompt + 1, len(rows))
-                  if rows[j]['dir'] == 'in' and _message(rows[j]).get('id') == prompt_id)
+                  if rows[j]['dir'] == 'in' and rpc_message(rows[j]).get('id') == prompt_id)
     return rows[:answer]
-
-
-def first_prompt_fails(rows, text):
-    """The first prompt answered by a JSON-RPC error carrying text."""
-    prompt = _client_index(rows, 'session/prompt')
-    error = {'code': -32603, 'message': text.strip()}
-    reply = {'jsonrpc': '2.0', 'id': rows[prompt]['msg']['id'], 'error': error}
-    return rows[:prompt + 1] + [{'dir': 'in', 'msg': reply}]
-
-
-def session_on_model(rows, model):
-    """The new session starts on another model; the client must set the recorded one."""
-    rows = json.loads(json.dumps(rows))
-    new = _client_index(rows, 'session/new')
-    answer = next(a for a in range(new + 1, len(rows))
-                  if 'configOptions' in (_message(rows[a]).get('result') or {}))
-    after = next(b for b in range(answer + 1, len(rows)) if rows[b]['dir'] == 'out')
-    reply = _message(rows[answer])['result']
-    options = json.loads(json.dumps(reply['configOptions']))
-    wanted = next(o for o in options if o['id'] == 'model')['currentValue']
-    next(o for o in reply['configOptions'] if o['id'] == 'model')['currentValue'] = model
-    params = {'sessionId': reply.get('sessionId'), 'configId': 'model', 'value': wanted}
-    rows[after:after] = [
-        {'dir': 'out', 'msg': {'jsonrpc': '2.0', 'id': 9001,
-                               'method': 'session/set_config_option', 'params': params}},
-        {'dir': 'in', 'msg': {'jsonrpc': '2.0', 'id': 9001, 'result': {'configOptions': options}}},
-    ]
-    return rows
 
 
 def resume_refused(rows):
     """session/resume answered 'Session not found'."""
-    resume = _client_index(rows, 'session/resume')
+    resume = request_index(rows, 'session/resume')
     error = {'code': -32602, 'message': 'Session not found'}
     reply = {'jsonrpc': '2.0', 'id': rows[resume]['msg']['id'], 'error': error}
     return rows[:resume + 1] + [{'dir': 'in', 'msg': reply}]
-
-
-def with_delays(rows, seconds, count):
-    """A pause of `seconds` before the answers to each of the first `count` client lines."""
-    edited = []
-    for row in rows:
-        edited.append(row)
-        if row['dir'] == 'out' and count > 0:
-            count -= 1
-            edited.append({'dir': 'sleep', 'msg': seconds})
-    return edited
 
 
 # ---------------------------------------------------------------------------------------------
@@ -491,6 +475,55 @@ class DriverSocket:
             os.unlink(self.path)
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------------------------
+# Shared seat checks
+
+
+def agent(job, n=0):
+    return Sandbox.stub_log(job).seats()[n]
+
+
+def progress(job, text=None):
+    found = [e for e in events(job) if e['kind'] == 'progress']
+    return [e for e in found if text is None or text in str(e.get('text', ''))]
+
+
+def turn_started(job, turn=1):
+    return any(e['kind'] == 'turn_start' and e['turn'] == turn for e in events(job))
+
+
+def file_exists(*parts):
+    return wait_until(lambda: os.path.exists(os.path.join(*parts)))
+
+
+class SeatChecks(unittest.TestCase):
+    def assertVocabulary(self, found, kinds, statuses, last, result_text):
+        """Every event uses the vocabulary; each tool_result and file pairs a tool_call; a usage
+        precedes each turn_end; the turn_ends carry these statuses, a session and a final."""
+        ends = [e for e in found if e['kind'] == 'turn_end']
+        calls = {e.get('call') for e in found if e['kind'] == 'tool_call'}
+        for e in found:
+            self.assertIsInstance(e.get('t'), str)
+            self.assertIn(e.get('kind'), wires.EVENT_KINDS)
+            self.assertIsInstance(e.get('turn'), int)
+        self.assertLessEqual(set(kinds), {e['kind'] for e in found})
+        self.assertEqual([e['turn'] for e in ends], list(range(1, len(ends) + 1)))
+        self.assertEqual([e['status'] for e in ends], statuses)
+        self.assertTrue(all(e.get('session') and e.get('final') for e in ends))
+        for e in found:
+            if e['kind'] in ('tool_result', 'file'):
+                self.assertIn(e.get('call'), calls)
+        for i, e in enumerate(found):
+            if e['kind'] == 'turn_end':
+                self.assertTrue(any(x['kind'] == 'usage' and x['turn'] == e['turn']
+                                    for x in found[:i]))
+        self.assertEqual(ends[-1]['text'].strip(), last)
+        self.assertEqual(result_text, ends[-1]['text'])
+
+    def assertGone(self, job, *pids):
+        self.assertTrue(gone(job, pids), 'a wrapper or a process outlived the seat')
 
 
 # ---------------------------------------------------------------------------------------------

@@ -1,0 +1,4 @@
+#!/bin/sh
+# The Claude gauge must call neither a login tool nor its CLI.
+[ -n "${QUOTA_CALL_LOG:-}" ] && echo "${0##*/} $*" >>"$QUOTA_CALL_LOG"
+exit 1

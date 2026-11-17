@@ -17,14 +17,5 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - name: wires suite
-        run: python3 tests/test_wires.py
-      - name: cli suite
-        if: always()
-        run: python3 tests/test_cli.py
-      - name: seat suite
-        if: always()
-        run: python3 tests/test_seat.py
-      - name: quota suite
-        if: always()
-        run: python3 tests/test_quota.py
+      - name: Run tests
+        run: python3 -m unittest discover -s tests -v

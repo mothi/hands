@@ -5,8 +5,8 @@ STUB_MODE picks how each turn goes:
   ok          (the default) the answer names two environment switches and the turn number
   count       the answer is 'turn N pid P'
   echo        the answer is the message text itself
-  slow        STUB_SLEEP seconds (default 2), then count's answer, or a failure when STUB_FAIL
-              is set
+  slow        wait for stdin EOF when STUB_ANSWER_ON_EOF is set, otherwise STUB_SLEEP seconds
+              (default 2), then count's answer or a failure when STUB_FAIL is set
   replay      STUB_REPLAY, a recorded stream, one recorded turn per message line
   park        the turn never ends
   deaf        the turn never ends, and a TERM is ignored
@@ -76,7 +76,10 @@ def run_turn(number, line):
     elif MODE == 'count':
         result('turn %d pid %d' % (number, os.getpid()))
     elif MODE == 'slow':
-        time.sleep(float(stub.setting('SLEEP', 2)))
+        if stub.setting('ANSWER_ON_EOF'):
+            sys.stdin.read()
+        else:
+            time.sleep(float(stub.setting('SLEEP', 2)))
         if stub.setting('FAIL'):
             failed('API Error: 500')
         else:

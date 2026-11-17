@@ -10,19 +10,16 @@ provider is one entry in the provider table (`PROVIDERS` in `wires.py`), not a f
 
 ## Every change is tested
 
-Run all four suites before a commit. Each must print `0 failed` and exit 0:
+Run the same test command as CI from the repository root before a commit. It must exit 0.
 
 ```bash
-python3 tests/test_wires.py   # the clients and translators on their own (seconds)
-python3 tests/test_cli.py     # hands.py end to end (about a minute)
-python3 tests/test_seat.py    # the wrapper against stub CLIs (about five minutes)
-python3 tests/test_quota.py   # the quota board
+python3 -m unittest discover -s tests -v
 ```
 
-They are hermetic: the stub CLIs in `tests/stubs`, and the curl and codex stubs that
-`tests/test_quota.py` writes, stand in for the real ones, and nothing touches the network or
-spends quota. To run one test, name it:
-`python3 tests/test_seat.py CodexSeats.test_a_seat_ends_with_its_turn_and_a_send_resumes_it`.
+The tests use the stub CLIs in `tests/stubs/` and the quota stubs in `tests/stubs/quota/`.
+They make no network requests and spend no quota. To run one test, pass its class and method to
+its file, for example
+`python3 tests/test_seat_codex.py CodexSeats.test_a_seat_ends_with_its_turn_and_a_send_resumes_it`.
 The tests keep a seat's process up between turns with the environment variable `HANDS_IDLE`
 (seconds), which is not part of the interface.
 
@@ -54,4 +51,5 @@ and session ids, emails, tokens, local timestamps, and anything else that is you
 
 ## Pull requests
 
-Describe what changed and why, name the tests you added, and confirm all four suites pass. Report security issues privately (see `SECURITY.md`), not in a public issue.
+Describe what changed and why, name the tests you added, and confirm the full test run passed.
+Report security issues privately (see `SECURITY.md`).

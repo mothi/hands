@@ -2,80 +2,22 @@
 """Hermetic tests for quota.py: stub curl and codex CLIs on PATH answer from fixtures/, in a
 sandbox HOME and jobs root. No network, no credential, no model call.
 Run: python3 tests/test_quota.py"""
-import json, os, subprocess, sys, tempfile, time, unittest
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from unittest import mock
 
-TESTS = os.path.dirname(os.path.abspath(__file__))
-QUOTA = os.path.join(os.path.dirname(TESTS), 'quota.py')
-FX = os.path.join(TESTS, 'fixtures')
+import harness
+
+QUOTA = os.path.join(harness.ROOT, 'quota.py')
+FX = harness.FIXTURES
+QUOTA_STUBS = os.path.join(harness.STUBS, 'quota')
 POOLS = ('claude', 'codex', 'opencode')
-
-# A run inside a Claude Code session inherits the driver's inbox socket; nothing here may reach it.
-# opencode's key file resolves XDG_DATA_HOME first and the codex stub CODEX_HOME before HOME, as
-# the real CLIs do: unset, so no test reads a real login (test_47 sets XDG_DATA_HOME itself).
-for _name in ('CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'XDG_DATA_HOME',
-              'CODEX_HOME'):
-    os.environ.pop(_name, None)
-
-# curl: the URL picks a fixture; QUOTA_STUB_<POOL>=<path>|FAIL overrides it. Headers come as -H
-# values, or on stdin when a value is @- (as quota.py passes the bearer).
-CURL = r'''#!/bin/sh
-url=""; for a in "$@"; do case "$a" in http*) url="$a";; esac; done
-[ -n "${QUOTA_CALL_LOG:-}" ] && echo "curl $url" >>"$QUOTA_CALL_LOG"
-[ -n "${QUOTA_ARGV_LOG:-}" ] && echo "curl $*" >>"$QUOTA_ARGV_LOG"
-hdrs=$(for a in "$@"; do echo "$a"; done; for a in "$@"; do [ "$a" = @- ] && cat; done)
-[ -n "${QUOTA_AUTH_LOG:-}" ] && printf '%s\n' "$hdrs" | grep '^Authorization:' >>"$QUOTA_AUTH_LOG"
-pick() { [ "$1" = FAIL ] && exit 6; cat "$1"; exit 0; }
-case "$url" in
-  *opencode.ai*) pick "${QUOTA_STUB_OPENCODE:-@FX@/quota-opencode-happy.json}" ;;
-  *) exit 6 ;;
-esac
-'''
-
-# codex: the app-server as codex-cli 0.160 speaks quota.py's exchange. It answers initialize,
-# then account/rateLimits/read with the fixture's {"result": ...} or {"error": ...}. A read whose
-# stdin is at EOF by its answer is dropped, as the real one drops it. No auth.json answers the
-# recorded no-login error. QUOTA_STUB_CODEX=<path>|FAIL|HANG|LINGER.
-CODEX = r'''#!/usr/bin/env python3
-import json, os, select, sys, time
-if os.environ.get("QUOTA_CALL_LOG"):
-    open(os.environ["QUOTA_CALL_LOG"], "a").write(" ".join(["codex"] + sys.argv[1:]) + "\n")
-f = os.environ.get("QUOTA_STUB_CODEX") or "@FX@/quota-codex-happy.json"
-if f == "FAIL": sys.exit(6)
-if f == "HANG": time.sleep(3600)
-linger = f == "LINGER"   # answers, then ignores stdin EOF
-if linger: f = "@FX@/quota-codex-happy.json"
-# what the live server sends between the initialize answer and the read answer, and a non-JSON line
-LIVE = "".join(json.dumps(n) + "\n" for n in (
-    {"method": "remoteControl/status/changed", "params": {"installationId": "FAKEFIXTUREID0000",
-                                                          "status": "disabled"}},
-    {"method": "account/updated", "params": {"authMode": "chatgpt"}})) + "not json\n"
-home = os.environ.get("CODEX_HOME") or os.path.join(os.environ["HOME"], ".codex")
-if not os.path.exists(os.path.join(home, "auth.json")):
-    f = "@FX@/quota-codex-no-login.json"
-buf, eof = b"", False
-while not eof:
-    c = os.read(0, 65536)
-    eof, buf = not c, buf + c
-    while b"\n" in buf:
-        line, buf = buf.split(b"\n", 1)
-        m = json.loads(line)
-        if "id" not in m: continue
-        if m["method"] == "initialize":
-            answer = {"id": m["id"], "result": {"userAgent": "stub"}}
-            sys.stdout.write(json.dumps(answer) + "\n" + LIVE)
-        else:   # the backend round trip: a stdin at EOF by its end has shut the server down
-            time.sleep(0.5)
-            if select.select([0], [], [], 0)[0]:
-                c = os.read(0, 65536)
-                if not c: sys.exit(0)
-                buf += c
-            sys.stdout.write(json.dumps(dict(json.load(open(f)), id=m["id"])) + "\n")
-        sys.stdout.flush()
-        if linger and m["method"] != "initialize": time.sleep(3600)
-'''
-
-# Tripwires: the claude reading reads no credential and calls nothing. These only log a call.
-TRIPWIRE = '#!/bin/sh\n[ -n "${QUOTA_CALL_LOG:-}" ] && echo "%s $*" >>"$QUOTA_CALL_LOG"\nexit 1\n'
 
 
 def read(path):
@@ -132,10 +74,12 @@ class Quota(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory(prefix='quota-test.')
         sb = cls.sb = cls.tmp.name
-        for name, text in (('curl', CURL), ('codex', CODEX)):
-            write(os.path.join(sb, 'bin', name), text.replace('@FX@', FX), 0o755)
+        bin_dir = os.path.join(sb, 'bin')
+        os.makedirs(bin_dir)
+        for name in ('curl', 'codex'):
+            shutil.copy(os.path.join(QUOTA_STUBS, name), bin_dir)
         for name in ('security', 'claude'):
-            write(os.path.join(sb, 'bin', name), TRIPWIRE % name, 0o755)
+            shutil.copy(os.path.join(QUOTA_STUBS, 'tripwire'), os.path.join(bin_dir, name))
         write(os.path.join(sb, 'home', '.codex', 'auth.json'),
               '{"tokens":{"access_token":"tok-test","account_id":"acct-test"}}')
         write(os.path.join(sb, 'home', '.local', 'share', 'opencode', 'auth.json'),
@@ -153,11 +97,18 @@ class Quota(unittest.TestCase):
     def path(self, *parts):
         return os.path.join(self.sb, *parts)
 
+    def environment(self, **changes):
+        # The caller's seat and credentials must stay outside the quota sandbox.
+        excluded = harness.DRIVER_NAMES | {'CODEX_HOME', 'XDG_DATA_HOME'}
+        env = {name: value for name, value in os.environ.items() if name not in excluded}
+        env.update(HOME=self.path('home'), PATH=self.path('bin') + os.pathsep + os.environ['PATH'],
+                   TMPDIR=self.path('tmp'), XDG_STATE_HOME=self.path('state'), QUOTA_FIXTURES=FX)
+        env.update(changes)
+        return env
+
     def run_quota(self, *args, **env):
-        base = {'HOME': self.path('home'), 'PATH': self.path('bin') + ':' + os.environ['PATH'],
-                'TMPDIR': self.path('tmp'), 'XDG_STATE_HOME': self.path('state')}
         done = subprocess.run([sys.executable, QUOTA] + list(args), capture_output=True,
-                              text=True, timeout=90, env=dict(os.environ, **dict(base, **env)))
+                              text=True, timeout=90, env=self.environment(**env))
         self.assertEqual(done.returncode, 0, done.stderr)   # quota always exits 0
         return done.stdout
 
@@ -169,38 +120,38 @@ class Quota(unittest.TestCase):
     def windows(self, reading):
         return [(w['name'], w['used_pct']) for w in reading['windows']]
 
-    def test_01_all_three_pools_read(self):
+    def test_all_three_pools_read(self):
         pools = self.pools()
         self.assertEqual(list(pools), list(POOLS))
         self.assertTrue(all(p['status'] == 'ok' for p in pools.values()), pools)
 
-    def test_02_claude_reads_the_last_event_of_its_stream(self):
+    def test_claude_reads_the_last_event_of_its_stream(self):
         claude = self.pools('claude')['claude']
         self.assertEqual(self.windows(claude), [('week', 43.0), ('5h', 26.0)])   # x100, week first
         self.assertTrue(all(w['resets_at'] for w in claude['windows']))
         self.assertIsInstance(claude['age_s'], int)
 
-    def test_03_codex_window_is_named_by_its_length(self):
+    def test_codex_window_is_named_by_its_length(self):
         codex = self.pools('codex')['codex']
         self.assertEqual(self.windows(codex), [('week', 40)])   # 10080 minutes, secondary null
         self.assertTrue(codex['windows'][0]['resets_at'])
 
-    def test_04_codex_identity_never_reaches_output(self):
+    def test_codex_identity_never_reaches_output(self):
         for args in (('--json',), ()):
             out = self.run_quota(*args)
             self.assertNotRegex(out, 'FAKEFIXTUREID|fixture-must-never-appear')
 
-    def test_06_opencode_lists_its_three_windows_longest_first(self):
+    def test_opencode_lists_its_three_windows_longest_first(self):
         opencode = self.pools('opencode')['opencode']
         self.assertEqual(self.windows(opencode), [('month', 22), ('week', 8), ('rolling', 0)])
 
-    def test_07_a_reply_that_is_not_json_is_unknown(self):   # opencode's 404 page
+    def test_a_reply_that_is_not_json_is_unknown(self):   # opencode's 404 page
         opencode = self.pools('opencode', QUOTA_STUB_OPENCODE=FX + '/quota-opencode-404.html')
         self.assertEqual(opencode['opencode']['status'], 'unknown')
         self.assertEqual(opencode['opencode']['why'], 'the reply is not JSON')
         self.assertEqual(opencode['opencode']['windows'], [])
 
-    def test_08_an_error_reply_carries_the_provider_message(self):
+    def test_an_error_reply_carries_the_provider_message(self):
         # the parse is the same for every pool: an Anthropic 429 envelope, served as opencode's
         opencode = self.pools('opencode',
                               QUOTA_STUB_OPENCODE=FX + '/quota-claude-429.json')['opencode']
@@ -208,12 +159,12 @@ class Quota(unittest.TestCase):
         self.assertEqual(opencode['why'], 'Number of requests has exceeded your rate limit. '
                                           'Please try again later.')
 
-    def test_09_an_absent_percentage_is_no_window_never_zero(self):
+    def test_an_absent_percentage_is_no_window_never_zero(self):
         codex = self.pools('codex', QUOTA_STUB_CODEX=FX + '/quota-codex-absent-pct.json')['codex']
         self.assertEqual((codex['status'], codex['why']),
                          ('unknown', 'the reply has no usage windows'))
 
-    def test_43_codex_windows_are_told_apart_by_length_not_name(self):
+    def test_codex_windows_are_told_apart_by_length_not_name(self):
         # primary has been the weekly window, then the 5-hour one: only the length is stable
         out = self.run_quota('--json', 'codex',
                              QUOTA_STUB_CODEX=FX + '/quota-codex-two-window.json')
@@ -221,15 +172,15 @@ class Quota(unittest.TestCase):
         self.assertEqual(self.windows(codex), [('week', 16), ('5h', 92)])
         self.assertNotRegex(out, 'FAKEFIXTUREID|fixture-must-never-appear')
 
-    def test_44_the_board_line_lists_windows_longest_first(self):
+    def test_the_board_line_lists_windows_longest_first(self):
         out = self.run_quota('opencode')
         self.assertRegex(out, r'^opencode  month 22%.*, week 8%.*, rolling 0%')
 
-    def test_45_the_board_line_for_two_codex_windows(self):   # both reset in the past: no "resets"
+    def test_the_board_line_for_two_codex_windows(self):   # both reset in the past: no "resets"
         out = self.run_quota('codex', QUOTA_STUB_CODEX=FX + '/quota-codex-two-window.json')
         self.assertEqual(out, 'codex     week 16%, 5h 92%\n')
 
-    def test_13_nothing_to_read_is_all_unknown(self):
+    def test_nothing_to_read_is_all_unknown(self):
         empty = self.path('empty')
         pools = self.pools(HOME=empty, XDG_STATE_HOME=empty)
         self.assertTrue(all(p['status'] == 'unknown' for p in pools.values()), pools)
@@ -238,24 +189,24 @@ class Quota(unittest.TestCase):
                          'codex account authentication required to read rate limits')
         self.assertTrue(pools['opencode']['why'].startswith('no login in '))
 
-    def test_15_one_board_line_per_pool(self):
+    def test_one_board_line_per_pool(self):
         lines = self.run_quota().splitlines()
         self.assertEqual([line.split()[0] for line in lines], list(POOLS))
 
-    def test_16_provider_arguments_pick_the_pools_in_order(self):
+    def test_provider_arguments_pick_the_pools_in_order(self):
         self.assertEqual(list(self.pools('codex', 'opencode')), ['codex', 'opencode'])
 
-    def test_17_an_unknown_argument_is_ignored(self):
+    def test_an_unknown_argument_is_ignored(self):
         self.assertEqual(len(self.run_quota('--bogus-flag').splitlines()), 3)   # and exit 0
 
-    def test_20_an_odd_reply_makes_only_its_own_pool_unknown(self):
+    def test_an_odd_reply_makes_only_its_own_pool_unknown(self):
         write(self.path('opencode-usage-list.json'), '{"usage":["x"]}')
         pools = self.pools(QUOTA_STUB_OPENCODE=self.path('opencode-usage-list.json'))
         self.assertEqual(pools['opencode']['why'], 'the reply has an unexpected shape')
         self.assertEqual([pools[p]['status'] for p in ('claude', 'codex')], ['ok'] * 2)
 
-    def test_21_a_claude_utilization_that_is_text_is_unknown(self):
-        state = self.path('t21')
+    def test_a_claude_utilization_that_is_text_is_unknown(self):
+        state = self.path('text-utilization')
         stream(os.path.join(state, 'hands', 'j', 'stream.jsonl'), 0,
                '{"type":"rate_limit_event","rate_limit_info":{"unifiedWindows":'
                '{"five_hour":{"utilization":"26","resetsAt":9999999999}}}}')
@@ -263,13 +214,13 @@ class Quota(unittest.TestCase):
         self.assertEqual((claude['status'], claude['why']),
                          ('unknown', 'the reply has an unexpected shape'))
 
-    def test_22_a_codex_length_that_is_not_a_number_keeps_the_window_name(self):
+    def test_a_codex_length_that_is_not_a_number_keeps_the_window_name(self):
         write(self.path('codex-mins-text.json'), '{"result":{"rateLimits":{"primary":'
               '{"usedPercent":40,"windowDurationMins":"300"}}}}')
         codex = self.pools('codex', QUOTA_STUB_CODEX=self.path('codex-mins-text.json'))['codex']
         self.assertEqual(self.windows(codex), [('primary', 40)])
 
-    def test_29_provider_text_is_masked(self):
+    def test_provider_text_is_masked(self):
         write(self.path('leak.json'), '{"type":"error","error":{"type":"auth_error","message":'
               '"Bad token sk-ant-oat01-LEAKLEAKLEAKLEAK and id 0123456789012345678901234567890123'
               '456789ABCD were rejected. Re-authenticate."}}')
@@ -278,18 +229,18 @@ class Quota(unittest.TestCase):
         self.assertIn('Re-authenticate', why)
         self.assertLessEqual(len(why), 200)
 
-    def test_34_the_newest_reading_wins(self):
+    def test_the_newest_reading_wins(self):
         # the most recently written stream, and in it the last event
-        state = self.path('t34')
+        state = self.path('newest')
         stream(os.path.join(state, 'hands', 'old', 'stream.jsonl'), 600, rate_event(0.90, 0.90))
         stream(os.path.join(state, 'hands', 'new', 'stream.jsonl'), 30, rate_event(0.11, 0.12),
                '{"type":"assistant"}', rate_event(0.15, 0.16))
         claude = self.pools('claude', XDG_STATE_HOME=state)['claude']
         self.assertEqual(self.windows(claude), [('week', 16.0), ('5h', 15.0)])
 
-    def test_35_a_quoted_event_is_text_not_a_reading(self):
+    def test_a_quoted_event_is_text_not_a_reading(self):
         # a codex seat discussing an event, written later than the real claude stream
-        state = self.path('t35')
+        state = self.path('quoted')
         stream(os.path.join(state, 'hands', 'claude', 'stream.jsonl'), 300, rate_event(0.21, 0.22))
         quoted = json.dumps({'type': 'item.completed', 'item': {
             'type': 'agent_message', 'text': rate_event(0.99, 0.99)}})
@@ -297,16 +248,16 @@ class Quota(unittest.TestCase):
         claude = self.pools('claude', XDG_STATE_HOME=state)['claude']
         self.assertEqual(self.windows(claude), [('week', 22.0), ('5h', 21.0)])
 
-    def test_36_an_old_reading_is_shown_with_its_age_in_hours(self):
-        state = self.path('t36')
+    def test_an_old_reading_is_shown_with_its_age_in_hours(self):
+        state = self.path('old-reading')
         stream(os.path.join(state, 'hands', 'claude', 'stream.jsonl'), 7200, rate_event(0.30, 0.40))
         out = self.run_quota('claude', XDG_STATE_HOME=state)
         self.assertRegex(out, r'^claude    week 40% \(resets in 2d\), '
                               r'5h 30% \(resets in \d+[mh]\); '
                               r'read 2h ago; refresh: hands\.sh --probe claude\n$')
 
-    def test_37_a_window_reset_since_the_reading_is_dropped(self):
-        state = self.path('t37')
+    def test_a_window_reset_since_the_reading_is_dropped(self):
+        state = self.path('reset-window')
         stream(os.path.join(state, 'hands', 'claude', 'stream.jsonl'), 60,
                rate_event(0.95, 0.40, int(time.time()) - 10))
         claude = self.pools('claude', XDG_STATE_HOME=state)['claude']
@@ -315,9 +266,9 @@ class Quota(unittest.TestCase):
         out = self.run_quota('claude', XDG_STATE_HOME=state)
         self.assertIn('s ago, before the 5h reset; refresh: hands.sh --probe claude', out)
 
-    def test_38_an_event_without_unified_windows_is_not_a_reading(self):
+    def test_an_event_without_unified_windows_is_not_a_reading(self):
         # the older event shape, in a stream whose text mentions the field: the next stream counts
-        state = self.path('t38')
+        state = self.path('old-shape')
         stream(os.path.join(state, 'hands', 'b', 'stream.jsonl'), 300, rate_event(0.31, 0.32))
         stream(os.path.join(state, 'hands', 'a', 'stream.jsonl'), 10,
                '{"type":"assistant","message":{"content":[{"type":"text",'
@@ -327,33 +278,33 @@ class Quota(unittest.TestCase):
         claude = self.pools('claude', XDG_STATE_HOME=state)['claude']
         self.assertEqual(self.windows(claude), [('week', 32.0), ('5h', 31.0)])
 
-    def test_39_a_fresh_reading_says_its_age_in_seconds(self):
+    def test_a_fresh_reading_says_its_age_in_seconds(self):
         out = self.run_quota('claude')
         self.assertRegex(out, r'^claude    week 43% \(resets in 2d\), '
                               r'5h 26% \(resets in \d+[mh]\); '
                               r'read \d+s ago; refresh: hands\.sh --probe claude\n$')
 
-    def test_40_the_claude_reading_calls_nothing(self):   # no keychain, no curl, no claude CLI
-        log = self.path('calls40.log')
+    def test_the_claude_reading_calls_nothing(self):   # no keychain, no curl, no claude CLI
+        log = self.path('calls-claude.log')
         write(log, '')
         self.assertEqual(self.pools('claude', QUOTA_CALL_LOG=log)['claude']['status'], 'ok')
         self.assertEqual(read(log), '')
 
-    def test_41_a_real_recorded_claude_stream(self):
-        state = self.path('t41')
+    def test_a_real_recorded_claude_stream(self):
+        state = self.path('recorded-reading')
         replay(FX + '/claude-stream-ratelimit.jsonl', state)
         claude = self.pools('claude', XDG_STATE_HOME=state)['claude']
         self.assertEqual(self.windows(claude), [('week', 37.0), ('5h', 12.0)])
 
-    def test_47_the_opencode_key_comes_from_xdg_data_home_first(self):
-        data, log = self.path('xdg47'), self.path('auth47.log')
+    def test_the_opencode_key_comes_from_xdg_data_home_first(self):
+        data, log = self.path('xdg-data'), self.path('auth-xdg.log')
         write(os.path.join(data, 'opencode', 'auth.json'), '{"opencode-go":{"key":"sk-xdg47"}}')
         self.run_quota('opencode', QUOTA_AUTH_LOG=log, XDG_DATA_HOME=data)
         self.assertEqual(read(log), 'Authorization: Bearer sk-xdg47\n')
 
-    def test_48_a_model_limit_is_listed_apart_never_a_window(self):
+    def test_a_model_limit_is_listed_apart_never_a_window(self):
         # the recorded fable event carries seven_day_overage_included 97 beside week 58
-        state = self.path('t48')
+        state = self.path('model-limit')
         replay(FX + '/claude-stream-fable-scoped.jsonl', state)
         claude = self.pools('claude', XDG_STATE_HOME=state)['claude']
         self.assertEqual([w['name'] for w in claude['windows']], ['week', '5h'])
@@ -365,28 +316,26 @@ class Quota(unittest.TestCase):
         self.assertRegex(out, r'^claude    week 58%.*, '
                               r'seven_day_overage_included 97% \(one model\); read ')
 
-    def test_50_codex_calls_no_endpoint_and_reads_no_credential(self):
-        home, log = self.path('home50'), self.path('calls50.log')
+    def test_codex_calls_no_endpoint_and_reads_no_credential(self):
+        home, log = self.path('unreadable-auth-home'), self.path('calls-codex.log')
         login = os.path.join(home, '.codex', 'auth.json')
         write(login, read(self.path('home', '.codex', 'auth.json')), 0)   # unreadable
         codex = self.pools('codex', HOME=home, QUOTA_CALL_LOG=log)['codex']
         self.assertEqual(self.windows(codex), [('week', 40)])
         self.assertEqual(read(log), 'codex --no-daemon app-server\n')
 
-    def test_51_one_deadline_bounds_the_codex_cli(self):
+    def test_one_deadline_bounds_the_codex_cli(self):
         # exits unanswered: unknown with its rc
         codex = self.pools('codex', QUOTA_STUB_CODEX='FAIL')['codex']
         self.assertEqual(codex['why'], 'codex app-server gave no answer (rc 6)')
         # never answers, or answers and never exits: the 20 s deadline kills its group. The two
         # run side by side, so the test waits for the deadline once
-        env = dict(os.environ, HOME=self.path('home'),
-                   PATH=self.path('bin') + ':' + os.environ['PATH'])
         start = time.time()
         runs = {}
         for mode in ('HANG', 'LINGER'):
             runs[mode] = subprocess.Popen([sys.executable, QUOTA, '--json', 'codex'],
                                           stdout=subprocess.PIPE, text=True,
-                                          env=dict(env, QUOTA_STUB_CODEX=mode))
+                                          env=self.environment(QUOTA_STUB_CODEX=mode))
         out = {mode: json.loads(run.communicate(timeout=60)[0])['pools'][0]
                for mode, run in runs.items()}
         self.assertTrue(19 <= time.time() - start <= 30)
@@ -397,21 +346,19 @@ class Quota(unittest.TestCase):
                               capture_output=True, text=True)
         self.assertEqual(left.stdout, '')   # no codex stub is left running
 
-    def test_52_the_bearer_never_rides_argv(self):
-        argv_log, auth_log = self.path('argv52'), self.path('auth52')
+    def test_the_bearer_never_rides_argv(self):
+        argv_log, auth_log = self.path('argv-bearer.log'), self.path('auth-bearer.log')
         self.run_quota('opencode', QUOTA_ARGV_LOG=argv_log, QUOTA_AUTH_LOG=auth_log)
         self.assertEqual(sorted(read(auth_log).splitlines()), ['Authorization: Bearer sk-test'])
         argv = read(argv_log)
         self.assertTrue(argv)
         self.assertNotIn('Bearer', argv)
 
-    def test_49_the_suite_env_carries_no_driver_inbox(self):
-        names = {'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CODEX_HOME'}
-        self.assertFalse(names & set(os.environ))
+    def test_the_suite_env_carries_no_driver_inbox(self):
+        names = harness.DRIVER_NAMES | {'CODEX_HOME', 'XDG_DATA_HOME'}
+        with mock.patch.dict(os.environ, dict.fromkeys(names, self.path('outside'))):
+            self.assertFalse(names & self.environment().keys())
 
 
 if __name__ == '__main__':
-    result = unittest.main(exit=False, verbosity=2).result
-    bad = len(result.failures) + len(result.errors)
-    print('test_quota: %d passed, %d failed' % (result.testsRun - bad, bad))
-    sys.exit(1 if bad else 0)
+    harness.main('test_quota')
