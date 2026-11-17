@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """The wrapper: the background process that runs one seat.
 
-A seat is a job dir with a live CLI in it. hands.py makes the job dir and starts the wrapper
-(spawn). The wrapper launches the CLI through wires.py, hands it each message that arrives
-(through the job dir's in.fifo, or the driver's inbox.jsonl), writes what the CLI says to
-events.jsonl, and closes each turn with its result.txt and envelope.json (close_turns). It runs
-until the CLI exits, the seat's deadline passes, or `hands.sh stop` ends it.
+hands.py makes the job dir and starts its wrapper (spawn). The wrapper launches the CLI
+through wires.py, delivers messages, writes events.jsonl, and closes each turn with its
+result.txt and envelope.json (close_turns). It runs until the CLI exits, the seat's deadline
+passes, or `hands.sh stop` ends it.
 
 Its command line is internal; hands.py calls it:
   spawn DIR FILE   start the seat's wrapper, with FILE as its first message
   send DIR FILE    deliver FILE to the seat's live wrapper (rc 3: there is none)
   reap SECS ARGV   run ARGV in its own process group for at most SECS seconds (0: no limit)
 
-A job dir holds session (the seat's handle), prompt.txt, in.fifo, stream.jsonl, stderr.log,
-events.jsonl, inbox.jsonl, outbox.jsonl, turn-N/{result.txt,envelope.json}, envelope.json,
-result.txt, driver, pushes.jsonl and job.log.
+The first message rides in the launch. A send must reach a live seat now or relaunch it, so
+it uses in.fifo. A nonblocking open tells the sender at once whether the wrapper is reading.
+The wrapper closes the pipe under the delivery lock when it leaves. Mail goes to inbox.jsonl
+so it can wait on disk with no seat running. Mail never starts a seat.
+
+See the README's Job dir reference for the files and event fields.
 
 Python 3 standard library only.
 """
@@ -68,7 +70,7 @@ def main(args):
     job_dir = os.path.realpath(args[1])
     handle = read_json(os.path.join(job_dir, 'session'))
     if not handle or not os.path.isfile(args[2]):
-        print('seat.py: %s needs a persistent seat dir (a session handle) and an existing FILE'
+        print('seat.py: %s needs a persistent job dir with a handle and an existing FILE'
               % command, file=sys.stderr)
         return 2
     return (spawn if command == 'spawn' else send)(job_dir, handle, args[2])
@@ -584,8 +586,8 @@ class Wrapper:
     def forget_session(self, session, turn):
         """Delete the stored session of a turn whose agent went away mid-turn (a stop, a crash,
         a kill), so nothing resumes it later: opencode's background service would. It runs
-        before the turn's envelope is written, so a sync buy's stop never races it. A turn the
-        deadline ended keeps its session."""
+        before the turn's envelope is written, so the one-shot run's stop never races it.
+        A turn the deadline ended keeps its session."""
         if self.past_deadline:
             return
         argv = wires.forget_command(self.provider, session, self.handle.get('cli'))
@@ -609,7 +611,13 @@ class Wrapper:
 
 
 class SeatState:
-    """What deliveries and waits need from events.jsonl, read incrementally."""
+    """Turn counters and other delivery state, read incrementally from events.jsonl.
+
+    For example, after turn 1 starts, turn and expected are 1 and ended is 0. A queued
+    message raises expected to 2. When turn 1 ends, ended becomes 1. When turn 2 starts,
+    turn becomes 2. Ending turn 2 brings all three to 2. Deliveries record expected as
+    the expect field.
+    """
 
     def __init__(self, job_dir):
         self.path = os.path.join(job_dir, 'events.jsonl')
@@ -644,7 +652,14 @@ class SeatState:
         return self
 
     def next_turn(self, delivery, alive):
-        """The turn that will answer a message delivered now."""
+        """The turn that will answer a message delivered now.
+
+        Seat          Delivery   Turn
+        Relaunch      either     One after the latest started or ended.
+        Live          queue      One after the latest started, ended, or expected.
+        Live          steer      The latest started or expected if it has yet to end,
+                                 otherwise one after the latest ended.
+        """
         latest = max(self.turn, self.ended)
         if not alive or delivery == 'queue':
             return max(self.expected if alive else 0, latest) + 1

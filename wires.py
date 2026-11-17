@@ -56,6 +56,10 @@ def launch(handle, wrap, stderr_path, stream_path, last_turn, owner):
 # The vocabulary every wire shares
 
 
+EVENT_KINDS = frozenset(('turn_start', 'text', 'thought', 'tool_call', 'tool_result',
+                         'file', 'usage', 'turn_end', 'error', 'progress'))
+
+
 def now():
     """The local time in ISO 8601, to the second."""
     return datetime.datetime.now().astimezone().isoformat(timespec='seconds')
@@ -673,7 +677,7 @@ class AcpAgent(Rpc):
 
     def answer_request(self, request_id, method, params):
         """A permission request gets allow_once, else the first allow option: an "always"
-        answer could save a rule in the CLI's config. (fs and terminal were not offered.)"""
+        answer could save a rule in the CLI's config. Other requests use Rpc's default."""
         if method != 'session/request_permission':
             return Rpc.answer_request(self, request_id, method, params)
         choices = [c for c in params.get('options') or [] if isinstance(c, dict)]
@@ -1023,8 +1027,7 @@ def repeats(message):
 
     A streamed fragment (codex names them .../delta and ...Delta) belongs to an item that
     arrives whole at item/completed. And codex sends turn/diff/updated, the turn's whole diff,
-    again at every change, while each change is also a fileChange item. No translator reads
-    either, and together they were two thirds of the bytes of real codex seats' logs."""
+    again at every change, while individual changes arrive as fileChange items."""
     method = message.get('method') if isinstance(message, dict) else None
     return isinstance(method, str) and (method.lower().endswith('delta')
                                         or method == 'turn/diff/updated')

@@ -133,7 +133,7 @@ def main(args):
     if options.probe:
         return probe(options.probe)
     if len(args) >= 2:
-        return buy(args[0], args[1], options)
+        return start_seat(args[0], args[1], options)
     print(__doc__.rstrip())
     return 2
 
@@ -184,8 +184,8 @@ def cli_path(provider):
 # Starting a seat
 
 
-def buy(spec, prompt_file, options):
-    """Make the job dir and its prompt, then launch the seat."""
+def start_seat(spec, prompt_file, options):
+    """Prepare the job dir and launch a seat for either start or a one-shot run."""
     provider, _, model = spec.partition(':')
     if not re.fullmatch(r'[a-z0-9]+', provider):   # it names the job dir: only a plain name
         say("bad provider '%s' (%s)" % (provider, PROVIDER_NAMES))
@@ -264,8 +264,8 @@ def end_early(job_dir, status, provider, model, rc, options, reset='', reason=''
 
 
 def launch(provider, model, job_dir, options):
-    """Write the seat's handle, DIR/session, and spawn its wrapper. Without `start`, wait for
-    the answer, then stop whatever is left (a seat ends with its turn by itself).
+    """Write the handle and spawn the wrapper. A one-shot run waits for the answer, then
+    stops whatever is left (a seat ends with its turn by itself).
 
     The handle is what every relaunch resumes with: the provider, model and effort, the
     canonical cwd, the timeout, the CLI's path, and the session id the wrapper records."""
@@ -291,7 +291,7 @@ def launch(provider, model, job_dir, options):
     if options.start:
         return spawn(job_dir, prompt)
 
-    def interrupted(signum, frame):   # an interrupted start stops its seat first
+    def interrupted(signum, frame):   # an interrupted one-shot run stops its seat first
         sys.stdout.flush()
         stop(job_dir)
         sys.exit(128 + signum)
@@ -338,7 +338,7 @@ def send(job_dir, message_file):
     """The next turn. A live seat takes it now; a seat whose process is gone relaunches on its
     recorded session, with the same model, effort and cwd."""
     if not os.path.isfile(os.path.join(job_dir, 'session')):
-        say('%s is not a seat dir (it holds no session handle)' % job_dir)
+        say('%s is not a job dir (it holds no handle)' % job_dir)
         return 2
     job_dir = os.path.realpath(job_dir)
     if not os.path.isfile(message_file):

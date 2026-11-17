@@ -78,7 +78,7 @@ def efforts(value):
              'options': [{'value': x} for x in ('default', 'low', 'high')]}]
 
 
-# opencode 2.0.22: the set's reply carries the OLD value; a config update ~20 ms later the new one
+# The set's reply carries the current value, then a config update confirms the new one.
 LATE_UPDATE = [
     ('out', {'id': 1, 'method': 'initialize'}),
     ('in', answer(1, result={'protocolVersion': 1, 'agentCapabilities': {}})),

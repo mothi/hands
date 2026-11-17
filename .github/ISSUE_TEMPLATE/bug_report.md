@@ -12,7 +12,7 @@ labels: bug
 The `hands.sh` command you ran (with the prompt file's content, if it matters).
 
 **The envelope**
-The JSON line `wait` or the buy printed. Remove anything private first.
+The JSON line printed by `wait` or the one-shot run. Remove anything private first.
 
 **Versions**
 - macOS (or Linux) version:

@@ -14,9 +14,8 @@ STUB_MODE:
   stubborn    ignore stdin EOF; start a child in this process group; on a TERM, exit 0
   escape      as die, but a detached child keeps stdout open, so the client never sees EOF
   slow        each prompt answers STUB_SLEEP seconds late (default 2)
-  termcancel  on a TERM or stdin EOF, answer the open prompt 'cancelled', then exit (opencode 2.x)
-  termerror   on a TERM, answer the open prompt with the error opencode 2.0.22 sends when its
-              server died first, then exit 1
+  termcancel  on a TERM or stdin EOF, answer the open prompt 'cancelled', then exit 0
+  termerror   on a TERM, answer the open prompt with ServerUnavailable, then exit 1
 `opencode session ...` (the wrapper deleting an abandoned turn's session) logs its launch after a
 second, as a real delete takes a moment, and exits 0.
 `opencode api ...` is a push into the driver's session (stub.answer_push).

@@ -51,7 +51,7 @@ def save_driver_address(job_dir, live_seats):
     if here is None:
         return
     host, session, address = here
-    handles = [read_json(os.path.join(seat_dir, 'session')) or {} for seat_dir in live_seats()]
+    handles = [read_json(os.path.join(job, 'session')) or {} for job in live_seats()]
     seat_sessions = {handle['session'] for handle in handles if handle.get('session')}
     if seat_sessions & set(address + [session]):
         return

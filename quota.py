@@ -223,7 +223,7 @@ def read_codex():
         raise Unknown('codex app-server gave no answer (%s)' % why)
     reply = raise_if_error(answer.get('result', answer))
     found = []
-    for key in ('primary', 'secondary'):   # their meanings have swapped: go by the length
+    for key in ('primary', 'secondary'):   # the window length identifies the quota period
         value = (reply.get('rateLimits') or {}).get(key)
         if not isinstance(value, dict):
             continue

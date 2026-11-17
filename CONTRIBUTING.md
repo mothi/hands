@@ -46,7 +46,7 @@ and session ids, emails, tokens, local timestamps, and anything else that is you
   receives first. A seat's prompt is that box, a blank line, the task file, a blank line, and its
   job-dir line; the job dir's `prompt.txt` is exactly that input.
 - **The job dir is the only state.** No daemon, no registry, no cache file. A relaunch reads the
-  handle (`DIR/session`), and `events.jsonl` is the truth.
+  handle, and `events.jsonl` is the truth. See the [job dir reference](README.md#job-dir-reference).
 - **Typed failure, never a retry loop.** Every turn ends in an envelope with a status the caller
   can act on; quota deaths carry their reset time.
 - **Fix the defect, don't add state.** Prefer one general rule over a provider-specific branch,

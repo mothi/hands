@@ -61,7 +61,7 @@ class CommandLine(unittest.TestCase):
         self.assertEqual((idle.rc, idle.out, idle.err), (2, '', 'hands: unknown flag --idle\n'))
 
     def test_an_unknown_provider_is_refused_with_an_error_envelope(self):
-        job, run = SB.buy('unknown', 'badprov')
+        job, run = SB.one_shot('unknown', 'badprov')
         self.assertEqual(run.rc, 2)
         self.assertEqual((envelope(job)['status'], envelope(job)['provider']), ('error', 'badprov'))
 
@@ -77,14 +77,14 @@ class CommandLine(unittest.TestCase):
         self.assertIn("unknown provider 'gemini' (claude|codex|opencode)", run.err)
 
     def test_a_missing_task_file_is_refused_with_a_full_envelope(self):
-        job, run = SB.buy('missing-task', 'claude:sonnet', task=SB.path('nope.md'))
+        job, run = SB.one_shot('missing-task', 'claude:sonnet', task=SB.path('nope.md'))
         self.assertEqual(run.rc, 2)
         self.assertNoLaunch(job)
         keys = {'status', 'provider', 'model', 'effort', 'rc', 'seconds', 'reset', 'dir', 'usage'}
         self.assertLessEqual(keys, set(envelope(job)))
         self.assertIsNone(envelope(job)['effort'])
-        job, _ = SB.buy('missing-task-effort', 'claude:sonnet', '--effort', 'xhigh',
-                        task=SB.path('nope.md'))
+        job, _ = SB.one_shot('missing-task-effort', 'claude:sonnet', '--effort', 'xhigh',
+                             task=SB.path('nope.md'))
         self.assertEqual(envelope(job)['effort'], 'xhigh')   # the effort a relaunch would run at
 
     def test_a_provider_name_must_be_plain_lowercase(self):
@@ -112,14 +112,14 @@ class CommandLine(unittest.TestCase):
         self.assertIn('must PRECEDE the provider positional', run.out + run.err)
 
     def test_an_out_dir_in_use_is_refused(self):
-        SB.buy('in-use', 'claude:sonnet', task=SB.path('nope.md'))
-        self.assertEqual(SB.buy('in-use', 'claude:sonnet')[1].rc, 2)
+        SB.one_shot('in-use', 'claude:sonnet', task=SB.path('nope.md'))
+        self.assertEqual(SB.one_shot('in-use', 'claude:sonnet')[1].rc, 2)
 
     def test_a_non_empty_out_dir_is_refused_and_left_alone(self):
         job = SB.path('not-empty')
         os.makedirs(job)
         SB.write('not-empty/notes.txt', 'keep')
-        _, run = SB.buy('not-empty', 'claude:sonnet')
+        _, run = SB.one_shot('not-empty', 'claude:sonnet')
         self.assertEqual(run.rc, 2)
         self.assertIn('is not empty', run.err)
         self.assertEqual(os.listdir(job), ['notes.txt'])
@@ -127,14 +127,14 @@ class CommandLine(unittest.TestCase):
 
     def test_an_opencode_seat_names_provider_slash_model(self):
         for name, spec in (('oc-no-model', 'opencode'), ('oc-no-slash', 'opencode:foo')):
-            job, run = SB.buy(name, spec, '--effort', 'low')
+            job, run = SB.one_shot(name, spec, '--effort', 'low')
             self.assertEqual(run.rc, 2)
             self.assertEqual((envelope(job)['status'], envelope(job)['reason']),
                              ('refused', 'model-required'))
             self.assertNoLaunch(job)
 
     def test_send_refusals_come_before_any_launch(self):
-        job, _ = SB.buy('no-session', 'claude:sonnet', STUB_MODE='authfail')
+        job, _ = SB.one_shot('no-session', 'claude:sonnet', STUB_MODE='authfail')
         log = SB.stub_log(job)
         launched = len(log.launches())
         run = SB.send(job)
@@ -144,14 +144,16 @@ class CommandLine(unittest.TestCase):
                          ('refused', 'no-session', 2))
         self.assertEqual(envelope(job)['reason'], 'no-session')
         self.assertIn('recorded no session', run.err)
-        handle_less, _ = SB.buy('no-handle', 'claude:sonnet', task=SB.path('nope.md'))
-        self.assertEqual(SB.send(handle_less).rc, 2)
-        seat_dir, _ = SB.buy('send-args', 'claude:sonnet')
-        self.assertEqual(SB.send(seat_dir, SB.path('nope.md')).rc, 2)
-        self.assertEqual(SB.hands('send', seat_dir).rc, 2)
+        handle_less, _ = SB.one_shot('no-handle', 'claude:sonnet', task=SB.path('nope.md'))
+        run = SB.send(handle_less)
+        self.assertEqual(run.rc, 2)
+        self.assertEqual(run.err, 'hands: %s is not a job dir (it holds no handle)\n' % handle_less)
+        job_dir, _ = SB.one_shot('send-args', 'claude:sonnet')
+        self.assertEqual(SB.send(job_dir, SB.path('nope.md')).rc, 2)
+        self.assertEqual(SB.hands('send', job_dir).rc, 2)
 
     def test_a_send_to_a_seat_whose_provider_hands_does_not_run_is_refused_in_one_line(self):
-        job, _ = SB.buy('unrun-provider', 'claude:sonnet')
+        job, _ = SB.one_shot('unrun-provider', 'claude:sonnet')
         path = os.path.join(job, 'session')
         handle = dict(json.loads(read_text(path)), provider='gone', model='gone-1')
         with open(path, 'w') as f:   # a handle naming a provider hands does not run
@@ -172,7 +174,7 @@ class SeatPrompt(unittest.TestCase):
         os.makedirs(SB.path('elsewhere'))
         cls.opencode, _ = SB.start('prompt-opencode', 'opencode:opencode-go/deepseek-v4.1-flash',
                                    '--effort', 'low', '--cwd', SB.path('elsewhere'))
-        cls.claude, _ = SB.buy('prompt-claude', 'claude:sonnet')
+        cls.claude, _ = SB.one_shot('prompt-claude', 'claude:sonnet')
         SB.wait(cls.opencode)
         SB.stop(cls.opencode)
 
@@ -304,7 +306,7 @@ class Verbs(unittest.TestCase):
         self.assertEqual((final['status'], final['rc']), ('incomplete', 143))
 
     def test_a_bad_wait_argument_is_one_usage_line(self):
-        job, _ = SB.buy('wait-args', 'claude:sonnet', task=SB.path('nope.md'))
+        job, _ = SB.one_shot('wait-args', 'claude:sonnet', task=SB.path('nope.md'))
         usage = ' (usage: hands.sh wait DIR [--for turn|mail|exit] [--timeout S])\n'
         for args, problem in ((['--timeout', 'x'], '--timeout takes seconds'),
                               (['--for', 'nothing'],
@@ -316,7 +318,7 @@ class Verbs(unittest.TestCase):
             self.assertEqual((run.rc, run.out, run.err), (2, '', 'hands: ' + problem + usage), args)
 
     def test_mail_with_no_text_says_so(self):
-        job, _ = SB.buy('mail-no-text', 'claude:sonnet', task=SB.path('nope.md'))
+        job, _ = SB.one_shot('mail-no-text', 'claude:sonnet', task=SB.path('nope.md'))
         run = SB.hands('mail', job)
         self.assertEqual((run.rc, run.out), (2, ''))
         self.assertEqual(run.err, 'hands: mail needs a text (usage: hands.sh mail DIR TEXT)\n')
@@ -335,7 +337,7 @@ class Verbs(unittest.TestCase):
         self.assertEqual(os.listdir(other), ['notes.txt'])
 
     def test_wait_on_a_job_dir_with_no_handle_prints_its_envelope(self):
-        job, _ = SB.buy('wait-no-handle', 'claude:sonnet', task=SB.path('nope.md'))
+        job, _ = SB.one_shot('wait-no-handle', 'claude:sonnet', task=SB.path('nope.md'))
         self.assertFalse(os.path.exists(os.path.join(job, 'session')))
         run = SB.wait(job, '--timeout', '5')
         self.assertEqual(run.rc, 1)
@@ -367,15 +369,15 @@ class Verbs(unittest.TestCase):
         self.assertEqual((run.json['status'], run.json['reason'], run.json['turn']),
                          ('incomplete', 'wrapper-gone', 2))
 
-    def test_a_signalled_one_shot_buy_stops_its_seat_first(self):
+    def test_a_signalled_one_shot_run_stops_its_seat_first(self):
         job = SB.path('signalled')
-        buy = SB.popen('--out', job, 'claude:sonnet', SB.task, STUB_MODE='park',
+        run = SB.popen('--out', job, 'claude:sonnet', SB.task, STUB_MODE='park',
                        STUB_LOG=job + '.stub.jsonl')
         self.assertTrue(wait_until(lambda: SB.stub_log(job).seats()[0].parked))
         cli = SB.stub_log(job).seats()[0].pid
-        buy.send_signal(signal.SIGTERM)
-        buy.communicate(timeout=30)
-        self.assertEqual(buy.returncode, 143)
+        run.send_signal(signal.SIGTERM)
+        run.communicate(timeout=30)
+        self.assertEqual(run.returncode, 143)
         self.assertEqual(harness.wrapper_pids(job), [])
         self.assertFalse(harness.alive(cli))
         self.assertEqual(envelope(job)['status'], 'incomplete')
@@ -535,7 +537,7 @@ class JobsRoot(unittest.TestCase):
     def mode(self, path):
         return os.stat(path).st_mode & 0o777
 
-    def test_a_buy_without_out_lands_in_the_jobs_root(self):
+    def test_a_one_shot_run_without_out_lands_in_the_jobs_root(self):
         os.makedirs(SB.path('home-a'))
         os.makedirs(SB.path('home-b'))
         SB.hands('--cwd', SB.work, 'codex:gpt-5.6-terra', SB.task,
@@ -555,14 +557,14 @@ class JobsRoot(unittest.TestCase):
         self.assertFalse(os.path.exists(SB.path('tmp', 'relative')))
 
     def test_an_out_dir_is_private_and_its_parent_is_not(self):
-        SB.buy('out-parent/x', 'codex:gpt-5.6-terra', '--cwd', SB.work)
+        SB.one_shot('out-parent/x', 'codex:gpt-5.6-terra', '--cwd', SB.work)
         mask = os.umask(0)
         os.umask(mask)
         self.assertEqual(self.mode(SB.path('out-parent')), 0o777 & ~mask)
         self.assertEqual(self.mode(SB.path('out-parent', 'x')), 0o700)
         os.makedirs(SB.path('out-existing'))
         os.chmod(SB.path('out-existing'), 0o755)
-        SB.buy('out-existing', 'codex:gpt-5.6-terra', '--cwd', SB.work)
+        SB.one_shot('out-existing', 'codex:gpt-5.6-terra', '--cwd', SB.work)
         self.assertEqual(self.mode(SB.path('out-existing')), 0o700)
 
     def test_the_sweep_deletes_only_idle_dirs_hands_named(self):
@@ -570,7 +572,7 @@ class JobsRoot(unittest.TestCase):
         root = os.path.join(state, 'hands')
         SB.hands('--cwd', SB.work, 'codex:gpt-5.6-terra', SB.task, XDG_STATE_HOME=state)
         SB.hands('--probe', 'claude', XDG_STATE_HOME=state)
-        real = os.listdir(root)   # a buy's dir and a probe's, as hands names them today
+        real = os.listdir(root)   # a one-shot run's dir and a probe's
         names = ['20250101-000000-codex-1', 'probe-1-claude', '20250101-000000-codex-2',
                  '20250101-000000-codex-3', 'keepme', '20250101-000000-codex-4',
                  '20250101-000000-codex-6']
@@ -612,9 +614,9 @@ class JobsRoot(unittest.TestCase):
         self.assertEqual(os.listdir(elsewhere), ['session'])
         self.assertEqual(len(real), 2)
         self.assertTrue(any(n.startswith('probe-') for n in real))
-        self.assertFalse(set(real) & left)   # today's names are swept too
+        self.assertFalse(set(real) & left)   # also removes the dirs that the commands made
         made = [n for n in self.own_dirs(root) if not n.startswith('2025')]
-        self.assertEqual(len(made), 1)   # the buy's own dir is made
+        self.assertEqual(len(made), 1)   # the one-shot run makes its own dir
 
     def test_a_resume_is_use(self):
         state = SB.path('resume-state')

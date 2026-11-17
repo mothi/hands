@@ -1,6 +1,6 @@
 ---
 name: hands
-description: Run a task on another provider's model as a subagent seat — codex (gpt-5.6 sol/terra/luna, gpt-6 astra), opencode (Go plan: deepseek-v4.1-flash, muse-spark-1.3-contributor), or claude (opus, fable 5.1), chosen per call. A seat is a job dir with a session in it, whose CLI runs while it has a turn and ends with its last one — start it, send it turns, mail it, wait on it, read its events — and every turn ends in a typed envelope. Use when the user says hands, ask codex, or wants a second opinion from another model. Bare "hands" with no task = interactive guided setup (the quota board, then a few questions).
+description: Run a task on another provider's model as a subagent seat — codex (gpt-5.6 sol/terra/luna, gpt-6 astra), opencode (Go plan: deepseek-v4.1-flash, muse-spark-1.3-contributor), or claude (opus, fable 5.1), chosen per call. A seat runs in its own job dir. Its CLI runs while it has a turn and ends with its last one — start it, send it turns, mail it, wait on it, read its events — and every turn ends in a typed envelope. Use when the user says hands, ask codex, or wants a second opinion from another model. Bare "hands" with no task = interactive guided setup (the quota board, then a few questions).
 ---
 
 # hands: subagent seats on other providers' CLIs
@@ -25,7 +25,7 @@ $H quota                           # the quota board: read-only, it never spends
 
 ## Rules for the calling agent
 
-- Buy real work with `start` and keep working. Never run `wait` in the foreground: it blocks
+- Start real work with `start` and keep working. Never run `wait` in the foreground: it blocks
   your session for the whole turn. In Claude Code, Codex and OpenCode each turn's answer arrives
   as a push, a new message in your session; in a plain shell, run `wait` as a background
   command, or poll `wait DIR --timeout 60`.
@@ -49,15 +49,15 @@ $H quota                           # the quota board: read-only, it never spends
 - Each provider's quota is one shared pool, so spread parallel seats across providers. Start at
   most 3 at once unless the user asks for more, and never start several without saying so.
 - hands collects answers; the judgment is yours (or one more seat's, as a judge).
-- Buy a seat for another model's view, isolation or parallel work, not for what you can answer
-  yourself. Continue a seat with `send`: a new seat pays its CLI's start-up prompt again (about
+- Start a seat when you need another model's view, isolation or parallel work.
+  Continue a seat with `send`: a new seat pays its CLI's start-up prompt again (about
   34k tokens for Claude, mostly cached).
 
 ## The seat
 
 - A seat is its job dir: `--out DIR` (new or empty), else a fresh dir in the jobs root
   (`$XDG_STATE_HOME/hands`, else `~/.local/state/hands`). A dir there that nothing wrote to for
-  30 days is deleted at the next buy; pass `--out` elsewhere to keep one.
+  30 days is deleted the next time a seat starts. Pass `--out` elsewhere to keep one.
 - Each turn lands whole when it ends: `DIR/turn-N/result.txt` and `DIR/turn-N/envelope.json`.
   `DIR/envelope.json` is the latest turn's. No envelope means not finished, never finished empty.
 - Judge whether a seat is alive by the age of the last `DIR/events.jsonl` line or an open tool
@@ -79,7 +79,7 @@ $H quota                           # the quota board: read-only, it never spends
 session, turn, delivery, and a reason when there is one.
 
 - `refused` comes before any prompt (`model-mismatch`, `effort-unsupported`, `model-required`,
-  `no-session`): fix the buy.
+  `no-session`): correct the command.
 - `timeout`, `incomplete`, `cancelled` and `truncated` keep the session: `send` continues it.
 - `provider-quota-dead`: wait until `reset`, and don't retry before it.
 - `usage` is the turn's own tokens: `in` (uncached), `cache_read`, `cache_write`, `out`, and

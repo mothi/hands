@@ -129,7 +129,7 @@ class Sandbox:
                          **self.seat_env(job, env))
         return job, run
 
-    def buy(self, name, spec, *flags, task=None, **env):
+    def one_shot(self, name, spec, *flags, task=None, **env):
         """The one-shot form: start, wait for the turn, stop -> (the job dir, the run)."""
         job = self.path(name)
         run = self.hands(*flags, '--out', job, spec, task or self.task,

@@ -2,7 +2,7 @@
 """Tests for seat.py and the wires it runs: one class per kind of seat (ACP, codex, claude),
 then the reaper, pushes to the driver, and the failure text classifier.
 
-Each test buys seats through hands.sh with stub CLIs standing in for the providers
+Each test runs seats through hands.sh with stub CLIs standing in for the providers
 (tests/stubs), and reads back the job dir and what the stub logged. The ACP and codex stubs
 replay transcripts recorded from the real CLIs (tests/fixtures).
 Run: python3 tests/test_seat.py"""
@@ -22,14 +22,13 @@ from harness import (OPENCODE_SESSION, envelope, events, first_index, read_json,
 
 import push
 import wires
+from wires import EVENT_KINDS
 
 SB = None
 SLOW_LAUNCH = None
 OPENCODE = 'opencode:opencode-go/deepseek-v4.1-flash'
 CODEX = 'codex:gpt-5.6-terra'
 CLAUDE = 'claude:sonnet'
-KINDS = {'turn_start', 'text', 'thought', 'tool_call', 'tool_result', 'file', 'usage',
-         'turn_end', 'error', 'progress'}
 CODEX_ARGV = ['--no-daemon', '--disable', 'memories', '--disable', 'hooks',
               '-c', 'web_search="live"', 'app-server']
 CODEX_USAGE = {'in': 6, 'out': 3, 'cache_read': 4, 'reasoning': 1}   # the stub's two calls
@@ -104,7 +103,7 @@ class SeatChecks(unittest.TestCase):
         calls = {e.get('call') for e in found if e['kind'] == 'tool_call'}
         for e in found:
             self.assertIsInstance(e.get('t'), str)
-            self.assertIn(e.get('kind'), KINDS)
+            self.assertIn(e.get('kind'), EVENT_KINDS)
             self.assertIsInstance(e.get('turn'), int)
         self.assertLessEqual(set(kinds), {e['kind'] for e in found})
         self.assertEqual([e['turn'] for e in ends], list(range(1, len(ends) + 1)))
@@ -285,9 +284,9 @@ class AcpLaunch(SeatChecks):
 
     def test_what_the_agent_does_not_list_is_refused_before_any_prompt(self):
         refusals = [
-            SB.buy('acp-effort-xhigh', OPENCODE, '--effort', 'xhigh', '--cwd', SB.path('gdir'))
+            SB.one_shot('acp-effort-xhigh', OPENCODE, '--effort', 'xhigh', '--cwd', SB.path('gdir'))
             + ('effort-unsupported',),
-            SB.buy('acp-no-effort', OPENCODE, '--cwd', SB.path('gdir'))
+            SB.one_shot('acp-no-effort', OPENCODE, '--cwd', SB.path('gdir'))
             + ('effort-unsupported',),   # the engine never guesses one
             SB.start('acp-no-model', 'opencode:opencode-go/nope-9.9', '--effort', 'low',
                      '--cwd', SB.path('gdir')) + ('model-mismatch',),       # never substituted
@@ -310,7 +309,7 @@ class AcpLaunch(SeatChecks):
         text = read_text(os.path.join(harness.FIXTURES, 'opencode-openrouter-402.txt'))
         rows = harness.first_prompt_fails(harness.transcript('opencode-acp-seat-sample.jsonl'),
                                           text)
-        job, _ = SB.buy('acp-402', OPENCODE, '--effort', 'low', STUB_REPLAY=save('402.jsonl', rows))
+        job, _ = SB.one_shot('acp-402', OPENCODE, '--effort', 'low', STUB_REPLAY=save('402.jsonl', rows))
         self.assertEqual((envelope(job)['status'], envelope(job)['session']),
                          ('provider-quota-dead', OPENCODE_SESSION))
 
@@ -318,8 +317,8 @@ class AcpLaunch(SeatChecks):
         text = read_text(os.path.join(harness.FIXTURES, 'opencode-missing-api-key.txt'))
         rows = harness.first_prompt_fails(harness.transcript('opencode-acp-seat-sample.jsonl'),
                                           text)
-        job, _ = SB.buy('acp-no-key', OPENCODE, '--effort', 'low',
-                        STUB_REPLAY=save('no-key.jsonl', rows))
+        job, _ = SB.one_shot('acp-no-key', OPENCODE, '--effort', 'low',
+                             STUB_REPLAY=save('no-key.jsonl', rows))
         end = envelope(job)
         self.assertEqual((end['status'], end['rc'], end['session']),
                          ('auth-expired', 1, OPENCODE_SESSION))
@@ -363,17 +362,17 @@ class AcpClose(SeatChecks):
                          ('incomplete', 143, 1, OPENCODE_SESSION))
 
     def test_a_deadline_mid_turn_is_a_timeout_that_keeps_its_session(self):
-        job, _ = SB.buy('acp-deadline', OPENCODE, '--effort', 'low', '--timeout', '3',
-                        '--cwd', SB.path('gdir'), STUB_REPLAY=hung('opencode'))
+        job, _ = SB.one_shot('acp-deadline', OPENCODE, '--effort', 'low', '--timeout', '3',
+                             '--cwd', SB.path('gdir'), STUB_REPLAY=hung('opencode'))
         end = envelope(job)
         self.assertEqual((end['status'], end['rc'], end['turn'], end['session']),
                          ('timeout', 142, 1, OPENCODE_SESSION))
         self.assertEqual(agent(job).ended[:1], ['eof'])   # closed politely: stdin first, no TERM
 
     def test_a_turn_the_agent_cancels_at_the_deadline_is_still_a_timeout(self):
-        job, _ = SB.buy('acp-deadline-oc', OPENCODE, '--effort', 'low', '--timeout', '3',
-                        '--cwd', SB.path('gdir'), STUB_REPLAY=hung('opencode'),
-                        STUB_MODE='termcancel')
+        job, _ = SB.one_shot('acp-deadline-oc', OPENCODE, '--effort', 'low', '--timeout', '3',
+                             '--cwd', SB.path('gdir'), STUB_REPLAY=hung('opencode'),
+                             STUB_MODE='termcancel')
         end = envelope(job)
         self.assertEqual((end['status'], end['rc'], end['turn'], end['session']),
                          ('timeout', 142, 1, OPENCODE_SESSION))
@@ -443,7 +442,7 @@ class AcpClose(SeatChecks):
         self.assertEqual(result(job, 2), 'PONG')
         self.assertEqual([e.get('idle') for e in progress(job, 'exit rc=')], [True, True])
 
-    def test_a_seat_bought_without_a_timeout_has_no_deadline(self):
+    def test_a_seat_started_without_a_timeout_has_no_deadline(self):
         job, _ = SB.start('acp-no-limit', OPENCODE, '--effort', 'low', '--cwd', SB.path('gdir'),
                           STUB_REPLAY=hung('opencode'))
         self.assertTrue(wait_until(lambda: prompted(job)))
@@ -628,7 +627,7 @@ class CodexSeats(SeatChecks):
         self.assertEqual(texts, ['SECOND'])   # the whole item, never its fragments
 
     def test_file_changes_become_file_events(self):
-        job, _ = SB.buy('codex-files', CODEX, '--cwd', SB.work, STUB_MODE='files')
+        job, _ = SB.one_shot('codex-files', CODEX, '--cwd', SB.work, STUB_MODE='files')
         found = events(job)
         self.assertEqual([(e['call'], e['path']) for e in found if e['kind'] == 'file'],
                          [('fc-7', '/w/file-1.txt'), ('fc-11', '/w/file-2.txt'),
@@ -641,8 +640,8 @@ class CodexSeats(SeatChecks):
         limit = read_text(os.path.join(harness.FIXTURES, 'codex-usage-limit.txt'))
         statuses = {}
         for mode in ('quota', 'noticedeath', 'notice', 'quoted', 'quotedfail'):
-            job, _ = SB.buy('codex-fail-' + mode, CODEX, '--cwd', SB.work, STUB_MODE=mode,
-                            STUB_FAIL_TEXT=limit)
+            job, _ = SB.one_shot('codex-fail-' + mode, CODEX, '--cwd', SB.work, STUB_MODE=mode,
+                                 STUB_FAIL_TEXT=limit)
             statuses[mode] = envelope(job)['status']
         self.assertEqual(statuses, {'quota': 'provider-quota-dead',
                                     'noticedeath': 'provider-quota-dead',   # the notice types it
@@ -651,14 +650,14 @@ class CodexSeats(SeatChecks):
                                     'quotedfail': 'error'})
         self.assertIn('Aug', envelope(SB.path('codex-fail-quota'))['reset'])
         billing = read_text(os.path.join(harness.FIXTURES, 'codex-api-insufficient-quota.txt'))
-        job, _ = SB.buy('codex-fail-billing', CODEX, '--cwd', SB.work, STUB_MODE='quota',
-                        STUB_FAIL_TEXT=billing.strip())
+        job, _ = SB.one_shot('codex-fail-billing', CODEX, '--cwd', SB.work, STUB_MODE='quota',
+                             STUB_FAIL_TEXT=billing.strip())
         self.assertEqual(envelope(job)['status'], 'provider-quota-dead')
         # the turn the dead app-server cut keeps the usage it reported, normalized
         self.assertEqual(envelope(SB.path('codex-fail-noticedeath'))['usage'],
                          {'in': 4, 'out': 2, 'cache_read': 2, 'reasoning': 1})
-        job, _ = SB.buy('codex-refused', CODEX, '--cwd', SB.work, STUB_MODE='refuse',
-                        STUB_FAIL_TEXT='invalid params: effort')
+        job, _ = SB.one_shot('codex-refused', CODEX, '--cwd', SB.work, STUB_MODE='refuse',
+                             STUB_FAIL_TEXT='invalid params: effort')
         self.assertEqual((envelope(job)['status'], envelope(job)['turn']), ('error', 1))
         self.assertIn('turn/start refused: -32602 invalid params: effort',
                       read_text(os.path.join(job, 'events.jsonl')))
@@ -764,8 +763,8 @@ class CodexSeats(SeatChecks):
         self.assertFalse(os.path.exists(os.path.join(job, 'turn-4')))
 
     def test_a_deadline_closes_politely_and_leaves_a_resumable_checkpoint(self):
-        job, _ = SB.buy('codex-deadline', CODEX, '--effort', 'high', '--timeout', '3',
-                        '--cwd', SB.work, STUB_MODE='park')
+        job, _ = SB.one_shot('codex-deadline', CODEX, '--effort', 'high', '--timeout', '3',
+                             '--cwd', SB.work, STUB_MODE='park')
         self.assertInterrupted(job, 'timeout', 142)
         relaunched = SB.send(job).json
         SB.wait(job, '--timeout', '30')
@@ -811,11 +810,11 @@ class CodexSeats(SeatChecks):
                          {'in': 506, 'out': 53, 'cache_read': 4, 'reasoning': 1})
 
     def test_a_collaborators_thread_is_not_the_seats(self):
-        job, _ = SB.buy('codex-collab', CODEX, '--cwd', SB.work, STUB_MODE='subagent')
+        job, _ = SB.one_shot('codex-collab', CODEX, '--cwd', SB.work, STUB_MODE='subagent')
         self.assertCollaboratorIsNotTheSeat(job)
 
     def test_a_main_answer_before_the_collaborator_ends_still_answers(self):
-        job, _ = SB.buy('codex-collab-late', CODEX, '--cwd', SB.work, STUB_MODE='latesub')
+        job, _ = SB.one_shot('codex-collab-late', CODEX, '--cwd', SB.work, STUB_MODE='latesub')
         self.assertCollaboratorIsNotTheSeat(job)
 
     def test_a_turn_whose_completion_never_comes_runs_until_a_stop(self):
@@ -834,18 +833,18 @@ class CodexSeats(SeatChecks):
         self.assertFalse(os.path.exists(os.path.join(job, 'turn-2')))
 
     def test_an_unauthorized_turn_is_auth_expired(self):
-        job, _ = SB.buy('codex-unauthorized', CODEX, '--cwd', SB.work, STUB_MODE='unauthorized')
+        job, _ = SB.one_shot('codex-unauthorized', CODEX, '--cwd', SB.work, STUB_MODE='unauthorized')
         self.assertEqual((envelope(job)['status'], envelope(job)['turn']), ('auth-expired', 1))
 
     def test_a_malformed_line_is_kept_raw_and_skipped(self):
-        job, _ = SB.buy('codex-bad-line', CODEX, '--cwd', SB.work, STUB_MODE='badline')
+        job, _ = SB.one_shot('codex-bad-line', CODEX, '--cwd', SB.work, STUB_MODE='badline')
         self.assertEqual((envelope(job)['status'], result(job)), ('ok', 'stub ok'))
         stream = harness.read_jsonl(os.path.join(job, 'stream.jsonl'))
         self.assertEqual(len([r for r in stream if r['dir'] == 'in' and isinstance(r['msg'], str)]),
                          1)
 
-    def test_a_one_shot_codex_buy_persists_its_thread(self):
-        job, _ = SB.buy('codex-one-shot', CODEX)
+    def test_a_one_shot_codex_run_persists_its_thread(self):
+        job, _ = SB.one_shot('codex-one-shot', CODEX)
         start = agent(job).messages()[2]
         self.assertEqual(start[0], 'thread/start')
         self.assertIs(start[1]['ephemeral'], False)   # what a resume needs
@@ -863,7 +862,7 @@ class CodexSeats(SeatChecks):
         SB.stop(job)
 
     def test_an_answer_followed_by_a_tool_is_voided(self):
-        job, _ = SB.buy('codex-no-final', CODEX, STUB_MODE='nofinal')
+        job, _ = SB.one_shot('codex-no-final', CODEX, STUB_MODE='nofinal')
         self.assertEqual((envelope(job)['status'], envelope(job)['reason']), ('error', 'empty'))
         self.assertFalse(os.path.exists(os.path.join(job, 'result.txt')))
         self.assertEqual(len([e for e in events(job)
@@ -888,7 +887,7 @@ class CodexSeats(SeatChecks):
         self.assertEqual(steers, [[{'type': 'text', 'text': mail}]])
 
     def test_each_seat_runs_a_private_app_server(self):
-        job, _ = SB.buy('codex-private', CODEX)
+        job, _ = SB.one_shot('codex-private', CODEX)
         for launch in SB.stub_log(job).seats():
             self.assertEqual(launch.argv[-1:], ['app-server'])   # on stdio, its own process
             self.assertIn('--no-daemon', launch.argv)
@@ -903,7 +902,7 @@ class CodexSeats(SeatChecks):
 class ClaudeSeats(SeatChecks):
     @classmethod
     def setUpClass(cls):
-        cls.one_shot, _ = SB.buy('claude-one-shot', CLAUDE)
+        cls.one_shot, _ = SB.one_shot('claude-one-shot', CLAUDE)
 
     def option(self, launch, flag):
         return launch.argv[launch.argv.index(flag) + 1]
@@ -929,7 +928,7 @@ class ClaudeSeats(SeatChecks):
         self.assertSettings(cli)
 
     def test_a_seat_that_died_mid_turn_still_has_its_session(self):
-        job, _ = SB.buy('claude-died', CLAUDE, STUB_MODE='initonly')
+        job, _ = SB.one_shot('claude-died', CLAUDE, STUB_MODE='initonly')
         self.assertNotEqual(envelope(job)['status'], 'ok')
         self.assertEqual(envelope(job)['session'], 'sess-stub')   # read from the first event
         path = os.path.join(job, 'result.txt')
@@ -937,13 +936,13 @@ class ClaudeSeats(SeatChecks):
 
     def test_a_recorded_claude_stream(self):
         replay = os.path.join(harness.FIXTURES, 'claude-stream-sample.jsonl')
-        job, _ = SB.buy('claude-wire', CLAUDE, STUB_MODE='replay', STUB_REPLAY=replay)
+        job, _ = SB.one_shot('claude-wire', CLAUDE, STUB_MODE='replay', STUB_REPLAY=replay)
         self.assertEqual(result(job), 'ok')
         self.assertEqual((envelope(job)['status'], envelope(job)['session']),
                          ('ok', '49c93750-efa1-4e50-9d05-6470e8eb5512'))
 
     def test_a_process_the_seat_forgot_dies_with_it(self):
-        job, _ = SB.buy('claude-straggler', CLAUDE, STUB_MODE='straggler')
+        job, _ = SB.one_shot('claude-straggler', CLAUDE, STUB_MODE='straggler')
         child = agent(job).children[0]
         try:
             self.assertEqual(envelope(job)['status'], 'ok')
@@ -953,11 +952,11 @@ class ClaudeSeats(SeatChecks):
 
     def test_a_cli_killed_from_outside_still_yields_its_session(self):
         job = SB.path('claude-killed')
-        buy = SB.popen('--out', job, CLAUDE, SB.task, STUB_MODE='park',
+        run = SB.popen('--out', job, CLAUDE, SB.task, STUB_MODE='park',
                        STUB_LOG=job + '.stub.jsonl')
         self.assertTrue(wait_until(lambda: agent(job).parked))
         os.kill(agent(job).pid, signal.SIGTERM)
-        buy.communicate(timeout=30)
+        run.communicate(timeout=30)
         end = envelope(job)
         self.assertNotEqual(end['status'], 'ok')
         self.assertEqual((end['rc'], end['session']), (143, 'sess-stub'))
@@ -1039,7 +1038,7 @@ class ClaudeSeats(SeatChecks):
     def test_failures_are_typed_from_provider_fields_and_stderr(self):
         statuses = {}
         for mode in ('quoted', 'quotedfail', 'quota', 'authfail'):
-            job, _ = SB.buy('claude-fail-' + mode, CLAUDE, '--cwd', SB.path('tmp'), STUB_MODE=mode)
+            job, _ = SB.one_shot('claude-fail-' + mode, CLAUDE, '--cwd', SB.path('tmp'), STUB_MODE=mode)
             statuses[mode] = (envelope(job)['status'], envelope(job)['rc'])
         self.assertEqual(statuses['quoted'][0], 'ok')              # a quote is text
         self.assertEqual(statuses['quotedfail'], ('error', 1))     # a failure that quotes one
@@ -1048,15 +1047,15 @@ class ClaudeSeats(SeatChecks):
         self.assertEqual(statuses['authfail'][0], 'auth-expired')
         # an API-key seat out of credit: the same type, with no reset to wait for
         credit = read_text(os.path.join(harness.FIXTURES, 'claude-api-credit-low.txt'))
-        job, _ = SB.buy('claude-fail-credit', CLAUDE, '--cwd', SB.path('tmp'), STUB_MODE='quota',
-                        STUB_FAIL_TEXT=credit.strip())
+        job, _ = SB.one_shot('claude-fail-credit', CLAUDE, '--cwd', SB.path('tmp'), STUB_MODE='quota',
+                             STUB_FAIL_TEXT=credit.strip())
         self.assertEqual((envelope(job)['status'], envelope(job)['reset']),
                          ('provider-quota-dead', None))
 
     def test_a_deadline_mid_turn_is_a_timeout_that_keeps_its_session(self):
         for mode in ('park', 'deaf'):   # deaf ignores the TERM too: only the KILL ends it
-            job, _ = SB.buy('claude-deadline-' + mode, CLAUDE, '--timeout', '3',
-                            '--cwd', SB.path('tmp'), STUB_MODE=mode)
+            job, _ = SB.one_shot('claude-deadline-' + mode, CLAUDE, '--timeout', '3',
+                                 '--cwd', SB.path('tmp'), STUB_MODE=mode)
             end = envelope(job)
             self.assertEqual((end['status'], end['rc'], end['session'], end['turn']),
                              ('timeout', 142, 'sess-stub', 1), mode)
@@ -1288,8 +1287,8 @@ class Reaper(unittest.TestCase):
                         'sh -c \'echo $$ > "$T71_PID"; exec sleep 300\' &\n'
                         'cat >/dev/null\nsleep 300\n')
         os.chmod(path, 0o755)
-        job, _ = SB.buy('reaper-timeout', CODEX, '--timeout', '1', T71_PID=pidfile,
-                        PATH=shim + os.pathsep + SB.env['PATH'])
+        job, _ = SB.one_shot('reaper-timeout', CODEX, '--timeout', '1', T71_PID=pidfile,
+                             PATH=shim + os.pathsep + SB.env['PATH'])
         grandchild = int(read_text(pidfile))
         try:
             self.assertEqual((envelope(job)['status'], envelope(job)['rc']), ('timeout', 142))
@@ -1375,7 +1374,7 @@ class Pushes(unittest.TestCase):
             self.assertFalse({'error', 'reply'} & set(found[0]))   # no reply is read
 
     def test_a_turn_end_posts_one_push(self):
-        job, _ = SB.buy('push-ok', CLAUDE, '--cwd', SB.path('tmp'), **self.driver_env())
+        job, _ = SB.one_shot('push-ok', CLAUDE, '--cwd', SB.path('tmp'), **self.driver_env())
         self.assertPushed(job, 'ok', 'claude:sonnet t1 ok: bg=1 mem=1 turn=1', 'bg=1 mem=1 turn=1')
         self.assertOutcome(job, 'posted')
 
@@ -1398,14 +1397,14 @@ class Pushes(unittest.TestCase):
         self.assertEqual('\n'.join(mails[-1][2][4:]), 'one line')
 
     def test_no_socket_is_no_push_and_a_dead_one_is_survived(self):
-        job, _ = SB.buy('push-none', CLAUDE)
+        job, _ = SB.one_shot('push-none', CLAUDE)
         self.assertFalse(os.path.exists(os.path.join(job, 'driver')))
         self.assertFalse(os.path.exists(os.path.join(job, 'pushes.jsonl')))
         self.assertEqual(self.outcomes(job), [])
         self.assertEqual(envelope(job)['status'], 'ok')
-        job, _ = SB.buy('push-dead', CLAUDE, '--cwd', SB.path('tmp'),
-                        CLAUDE_CODE_MESSAGING_SOCKET=SB.path('nope.sock'),
-                        CLAUDE_CODE_MESSAGING_TOKEN='tok-stub')
+        job, _ = SB.one_shot('push-dead', CLAUDE, '--cwd', SB.path('tmp'),
+                             CLAUDE_CODE_MESSAGING_SOCKET=SB.path('nope.sock'),
+                             CLAUDE_CODE_MESSAGING_TOKEN='tok-stub')
         self.assertTrue(os.path.getsize(os.path.join(job, 'driver')))
         self.assertEqual(envelope(job)['status'], 'ok')
         self.assertOutcome(job, 'failed', 'No such file')
@@ -1671,8 +1670,8 @@ class Pushes(unittest.TestCase):
         try:
             for name, reply in replies.items():
                 self.socket.reply = reply
-                job, _ = SB.buy('push-reply-' + name, CLAUDE, '--cwd', SB.path('tmp'),
-                                **self.driver_env())
+                job, _ = SB.one_shot('push-reply-' + name, CLAUDE, '--cwd', SB.path('tmp'),
+                                     **self.driver_env())
                 self.assertOutcome(job, 'posted')
         finally:
             self.socket.reply = None
@@ -1689,8 +1688,8 @@ class Pushes(unittest.TestCase):
 
     def test_a_long_answer_is_clipped_in_its_push(self):
         task = SB.write('long.md', 'x' * 5000 + '\n')
-        job, _ = SB.buy('push-long', CLAUDE, '--cwd', SB.path('tmp'), task=task,
-                        STUB_MODE='echo', **self.driver_env())
+        job, _ = SB.one_shot('push-long', CLAUDE, '--cwd', SB.path('tmp'), task=task,
+                             STUB_MODE='echo', **self.driver_env())
         self.assertTrue(self.wait_for_push(job, 'ok'))
         text = self.socket.pushes(job, 'ok')[0][2]
         answer = result(job, 1).strip()
@@ -1706,8 +1705,8 @@ class Pushes(unittest.TestCase):
         answers = {'claude': 'bg=1 mem=1 turn=1', 'codex': 'stub ok', 'opencode': 'PONG'}
         every_host = self.driver_env(CODEX_THREAD_ID='test-th', OPENCODE_SESSION_ID='test-ses')
         for cli, spec in harness.SPECS.items():
-            job, _ = SB.buy('push-wire-' + cli, spec, '--effort', 'low', '--cwd', SB.path('tmp'),
-                            **every_host)
+            job, _ = SB.one_shot('push-wire-' + cli, spec, '--effort', 'low', '--cwd', SB.path('tmp'),
+                                 **every_host)
             self.assertEqual(read_json(os.path.join(job, 'driver')),   # the first host wins
                              {'host': 'claude', 'address': [self.socket.path, 'tok-stub']})
             self.assertPushed(job, 'ok', '%s t1 ok: %s' % (spec, answers[cli]), answers[cli])
@@ -1743,8 +1742,8 @@ class Pushes(unittest.TestCase):
     def test_a_relaunch_captures_the_socket_and_hides_it(self):
         answers = {'claude': 'bg=1 mem=1 turn=1', 'codex': 'stub ok', 'opencode': 'PONG'}
         for cli, spec in harness.SPECS.items():
-            job, _ = SB.buy('push-relaunch-' + cli, spec, '--effort', 'low',
-                            '--cwd', SB.path('tmp'))   # bought with no socket
+            job, _ = SB.one_shot('push-relaunch-' + cli, spec, '--effort', 'low',
+                                 '--cwd', SB.path('tmp'))   # launched without a driver address
             replay = {}
             if cli == 'opencode':
                 replay['STUB_REPLAY'] = os.path.join(harness.FIXTURES,
@@ -1789,7 +1788,7 @@ class Pushes(unittest.TestCase):
     def test_capture_never_writes_through_a_link(self):
         env = dict(CLAUDE_CODE_MESSAGING_SOCKET=SB.path('no-socket'),
                    CLAUDE_CODE_MESSAGING_TOKEN='tok-200')
-        job, _ = SB.buy('push-capture-link', CLAUDE, '--cwd', SB.path('tmp'), **env)
+        job, _ = SB.one_shot('push-capture-link', CLAUDE, '--cwd', SB.path('tmp'), **env)
         victim = SB.write('capture-victim', 'keep')
         driver = os.path.join(job, 'driver')
         os.unlink(driver)
@@ -1821,7 +1820,7 @@ class HostPushes(unittest.TestCase):
         hosts = (('codex', 'CODEX_THREAD_ID', 'test-th-1'),
                  ('opencode', 'OPENCODE_SESSION_ID', 'test-ses/1'))
         for host, name, session in hosts:
-            job, _ = SB.buy('host-' + host, CLAUDE, '--cwd', SB.path('tmp'), **{name: session})
+            job, _ = SB.one_shot('host-' + host, CLAUDE, '--cwd', SB.path('tmp'), **{name: session})
             push = self.pushes(job)[0]
             self.assertEqual(push['cli'], host)
             self.assertEqual(len(push['argv']), 5)
@@ -1847,8 +1846,8 @@ class HostPushes(unittest.TestCase):
             self.assertFalse([env for env in seen if name in env])   # the seat's CLI, the push
 
     def test_a_push_that_fails_or_hangs_is_logged_and_the_seat_goes_on(self):
-        job, _ = SB.buy('host-fail', CLAUDE, '--cwd', SB.path('tmp'), CODEX_THREAD_ID='test-th-2',
-                        STUB_PUSH_RC='3', STUB_PUSH_SAYS='thread not found')
+        job, _ = SB.one_shot('host-fail', CLAUDE, '--cwd', SB.path('tmp'), CODEX_THREAD_ID='test-th-2',
+                             STUB_PUSH_RC='3', STUB_PUSH_SAYS='thread not found')
         found = self.outcome(job)
         self.assertEqual((found['push'], found['error'], found['pending']),
                          ('failed', 'codex exit 3: thread not found', 1))
@@ -1856,7 +1855,7 @@ class HostPushes(unittest.TestCase):
         self.assertTrue(harness.gone(job))
         self.assertEqual(len(self.pushes(job, 2)), 2)   # when it was logged, and the exit's retry
         self.assertEqual(push.pending_count(job), 1)
-        # started, not bought: a stop gives what is in flight 10 s, then ends it
+        # With start, the test can stop the seat while its exit is still in progress.
         job, _ = SB.start('host-hang', CLAUDE, '--cwd', SB.path('tmp'),
                           OPENCODE_SESSION_ID='test-ses-2', STUB_PUSH_SLEEP='60')
         try:
@@ -1908,8 +1907,8 @@ class HostPushes(unittest.TestCase):
             self.assertTrue(wait_until(lambda: read_json(os.path.join(parent, 'session'))
                                        ['session'] == CODEX_THREAD))
             # a command the codex seat runs is named its own thread
-            child, _ = SB.buy('host-child', CLAUDE, '--cwd', SB.path('tmp'),
-                              CODEX_THREAD_ID=CODEX_THREAD)
+            child, _ = SB.one_shot('host-child', CLAUDE, '--cwd', SB.path('tmp'),
+                                   CODEX_THREAD_ID=CODEX_THREAD)
             self.assertEqual(envelope(child)['status'], 'ok')
             self.assertFalse(os.path.exists(os.path.join(child, 'driver')))
             time.sleep(0.5)
