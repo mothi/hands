@@ -88,23 +88,24 @@ PROBE_SPECS = {   # each provider's smallest model; an ACP seat names an effort 
 
 
 def main(args):
-    rebind()
-    if args[:1] == ['quota']:
+    verb = args[0] if args else None
+    if verb == 'quota':
         return quota.main(args[1:])
-    if args[:1] == ['ps']:
-        if len(args) != 1:
-            say('usage: hands.sh ps')
-            return 2
-        return ps()
-    if args[:1] == ['send']:
-        if len(args) != 3:
-            say('usage: hands.sh send DIR FILE')
-            return 2
-        return send(args[1], args[2])
-    if args[:1] in (['mail'], ['wait'], ['events'], ['stop']):
+    if verb in ('ps', 'send', 'mail', 'wait', 'events', 'stop'):
+        rebind()
+        if verb == 'ps':
+            if len(args) != 1:
+                say('usage: hands.sh ps')
+                return 2
+            return ps()
+        if verb == 'send':
+            if len(args) != 3:
+                say('usage: hands.sh send DIR FILE')
+                return 2
+            return send(args[1], args[2])
         return run_verb(args)
     options = Options()
-    if args[:1] == ['start']:
+    if verb == 'start':
         options.start = True
         args = args[1:]
     while args:
@@ -130,12 +131,13 @@ def main(args):
         else:
             break
         args = args[1:]
+    if not options.probe and len(args) < 2:
+        print(__doc__.rstrip())
+        return 2
+    rebind()
     if options.probe:
         return probe(options.probe)
-    if len(args) >= 2:
-        return start_seat(args[0], args[1], options)
-    print(__doc__.rstrip())
-    return 2
+    return start_seat(args[0], args[1], options)
 
 
 def rebind():
@@ -462,13 +464,18 @@ def wait(job_dir, handle, mode, timeout):
     started = time.time()
     state = seat.SeatState(job_dir)
     outbox = os.path.join(job_dir, 'outbox.jsonl')
-    outbox_size = seat.file_size(outbox)
+    outbox_offset, outbox_size = wires.line_end_and_size(outbox) if mode == 'mail' else (0, 0)
     checks = 0
     while True:
         state.read()
-        if mode == 'mail' and seat.file_size(outbox) > outbox_size:
-            sys.stdout.write(wires.read_lines(outbox, outbox_size)[0])
-            return 0
+        if mode == 'mail':
+            size = seat.file_size(outbox)
+            if size > outbox_size:
+                text, _ = wires.read_lines(outbox, outbox_offset)
+                if text:
+                    sys.stdout.write(text)
+                    return 0
+                outbox_size = size
         if handle and mode != 'exit' and state.expected and state.ended >= state.expected:
             return print_result(job_dir)   # an idle seat mails nothing more
         if checks % 4 == 0:

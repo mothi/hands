@@ -23,8 +23,7 @@ from wires import (DEADLINE_RC, append_json, clip, event, open_regular, parse_js
 # Each push is first logged in DIR/pushes.jsonl, then sent by send_pending, the only sender. The
 # log also holds a cursor, {"sent": K}: the first K pushes reached the driver, and the rest are
 # pending. A push that fails stays pending until the seat's next push, its wrapper's exit, its
-# next launch, or any hands.sh command the driver session runs (rebind_seats), which knows the
-# session's address now.
+# next launch, or a driver command like `ps` (rebind_seats), which knows the session's address now.
 
 
 def driver_here():

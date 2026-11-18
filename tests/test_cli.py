@@ -54,6 +54,21 @@ class CommandLine(unittest.TestCase):
         self.assertIn('--effort <tier>', run.out)
         self.assertRegex(run.out, re.compile('^envelope:', re.M))
 
+    def test_help_does_not_rebind_the_driver(self):
+        for args, rc in ((['--help'], 0), (['start', '--cwd', SB.work, '-h'], 0), ([], 2)):
+            with self.subTest(args=args), mock.patch.object(hands, 'rebind') as rebind, \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(hands.main(args), rc)
+                self.assertIn('--effort <tier>', out.getvalue())
+                rebind.assert_not_called()
+
+    def test_a_help_flag_can_be_an_option_value_or_a_prompt_file(self):
+        with mock.patch.object(hands, 'rebind'), \
+                mock.patch.object(hands, 'start_seat', return_value=0) as start:
+            self.assertEqual(hands.main(['start', '--cwd', '--help', 'claude', '-h']), 0)
+        provider, prompt, options = start.call_args.args
+        self.assertEqual((provider, prompt, options.cwd), ('claude', '-h', '--help'))
+
     def test_an_unknown_flag_and_no_arguments_are_usage_errors(self):
         self.assertEqual(SB.hands('--bogus', 'x', SB.task).rc, 2)
         self.assertEqual(SB.hands().rc, 2)
@@ -350,6 +365,24 @@ class Verbs(unittest.TestCase):
         out, _ = exit_waiter.communicate(timeout=30)
         final = harness.last_json(out)
         self.assertEqual((final['status'], final['rc']), ('incomplete', 143))
+
+    def test_mail_wait_skips_old_lines_and_returns_only_complete_new_lines(self):
+        job = SB.path('wait-mail-partial')
+        os.mkdir(job)
+        SB.write('wait-mail-partial/prompt.txt', 'task\n')
+        outbox = SB.write('wait-mail-partial/outbox.jsonl', '{"text":"old"}\n{"text":"caf')
+        chunks = iter([b'', b'\xc3', b'', b'\xa9"}\n{"text":"second"}\n{"text":"still partial'])
+
+        def append_mail(_seconds):
+            with open(outbox, 'ab') as f:
+                f.write(next(chunks))
+
+        with mock.patch.object(hands.time, 'sleep', side_effect=append_mail), \
+                mock.patch.object(hands.wires, 'read_lines', wraps=hands.wires.read_lines) as read, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = hands.main(['wait', job, '--for', 'mail', '--timeout', '10'])
+        self.assertEqual((rc, out.getvalue()), (0, '{"text":"café"}\n{"text":"second"}\n'))
+        self.assertEqual(read.call_count, 2)   # polls without growth don't read the outbox
 
     def test_a_bad_wait_argument_is_one_usage_line(self):
         job, _ = SB.one_shot('wait-args', 'claude:sonnet', task=SB.path('nope.md'))

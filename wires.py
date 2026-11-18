@@ -176,6 +176,23 @@ def read_lines(path, offset):
     return data.decode('utf-8', 'replace'), offset + len(data)
 
 
+def line_end_and_size(path):
+    """Last complete line's end and the file's size, both as byte offsets in one snapshot."""
+    try:
+        with os.fdopen(open_regular(path, os.O_RDONLY), 'rb') as f:
+            end = size = f.seek(0, os.SEEK_END)
+            while end:
+                start = max(0, end - 4096)
+                f.seek(start)
+                newline = f.read(end - start).rfind(b'\n')
+                if newline >= 0:
+                    return start + newline + 1, size
+                end = start
+    except OSError:
+        return 0, 0
+    return 0, size
+
+
 def exit_code(returncode):
     """A process's exit code as a shell reports it: one that signal N ended reads 128 + N."""
     if returncode is None or returncode >= 0:

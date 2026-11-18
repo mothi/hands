@@ -84,6 +84,13 @@ class AtomicWrite(unittest.TestCase):
         self.assertFalse(os.path.islink(path))
 
 
+class WrapperDeadline(unittest.TestCase):
+    def test_launch_deadline_preserves_fractional_seconds(self):
+        with mock.patch.object(seat.time, 'time', return_value=100):
+            wrapper = seat.Wrapper(SB.root, {'provider': 'claude', 'timeout': 0.75}, '', None)
+        self.assertEqual(wrapper.deadline(), 100.75)
+
+
 class WrapperShutdown(unittest.TestCase):
     def setUp(self):
         job_dir = SB.path(self._testMethodName)

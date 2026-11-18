@@ -203,8 +203,8 @@ class Pushes(unittest.TestCase):
 
     def test_pending_pushes_of_an_ended_seat_reach_the_resumed_driver(self):
         """The app restarts while a seat's turn runs. The turn ends, its push fails, and the
-        wrapper ends with the push pending. The resumed session's next hands.sh command, whatever
-        it is, posts it to the session's new address and points the seat there."""
+        wrapper ends with the push pending. The resumed session's quota check leaves it pending.
+        Then ps posts it to the session's new address and points the seat there."""
         old = harness.DriverSocket(SB.path('pending-old.sock'))
         session = dict(CLAUDE_CODE_SESSION_ID='ses-pending')
         run = SB.hands('start', '--cwd', SB.path('tmp'), CLAUDE, SB.task, STUB_MODE='slow',
@@ -233,8 +233,15 @@ class Pushes(unittest.TestCase):
         time.sleep(2)   # so the pending push is measurably late: lateness counts whole seconds
         new = harness.DriverSocket(SB.path('pending-new.sock'))   # the resumed session
         try:
-            resumed = SB.hands('quota', CLAUDE_CODE_MESSAGING_SOCKET=new.path,
+            resumed_env = dict(CLAUDE_CODE_MESSAGING_SOCKET=new.path,
                                CLAUDE_CODE_MESSAGING_TOKEN='tok-new', **session)
+            board = SB.hands('quota', '--json', 'claude', **resumed_env)
+            self.assertEqual((board.rc, board.err), (0, ''))
+            self.assertEqual(read_json(os.path.join(job, 'driver'))['address'], [old.path, 'tok-old'])
+            self.assertEqual(push.pending_count(job), 1)
+            self.assertEqual(new.connections, [])
+
+            resumed = SB.hands('ps', **resumed_env)
             self.assertIn('pending pushes', resumed.err)
             self.assertIn(job, resumed.err)
             self.assertTrue(wait_until(lambda: len(new.connections) >= 1))

@@ -78,17 +78,17 @@ stops any wrapper still running.
 | `start [flags] SPEC FILE` | Starts a seat and reports `spawned` when the wrapper accepts the first message. The JSON includes `dir`, `expect` (the turn due to answer), `delivery` and `pid`. |
 | `send DIR FILE` | Sends to the live wrapper or relaunches the recorded session. Reports `sent` or `spawned`, with `dir`, `expect` and `delivery`. |
 | `mail DIR TEXT` | Appends a note to the inbox. Exits 1 if the handle exists and the wrapper has gone. The note then waits for the next launch. Exits 2 if the inbox is a symlink or other non-regular file. |
-| `wait DIR [--for turn\|mail\|exit] [--timeout S]` | Waits for all expected turns (default), new outbox mail or wrapper exit. For a result it prints the answer on success, then the envelope. New mail prints its JSON line. |
+| `wait DIR [--for turn\|mail\|exit] [--timeout S]` | Waits for all expected turns (default), new outbox mail or wrapper exit. For a result it prints the answer on success, then the envelope. For mail it prints all lines that completed since the wait began. |
 | `events DIR [--follow]` | Renders text, tool calls, usage and turn status from `events.jsonl`. Follow drains the events through wrapper exit. |
 | `stop DIR` | Ends work in flight. The wrapper closes the CLI and records unfinished turns as `incomplete`. Prints the latest envelope if present and exits 1 if a wrapper survives. |
 | `ps` | Lists live seats with turn state, event age, job dir and any pending pushes. Also lists ended seats with pending pushes inside the jobs root. |
-| `quota [--json] [provider ...]` | Prints the [quota board](#quota). Exit status 0 includes readings marked `unknown`. |
+| `quota [--json] [provider ...]` | Prints the read-only [quota board](#quota). Exit status 0 includes readings marked `unknown`. |
 
 | Flag | Meaning |
 |---|---|
 | `--cwd DIR` | Working directory, defaulting to the current directory. Relaunches use the recorded path. |
 | `--out DIR` | New or empty job dir, mode 0700. The default is a fresh dir in the jobs root. |
-| `--timeout SECS` | A wall-clock limit per wrapper launch, shared by its turns. The default is unlimited. A `wait --timeout` instead limits the caller's wait. |
+| `--timeout SECS` | A wall-clock limit per wrapper launch, shared by its turns. The default and `0` are unlimited. `wait --timeout` limits the caller's wait. Both accept fractional seconds. |
 | `--effort TIER` | Provider-specific reasoning effort. See [Providers](#providers). |
 | `--probe [claude\|codex\|opencode\|all]` | Runs a small billable test prompt from the system temp dir. Defaults to all providers. Prints one JSON line per provider and exits 1 if an attempted probe fails. Missing CLIs are reported as `not-installed`. |
 | `-h`, `--help` | Prints the command-line usage. |
@@ -165,10 +165,10 @@ text. The wrapper logs it to `pushes.jsonl` before sending. A `posted` event mea
 succeeded at the transport. Failed sends stay pending, and the seat's next push, exit or relaunch
 can send them in order.
 
-After restarting a driver session, run `hands.sh ps` from the resumed session. A command from that
-session can refresh its address and send pending pushes for live seats and ended seats in the jobs
-root. Delayed messages can have a `(late Ns)` or `(late Nm)` label. An ended seat outside the jobs
-root is found when it relaunches. Rebinding to a changed address needs the recorded session id.
+After restarting a driver session, run `hands.sh ps` from the resumed session. It refreshes the
+driver address and sends pending pushes for live seats and ended seats in the jobs root. Delayed
+messages can have a `(late Ns)` or `(late Nm)` label. An ended seat outside the jobs root is found
+when it relaunches. Rebinding to a changed address needs the recorded session id.
 
 ## Providers
 

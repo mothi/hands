@@ -275,7 +275,9 @@ class Wrapper:
             if self.leave_when_idle(cli):
                 break
             readable, writable = cli.fds()
-            readable, writable, _ = select.select(readable + [self.fifo_reader], writable, [], 0.5)
+            poll_for = min(0.5, max(0, ends_at - time.time()))
+            readable, writable, _ = select.select(readable + [self.fifo_reader], writable, [],
+                                                  poll_for)
             cli.on_ready(readable, writable)
             if self.fifo_reader in readable:
                 self.read_fifo()
@@ -308,7 +310,7 @@ class Wrapper:
     def deadline(self):
         """When the launch must end: --timeout seconds after it began, else never."""
         timeout = self.handle.get('timeout')
-        return self.started_at + int(timeout) if timeout else NO_LIMIT
+        return self.started_at + timeout if timeout else NO_LIMIT
 
     # -- messages in
 
