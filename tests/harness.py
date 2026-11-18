@@ -28,6 +28,7 @@ sys.path.insert(0, ROOT)
 # A run inside a driver session (Claude Code, Codex, OpenCode) inherits the variables that name
 # it. No test may push to it, and no stub setting from the outer environment may leak into a test.
 import push   # here, once ROOT is on the path
+import seat
 import wires
 
 DRIVER_NAMES = set(push.DRIVER_NAMES)
@@ -325,7 +326,9 @@ def processes():
 
 def wrapper_pids(job):
     """The pids of the seat wrappers running job (found by their argv, as hands finds them)."""
-    mine = re.compile(r'seat\.py spawn %s( |$)' % re.escape(os.path.realpath(job)))
+    job = os.path.realpath(job)
+    mine = re.compile(r'seat\.py spawn (?:%s|%s)( |$)'
+                      % (re.escape(job), re.escape(seat.job_arg(job))))
     return [pid for pid, command in processes() if mine.search(command)]
 
 

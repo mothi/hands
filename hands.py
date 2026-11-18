@@ -194,15 +194,32 @@ def start_seat(spec, prompt_file, options):
     job_dir = make_job_dir(provider, options)
     if job_dir is None:
         return 2
-    if not os.path.isfile(prompt_file):
-        say('prompt file not found: %s' % prompt_file)
-        if prompt_file.startswith('-'):
-            say("'%s' is a FLAG in the prompt-file position — options must PRECEDE the "
-                "provider positional (hands.sh [opts] provider[:model] prompt-file); flags "
-                "after it are read as the prompt file" % prompt_file)
-        end_early(job_dir, 'error', provider, model, 2, options)
-        return 2
-    write_prompt(job_dir, prompt_file)
+    out_fd = None
+    try:
+        if options.out:
+            # Claim an empty directory through the first job file, including an early envelope.
+            try:
+                out_fd = os.open(job_dir, os.O_RDONLY | os.O_DIRECTORY)
+                fcntl.flock(out_fd, fcntl.LOCK_EX)
+                if os.listdir(out_fd):
+                    out_not_empty(options.out)
+                    return 2
+                os.fchmod(out_fd, 0o700)
+            except OSError:
+                say('cannot create the job dir %s' % options.out)
+                return 2
+        if not os.path.isfile(prompt_file):
+            say('prompt file not found: %s' % prompt_file)
+            if prompt_file.startswith('-'):
+                say("'%s' is a FLAG in the prompt-file position — options must PRECEDE the "
+                    "provider positional (hands.sh [opts] provider[:model] prompt-file); flags "
+                    "after it are read as the prompt file" % prompt_file)
+            end_early(job_dir, 'error', provider, model, 2, options)
+            return 2
+        write_prompt(job_dir, prompt_file)
+    finally:
+        if out_fd is not None:
+            os.close(out_fd)
     if provider not in wires.PROVIDERS:   # a typo, or a provider hands has no wire for
         say("unknown provider '%s' (%s)" % (provider, PROVIDER_NAMES))
         end_early(job_dir, 'error', provider, model, 2, options)
@@ -214,19 +231,12 @@ def make_job_dir(provider, options):
     """Make the seat's job dir -> its canonical path, or None (after saying why)."""
     if options.out:   # new or empty: a start never writes over files it did not make
         job_dir = options.out
-        try:   # anything there but an empty dir (a file, a dir it cannot read) is refused
-            taken = os.path.lexists(job_dir) and bool(os.listdir(job_dir))
+        try:   # its parents keep your umask; the dir itself is 0700
+            os.makedirs(job_dir, mode=0o700, exist_ok=True)
         except OSError:
-            taken = True
-        if taken:
-            say('--out %s is not empty — name a new or empty dir, or omit --out for a fresh one '
-                'in the jobs root' % job_dir)
-            return None
-        try:   # its parents keep your umask; the dir itself is 0700, an existing one too
-            os.makedirs(job_dir, exist_ok=True)
-            os.chmod(job_dir, 0o700)
-        except OSError:
-            pass
+            if os.path.lexists(job_dir) and not os.path.isdir(job_dir):
+                out_not_empty(job_dir)
+                return None
     else:
         name = '%s-%s-%d' % (time.strftime('%Y%m%d-%H%M%S'), provider, os.getpid())
         job_dir = os.path.join(seat.JOBS, name)
@@ -236,10 +246,15 @@ def make_job_dir(provider, options):
         except OSError:
             pass
         os.umask(old_umask)
-    if not (os.path.isdir(job_dir) and os.access(job_dir, os.W_OK | os.X_OK)):
-        say('cannot create the job dir %s' % (options.out or 'in ' + seat.JOBS))
-        return None
-    return os.path.realpath(job_dir)   # one name for the prompt, the handle and the wrapper
+    if os.path.isdir(job_dir) and (options.out or os.access(job_dir, os.W_OK | os.X_OK)):
+        return os.path.realpath(job_dir)   # one name for the prompt, the handle and the wrapper
+    say('cannot create the job dir %s' % (options.out or 'in ' + seat.JOBS))
+    return None
+
+
+def out_not_empty(job_dir):
+    say('--out %s is not empty — name a new or empty dir, or omit --out for a fresh one '
+        'in the jobs root' % job_dir)
 
 
 def write_prompt(job_dir, prompt_file):
@@ -299,8 +314,7 @@ def launch(provider, model, job_dir, options):
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         if signal.getsignal(signum) != signal.SIG_IGN:   # nohup's ignored HUP stays ignored
             signal.signal(signum, interrupted)
-    ack = subprocess.run([sys.executable, SEAT_PY, 'spawn', job_dir, prompt],
-                         stdout=subprocess.PIPE, text=True)
+    ack = subprocess.run(spawn_argv(job_dir, prompt), stdout=subprocess.PIPE, text=True)
     if ack.returncode == 2:   # refused before any prompt: that envelope is the answer
         sys.stdout.write(ack.stdout)
         return 2
@@ -326,8 +340,12 @@ def parse_timeout(text):
 
 
 def spawn(job_dir, message_file):
-    # Always a subprocess: the wrapper it forks is found by its command line, seat.py spawn DIR.
-    return subprocess.call([sys.executable, SEAT_PY, 'spawn', job_dir, message_file])
+    return subprocess.call(spawn_argv(job_dir, message_file))
+
+
+def spawn_argv(job_dir, message_file):
+    # Always a subprocess: the wrapper it forks is found by its command line.
+    return [sys.executable, SEAT_PY, 'spawn', seat.job_arg(job_dir), message_file]
 
 
 # ---------------------------------------------------------------------------------------------

@@ -125,6 +125,52 @@ class CommandLine(unittest.TestCase):
         self.assertEqual(os.listdir(job), ['notes.txt'])
         self.assertEqual(read_text(os.path.join(job, 'notes.txt')), 'keep')
 
+    def test_start_refuses_an_out_dir_claimed_by_another_start_during_setup(self):
+        job = SB.path('shared-out')
+        os.makedirs(job)
+        options = hands.Options()
+        options.out = job
+        make_job_dir = hands.make_job_dir
+        write_prompt = hands.write_prompt
+        lock_held = []
+
+        def another_start_wins(provider, options):
+            prepared = make_job_dir(provider, options)
+            with mock.patch.object(hands, 'make_job_dir', make_job_dir):
+                self.assertEqual(hands.start_seat('claude:haiku', SB.task, options), 0)
+            return prepared
+
+        def check_claim(job_dir, prompt_file):
+            fd = os.open(job_dir, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_held.append(False)
+            except BlockingIOError:
+                lock_held.append(True)
+            finally:
+                os.close(fd)
+            write_prompt(job_dir, prompt_file)
+
+        err = io.StringIO()
+        with mock.patch.object(hands, 'make_job_dir', side_effect=another_start_wins), \
+                mock.patch.object(hands, 'write_prompt', side_effect=check_claim), \
+                mock.patch.object(hands, 'sweep'), \
+                mock.patch.object(hands, 'launch', return_value=0) as launch, \
+                contextlib.redirect_stderr(err):
+            self.assertEqual(hands.start_seat('claude:sonnet', SB.turn_two, options), 2)
+        self.assertIn('is not empty', err.getvalue())
+        self.assertEqual(lock_held, [True])
+        launch.assert_called_once_with('claude', 'haiku', job, options)
+        self.assertEqual(read_text(os.path.join(job, 'prompt.txt')),
+                         hands.SEAT_BOX + '\ntask\n\n' + hands.seat_line(job))
+
+    def test_an_existing_read_only_empty_out_dir_is_made_private_and_writable(self):
+        job = SB.path('empty-read-only')
+        os.mkdir(job, 0o500)
+        _, run = SB.one_shot('empty-read-only', 'claude:sonnet')
+        self.assertEqual(run.rc, 0, run.err)
+        self.assertEqual(os.stat(job).st_mode & 0o777, 0o700)
+
     def test_an_opencode_seat_names_provider_slash_model(self):
         for name, spec in (('oc-no-model', 'opencode'), ('oc-no-slash', 'opencode:foo')):
             job, run = SB.one_shot(name, spec, '--effort', 'low')
@@ -407,6 +453,37 @@ class LiveSeats(unittest.TestCase):
         self.assertTrue(wait_until(lambda: 'idle after turn 1 ok · ' in line()))
         SB.stop(job)
         self.assertTrue(wait_until(lambda: line() == ''))
+
+    def test_old_wrapper_with_a_space_in_its_job_dir_matches_only_its_own_job(self):
+        short, full = SB.path('older'), SB.path('older job')
+        for job in (short, full):
+            os.makedirs(job)
+            SB.write(os.path.join(job, 'session'), '{}')
+        row = (-1, 1, -1, 'python /hands/seat.py spawn %s %s/prompt.txt' % (full, full))
+        with mock.patch.object(seat, 'process_table', return_value=[row]) as process_table:
+            self.assertEqual(seat.wrappers(full), [row])
+            self.assertEqual(seat.wrappers(short), [])
+            self.assertEqual(seat.live_seats(), [full])
+            # A legacy resume with no prompt-path match cannot distinguish these two jobs.
+            message = SB.path('driver message.md')
+            process_table.return_value = [(-1, 1, -1, 'python /hands/seat.py spawn %s %s'
+                                           % (full, message))]
+            self.assertEqual(seat.wrappers(full), [])
+            self.assertEqual(seat.wrappers(short), [])
+            self.assertEqual(seat.live_seats(), [])
+
+    def test_encoded_resume_matches_even_when_job_or_message_paths_have_spaces(self):
+        jobs = [SB.path('restarted'), SB.path('restarted seat')]
+        rows = []
+        for number, job in enumerate(jobs, 1):
+            os.makedirs(job)
+            SB.write(os.path.join(job, 'session'), '{}')
+            command = ' '.join(hands.spawn_argv(job, SB.path('from the driver.md')))
+            rows.append((-number, 1, -number, command))
+        with mock.patch.object(seat, 'process_table', return_value=rows):
+            for job, row in zip(jobs, rows):
+                self.assertEqual(seat.wrappers(job), [row])
+            self.assertEqual(seat.live_seats(), jobs)
 
     def test_a_seat_leaves_ps_by_itself_when_its_turn_ends(self):
         job, _ = SB.start('ps-leaves', 'claude:sonnet')

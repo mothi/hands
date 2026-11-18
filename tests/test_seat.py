@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """Reaping, atomic writes, driver isolation and provider failure text."""
+from contextlib import nullcontext
 import os
 import signal
 import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
 
 import harness
 from harness import envelope, read_text, wait_until
 
 import wires
+import seat
 
 CODEX = harness.SPECS['codex']
 SB = None
@@ -79,6 +82,41 @@ class AtomicWrite(unittest.TestCase):
         wires.write_atomic(path, 'new')
         self.assertEqual((read_text(victim), read_text(path)), ('keep', 'new'))
         self.assertFalse(os.path.islink(path))
+
+
+class WrapperShutdown(unittest.TestCase):
+    def setUp(self):
+        job_dir = SB.path(self._testMethodName)
+        os.makedirs(job_dir)
+        self.wrapper = seat.Wrapper(job_dir, {'provider': 'claude'}, 'first message', None)
+
+    def test_close_drains_the_fifo_when_a_send_still_holds_the_lock(self):
+        wrapper = self.wrapper
+        wrapper.fifo_writer = 1   # sentinel: close_fifo is mocked
+        wrapper.first_sent = True
+        sequence = []
+        with mock.patch.object(wrapper, 'try_delivery_lock',
+                               side_effect=[None, nullcontext()]), \
+                mock.patch.object(wrapper, 'read_fifo', side_effect=lambda **opts: sequence.append('read')), \
+                mock.patch.object(wrapper, 'close_fifo', side_effect=lambda: sequence.append('close')), \
+                mock.patch.object(seat, 'delivery_lock', return_value=nullcontext()):
+            wrapper.release_fifo()
+        self.assertEqual(sequence, ['read', 'close'])
+
+    def test_first_message_is_marked_and_acked_after_draining_a_contended_fifo(self):
+        wrapper = self.wrapper
+        wrapper.first_turn = 1
+        wrapper.fifo_writer = 1
+        with mock.patch.object(wrapper, 'try_delivery_lock',
+                               side_effect=[None, nullcontext()]), \
+                mock.patch.object(wrapper, 'read_fifo') as read_fifo, \
+                mock.patch.object(wrapper, 'close_fifo'), \
+                mock.patch.object(wrapper, 'ack') as ack, \
+                mock.patch.object(seat, 'delivery_lock', return_value=nullcontext()):
+            wrapper.release_fifo()
+        ack.assert_called_once_with(1)
+        read_fifo.assert_called_once_with(wait=True)
+        self.assertEqual(wrapper.state.read().expected, 1)
 
 
 class Hermetic(unittest.TestCase):

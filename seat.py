@@ -7,10 +7,11 @@ result.txt and envelope.json (close_turns). It runs until the CLI exits, the sea
 passes, or `hands.sh stop` ends it.
 
 Its command line is internal; hands.py calls it:
-  spawn DIR FILE   start the seat's wrapper, with FILE as its first message
+  spawn JOB FILE   start the seat's wrapper, with FILE as its first message
   send DIR FILE    deliver FILE to the seat's live wrapper (rc 3: there is none)
   reap SECS ARGV   run ARGV in its own process group for at most SECS seconds (0: no limit)
 
+JOB is the encoded directory argument found in the wrapper's process listing.
 The first message rides in the launch. A send must reach a live seat now or relaunch it, so
 it uses in.fifo. A nonblocking open tells the sender at once whether the wrapper is reading.
 The wrapper closes the pipe under the delivery lock when it leaves. Mail goes to inbox.jsonl
@@ -24,6 +25,7 @@ import fcntl
 import json
 import math
 import os
+import re
 import select
 import signal
 import stat
@@ -44,6 +46,8 @@ STATE_HOME = os.environ.get('XDG_STATE_HOME', '')
 if not os.path.isabs(STATE_HOME):   # the XDG spec ignores a relative value
     STATE_HOME = os.path.join(os.path.expanduser('~'), '.local', 'state')
 JOBS = os.path.join(STATE_HOME, 'hands')
+JOB_ARG = '--hands-job='
+WRAPPER_COMMAND = re.compile(r'(?:^|[ /])seat\.py spawn ')
 
 NOTE = ('turn-N/result.txt + envelope.json land at each turn_end (absent = not finished, never '
         'finished-empty); liveness = the age of the last events.jsonl line, or an open '
@@ -63,6 +67,9 @@ def main(args):
     command = args[0] if args else ''
     if command == 'reap' and len(args) > 2:
         return reap(int(args[1]), args[2:])
+    if command == 'spawn' and len(args) > 1 and args[1].startswith(JOB_ARG):
+        job_dir = decode_job(args[1])
+        args = [command, job_dir or '', *args[2:]]
     if command not in ('spawn', 'send') or len(args) < 3 or not os.path.isdir(args[1]):
         print(__doc__.strip(), file=sys.stderr)
         return 2
@@ -276,9 +283,6 @@ class Wrapper:
         self.past_deadline = cli.proc.poll() is None and time.time() >= ends_at
         if not self.left:
             cli.interrupt()
-        # A stop that came before the first message was delivered marks it now, so the close-out
-        # types its turn.
-        self.send_first_message(5)
         self.release_fifo()
         rc = self.closing_rc(exit_code(cli.close(2)))
         self.push_outbox()
@@ -287,7 +291,7 @@ class Wrapper:
 
     def tick(self):
         """Each pass of the loop: the first message, then once a second the outbox and inbox."""
-        if not self.send_first_message(0):
+        if not self.send_first_message():
             return
         if time.time() >= self.next_mail_check:
             self.next_mail_check = time.time() + 1
@@ -317,7 +321,9 @@ class Wrapper:
         self.fifo_reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)   # first: neither blocks
         self.fifo_writer = os.open(fifo, os.O_WRONLY)
 
-    def read_fifo(self):
+    def read_fifo(self, wait=False):
+        if wait and self.fifo_reader is not None:
+            select.select([self.fifo_reader], [], [], 0.05)
         while self.fifo_reader is not None:
             try:
                 chunk = os.read(self.fifo_reader, 65536)
@@ -331,8 +337,8 @@ class Wrapper:
     def try_delivery_lock(self):
         """The delivery lock if it is free now, else None.
 
-        The wrapper never waits for it: a sender that holds it may be blocked writing to
-        in.fifo, which only this loop reads. What senders delivered before is read first."""
+        The probe never blocks: a sender that holds the lock may need the wrapper to drain
+        in.fifo. What senders delivered before is read first."""
         f = open(self.path('events.jsonl'), 'ab')
         try:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -347,21 +353,22 @@ class Wrapper:
         mark_delivery(self.job_dir, text, expect, turn, **mail)
         self.waiting.append(fifo_record(self.provider, text))
 
-    def send_first_message(self, wait):
-        """Deliver the first message once the lock is free, trying for `wait` s -> whether sent."""
-        tried = time.time()
-        while not self.first_sent:
-            lock = self.try_delivery_lock()
-            if lock is not None:
-                with lock:
-                    self.queue_own(self.first_message, self.first_turn, self.first_turn - 1)
-                self.first_sent = True
-                self.ack(self.first_turn)
-            elif time.time() - tried >= wait:
-                return False
-            else:
-                time.sleep(0.05)
+    def send_first_message(self):
+        """Deliver the first message if the lock is free -> whether sent."""
+        if self.first_sent:
+            return True
+        lock = self.try_delivery_lock()
+        if lock is None:
+            return False
+        with lock:
+            self.queue_first_message()
         return True
+
+    def queue_first_message(self):
+        """Record and acknowledge the first message under the delivery lock."""
+        self.queue_own(self.first_message, self.first_turn, self.first_turn - 1)
+        self.first_sent = True
+        self.ack(self.first_turn)
 
     def ack(self, turn):
         """Tell the spawn caller the turn its message opens (0: the launch failed first)."""
@@ -532,7 +539,13 @@ class Wrapper:
         closed it already). It closes under the lock, between deliveries."""
         if self.fifo_writer is None:
             return
-        with delivery_lock(self.job_dir):
+        lock = self.try_delivery_lock()
+        while lock is None:
+            self.read_fifo(wait=True)   # the writer may need more room to finish its send
+            lock = self.try_delivery_lock()
+        with lock:
+            if not self.first_sent:   # a stop before delivery still owes the first turn
+                self.queue_first_message()
             self.close_fifo()
 
     def close_fifo(self):
@@ -760,7 +773,7 @@ def write_envelope(job_dir, status, provider, model, rc, seconds, reset, usage, 
 
 
 # ---------------------------------------------------------------------------------------------
-# Processes. A wrapper is found by its command line (seat.py spawn DIR), and a seat's CLI by
+# Processes. A wrapper is found by its command line (seat.py spawn JOB), and a seat's CLI by
 # the process groups below its wrapper.
 
 
@@ -776,27 +789,54 @@ def process_table():
     return rows
 
 
+def job_arg(job_dir):
+    """Encode the directory as one word because ps joins argv with spaces."""
+    return JOB_ARG + os.fsencode(job_dir).hex()
+
+
+def decode_job(argument):
+    try:
+        job_dir = os.fsdecode(bytes.fromhex(argument[len(JOB_ARG):]))
+    except ValueError:
+        return None
+    if os.path.isabs(job_dir) and '\0' not in job_dir:
+        return job_dir
+    return None
+
+
+def wrapper_job(command):
+    """Read the job dir from a wrapper's command line, including pre-upgrade wrappers."""
+    spawner = WRAPPER_COMMAND.search(command)
+    if spawner is None:
+        return None
+    args = command[spawner.end():]
+    first, _, _ = args.partition(' ')
+    if first.startswith(JOB_ARG):
+        return decode_job(first)
+
+    # Older commands have no boundary between DIR and FILE in ps output. The first launch
+    # names its own prompt, and a resume is identifiable when only one candidate has a handle.
+    candidates = []
+    words = args.split(' ')
+    for count in range(1, len(words)):
+        job_dir = ' '.join(words[:count])
+        if os.path.isabs(job_dir) and os.path.isfile(os.path.join(job_dir, 'session')):
+            if args == '%s %s/prompt.txt' % (job_dir, job_dir):
+                return job_dir
+            candidates.append(job_dir)
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def wrappers(job_dir, rows=None):
     """The live wrapper processes of a job dir (normally one)."""
-    key = ' spawn %s ' % job_dir
-    return [row for row in rows or process_table()
-            if 'seat.py' in row[3] and key in row[3] + ' ' and row[0] != os.getpid()]
+    rows = process_table() if rows is None else rows
+    return [row for row in rows if row[0] != os.getpid() and wrapper_job(row[3]) == job_dir]
 
 
 def live_seats():
-    """The job dir of every live seat on this machine, found by its wrapper's command line
-    (seat.py spawn DIR FILE), so a seat started with --out is found too."""
-    found = set()
-    for command in (row[3] for row in process_table()):
-        if 'seat.py' not in command or ' spawn ' not in command:
-            continue
-        words = command.split(' spawn ', 1)[1].split(' ')
-        for count in range(1, len(words)):   # the dir may hold spaces; the message file follows
-            job_dir = ' '.join(words[:count])
-            if os.path.isfile(os.path.join(job_dir, 'session')):
-                found.add(job_dir)
-                break
-    return sorted(found)
+    """The job dir of every live seat, including seats started with --out."""
+    found = {wrapper_job(row[3]) for row in process_table()}
+    return sorted(job for job in found if job and os.path.isfile(os.path.join(job, 'session')))
 
 
 def groups_under(roots, rows=None):
