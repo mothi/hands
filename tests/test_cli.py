@@ -15,6 +15,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import unittest
 from unittest import mock
@@ -40,6 +41,25 @@ def tearDownModule():
 
 def on_system_path(name):
     return bool(shutil.which(name, path=SYSTEM_PATH))
+
+
+class TestRunner(unittest.TestCase):
+    def test_the_single_file_summary_reports_a_skip(self):
+        script = """\
+import harness
+import unittest
+
+class Sample(unittest.TestCase):
+    @unittest.skip('forced skip')
+    def test_skipped(self):
+        pass
+
+harness.main('sample')
+"""
+        run = subprocess.run([sys.executable, '-c', script], cwd=harness.TESTS, text=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10)
+        self.assertEqual(run.returncode, 0, run.stdout)
+        self.assertEqual(run.stdout.splitlines()[-1], 'OK (skipped=1)')
 
 
 class CommandLine(unittest.TestCase):
@@ -378,7 +398,7 @@ class Verbs(unittest.TestCase):
                 f.write(next(chunks))
 
         with mock.patch.object(hands.time, 'sleep', side_effect=append_mail), \
-                mock.patch.object(hands.wires, 'read_lines', wraps=hands.wires.read_lines) as read, \
+                mock.patch.object(hands.jobfiles, 'read_lines', wraps=hands.jobfiles.read_lines) as read, \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             rc = hands.main(['wait', job, '--for', 'mail', '--timeout', '10'])
         self.assertEqual((rc, out.getvalue()), (0, '{"text":"café"}\n{"text":"second"}\n'))

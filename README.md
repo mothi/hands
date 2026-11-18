@@ -20,10 +20,12 @@ printf '%s\n' 'Now suggest one improvement.' > "$work/followup.md"
 "$H" ps
 ```
 
-A **seat** is a provider conversation with its own **job dir** for prompts, logs, mail and results.
-A **turn** runs from a prompt to its result. The **driver** is the person or agent session calling
-hands. The **wrapper** runs the CLI and can send a **push** to the driver when the seat writes mail
-or ends a turn.
+A **seat** is a provider conversation. When the **driver** (you or your agent session) runs
+`start`, hands creates the job directory and prepends the [seat instructions](hands.py#L71)
+to your task. They cover command timeouts, verification, when to stop and how to send mail.
+A background **wrapper** starts the provider CLI, records its turn events in `events.jsonl`,
+and writes the answer and envelope when the turn ends. The wrapper can also push mail and
+turn results to the driver.
 
 ## Install
 
@@ -75,7 +77,7 @@ stops any wrapper still running.
 
 | Command | What it does |
 |---|---|
-| `start [flags] SPEC FILE` | Starts a seat and reports `spawned` when the wrapper accepts the first message. The JSON includes `dir`, `expect` (the turn due to answer), `delivery` and `pid`. |
+| `start [flags] SPEC FILE` | Starts a seat and reports `spawned` when the wrapper accepts the first message. The JSON includes `dir`, `expect` (the predicted turn), `delivery` and `pid`. |
 | `send DIR FILE` | Sends to the live wrapper or relaunches the recorded session. Reports `sent` or `spawned`, with `dir`, `expect` and `delivery`. |
 | `mail DIR TEXT` | Appends a note to the inbox. Exits 1 if the handle exists and the wrapper has gone. The note then waits for the next launch. Exits 2 if the inbox is a symlink or other non-regular file. |
 | `wait DIR [--for turn\|mail\|exit] [--timeout S]` | Waits for all expected turns (default), new outbox mail or wrapper exit. For a result it prints the answer on success, then the envelope. For mail it prints all lines that completed since the wait began. |
@@ -83,6 +85,9 @@ stops any wrapper still running.
 | `stop DIR` | Ends work in flight. The wrapper closes the CLI and records unfinished turns as `incomplete`. Prints the latest envelope if present and exits 1 if a wrapper survives. |
 | `ps` | Lists live seats with turn state, event age, job dir and any pending pushes. Also lists ended seats with pending pushes inside the jobs root. |
 | `quota [--json] [provider ...]` | Prints the read-only [quota board](#quota). Exit status 0 includes readings marked `unknown`. |
+
+A Codex send can predict turn 1 while it is finishing and receive its answer in turn 2.
+`wait` follows deliveries and turn boundaries in `events.jsonl` to find the latest result.
 
 | Flag | Meaning |
 |---|---|
@@ -176,12 +181,14 @@ when it relaunches. Rebinding to a changed address needs the recorded session id
 |---|---|---|
 | `claude` | Defaults to `sonnet`. Uses `claude -p` with stream JSON, `bypassPermissions`, strict MCP config, and hooks, auto-memory and background tasks disabled. To sign in, run `claude`. | Steers through stdin. Claude may queue a message for another turn. |
 | `codex` | Defaults to the CLI's configured model. Uses a private app-server on stdio with `danger-full-access`, live web search, approvals set to `never`, and hooks and memories disabled. Sign in with `codex login`. | `turn/start` steers a running turn or opens the next. |
-| `opencode` | Requires `provider/model` and `--effort`, for example `--effort low opencode:opencode-go/deepseek-v4.1-flash`. Uses `opencode acp` with your normal login, store and plugins. Sign in with `opencode auth login`. | Queues while a turn runs. For tool permissions, hands prefers allow-once and otherwise uses the first allow option, if offered. |
+| `opencode` | Requires `provider/model`, for example `--effort low opencode:opencode-go/deepseek-v4.1-flash`. Uses `opencode acp` with your normal login, store and plugins. Sign in with `opencode auth login`. | Queues while a turn runs. For tool permissions, hands prefers allow-once and otherwise uses the first allow option, if offered. |
 
 Claude and Codex use their defaults when `--effort` is absent. Typical values are `low`, `medium`,
 `high`, `xhigh` and `max`, with `ultra` available for some Codex models. These values pass through
-to the CLI. OpenCode checks the session's advertised models and effort values before the first
-prompt. Claude seats also refuse messages from other sessions.
+to the CLI. Before sending the first OpenCode prompt, hands checks the session's advertised
+models and requires one of the selected model's advertised effort values, including `default`
+if listed. Omit `--effort` when the model advertises no effort choices. Claude seats also
+refuse messages from other sessions.
 
 On timeout the wrapper closes OpenCode's stdin so the session can resume. If the OpenCode agent goes
 away during a turn for another reason, the wrapper attempts to delete its session before writing the
@@ -214,10 +221,9 @@ readings in one document. The board reads usage without running a model turn.
 
 ## How it works
 
-`hands.sh` runs `hands.py`, which makes the job dir, writes the prompt and handle, and starts
-`seat.py spawn`. The detached wrapper holds the `job.log` lock, calls `wires.py` to launch and
-translate the provider CLI, and records each result. A reaper supervises the CLI's process group.
-`push.py` sends and rebinds pushes, and `quota.py` reads the quota board.
+The detached wrapper holds the `job.log` lock. A reaper supervises the provider CLI's process
+group. Provider adapters live in `wires.py`, driver push delivery in `push.py`, and quota
+readings in `quota.py`.
 
 The first message rides in the launch. A `send` must reach a live seat now or relaunch it, so it
 uses `in.fifo`. A nonblocking open tells the sender whether the wrapper is reading. The wrapper

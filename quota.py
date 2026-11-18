@@ -21,6 +21,7 @@ below leave this file, and a provider's error text is masked before it is shown.
 import datetime
 import glob
 import json
+import math
 import os
 import re
 import signal
@@ -44,10 +45,16 @@ def iso_time(epoch):
     return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).isoformat()
 
 
-def window(name, used, resets):
-    """One usage window, or None when the reply has no percentage for it (never a made-up 0)."""
+def window(name, used, resets, fraction=False):
+    """One usage window, or None when usage is missing. Convert fractions to percentages."""
     if used is None:
         return None
+    if type(used) not in (int, float):
+        raise ValueError('usage percentage must be numeric')
+    if fraction:
+        used = round(used * 100, 1)
+    if not math.isfinite(used):
+        raise ValueError('usage percentage must be finite')
     return {'name': name, 'used_pct': used, 'resets_at': resets}
 
 
@@ -157,13 +164,12 @@ def claude_windows(windows, age, now):
         if isinstance(resets, (int, float)) and resets <= now:
             reset.append(name)
             continue
-        used = value.get('utilization')
-        used = None if used is None else round(used * 100, 1)
         resets = iso_time(resets) if isinstance(resets, (int, float)) else None
+        usage = window(name, value.get('utilization'), resets, fraction=True)
         if key in names:
-            found.append(window(name, used, resets))
-        elif used is not None:
-            model_limits.append({'name': name, 'used_pct': used, 'resets_at': resets})
+            found.append(usage)
+        elif usage is not None:
+            model_limits.append(usage)
     found = sorted((w for w in found if w), key=lambda w: w['name'] == '5h')   # week first
     if not found and reset:
         raise Unknown('out of date: %s reset since the reading; %s' % (', '.join(reset), REFRESH))

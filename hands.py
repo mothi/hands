@@ -5,7 +5,7 @@ from a driver session writes that session's address, for Claude Code its push so
 token, to DIR/driver, which stays until the job dir is deleted: README, Security model).
 
   hands.sh start [opts] provider[:model] prompt-file
-        start a seat and return at once: {"status":"spawned","dir":DIR,...}
+        wait for the wrapper to accept the prompt, then report: {"status":"spawned","dir":DIR,...}
   hands.sh [opts] provider[:model] prompt-file
         start a seat and wait for its answer
   hands.sh send DIR FILE          the next turn (a seat whose process is gone relaunches on its
@@ -30,7 +30,8 @@ opts (all before the provider spec; the prompt is always a file):
                    dirs idle for 30 days)
   --timeout SECS   a wall clock per launch (default: none)
   --effort <tier>  claude, codex: low|medium|high|xhigh|max, passed through (codex adds ultra
-                   where it lists it); opencode: required, a value the model lists
+                   where it lists it); opencode: choose one of the selected model's listed
+                   values, including default if listed. Omit it when the model lists no choices
 
 envelope: {"status":"ok|error|incomplete|cancelled|truncated|timeout|auth-expired|
              provider-quota-dead|not-installed|refused",
@@ -52,6 +53,7 @@ import sys
 import tempfile
 import time
 
+import jobfiles
 import push
 import quota
 import seat
@@ -320,7 +322,7 @@ def launch(provider, model, job_dir, options):
     if ack.returncode == 2:   # refused before any prompt: that envelope is the answer
         sys.stdout.write(ack.stdout)
         return 2
-    rc = wait(job_dir, wires.read_json(os.path.join(job_dir, 'session')), 'turn', None)
+    rc = wait(job_dir, jobfiles.read_json(os.path.join(job_dir, 'session')), 'turn', None)
     sys.stdout.flush()
     stop(job_dir)
     return rc
@@ -364,7 +366,7 @@ def send(job_dir, message_file):
     if not os.path.isfile(message_file):
         say('send file not found: %s' % message_file)
         return 2
-    provider = (wires.read_json(os.path.join(job_dir, 'session')) or {}).get('provider')
+    provider = (jobfiles.read_json(os.path.join(job_dir, 'session')) or {}).get('provider')
     if provider not in wires.PROVIDERS:   # the handle names a provider with no entry in the table
         say("%s names provider '%s', which hands does not run (%s)"
             % (job_dir, provider, PROVIDER_NAMES))
@@ -372,7 +374,7 @@ def send(job_dir, message_file):
     rc = seat.main(['send', job_dir, message_file])
     if rc != 3:
         return rc
-    handle = wires.read_json(os.path.join(job_dir, 'session'))
+    handle = jobfiles.read_json(os.path.join(job_dir, 'session'))
     options = Options()
     options.effort = handle.get('effort') or ''
     if not handle.get('session'):
@@ -394,7 +396,7 @@ def run_verb(args):
         say('%s is not a job dir (it holds neither prompt.txt nor envelope.json)' % args[1])
         return 2
     job_dir = os.path.realpath(args[1])
-    handle = wires.read_json(os.path.join(job_dir, 'session'))
+    handle = jobfiles.read_json(os.path.join(job_dir, 'session'))
     if verb == 'mail':
         return mail(job_dir, handle, args[2:])
     if verb == 'wait':
@@ -403,7 +405,7 @@ def run_verb(args):
     if verb == 'events':
         return events(job_dir, '--follow' in args)
     rc = stop(job_dir)
-    envelope = wires.read_json(os.path.join(job_dir, 'envelope.json'))
+    envelope = jobfiles.read_json(os.path.join(job_dir, 'envelope.json'))
     if envelope:
         print(seat.printed(envelope))
     return rc
@@ -447,7 +449,7 @@ def mail(job_dir, handle, words):
         return 2
     line = {'t': wires.now(), 'from': 'driver', 'text': ' '.join(words)}
     try:   # never through a link the seat planted
-        seat.append_json(os.path.join(job_dir, 'inbox.jsonl'), line)
+        jobfiles.append_json(os.path.join(job_dir, 'inbox.jsonl'), line)
     except OSError as e:
         say('%s/inbox.jsonl: %s -- not written' % (job_dir, e.strerror or e))
         return 2
@@ -464,14 +466,14 @@ def wait(job_dir, handle, mode, timeout):
     started = time.time()
     state = seat.SeatState(job_dir)
     outbox = os.path.join(job_dir, 'outbox.jsonl')
-    outbox_offset, outbox_size = wires.line_end_and_size(outbox) if mode == 'mail' else (0, 0)
+    outbox_offset, outbox_size = jobfiles.line_end_and_size(outbox) if mode == 'mail' else (0, 0)
     checks = 0
     while True:
         state.read()
         if mode == 'mail':
-            size = seat.file_size(outbox)
+            size = jobfiles.file_size(outbox)
             if size > outbox_size:
-                text, _ = wires.read_lines(outbox, outbox_offset)
+                text, _ = jobfiles.read_lines(outbox, outbox_offset)
                 if text:
                     sys.stdout.write(text)
                     return 0
@@ -507,7 +509,7 @@ def print_last(job_dir, handle, state):
 
 def print_result(job_dir):
     """A turn's answer (when it is ok), then its envelope line -> the exit code."""
-    envelope = wires.read_json(os.path.join(job_dir, 'envelope.json'))
+    envelope = jobfiles.read_json(os.path.join(job_dir, 'envelope.json'))
     if envelope is None:
         print(seat.one_line({'status': 'error', 'dir': job_dir, 'reason': 'no envelope'}))
         return 1
@@ -651,7 +653,7 @@ def events(job_dir, follow):
     offset = 0
     while True:
         live = follow and seat.wrappers(job_dir)
-        text, offset = wires.read_lines(os.path.join(job_dir, 'events.jsonl'), offset)
+        text, offset = jobfiles.read_lines(os.path.join(job_dir, 'events.jsonl'), offset)
         sys.stdout.write(view.feed(text) + ('' if live else view.flush()))
         sys.stdout.flush()
         if not live:
@@ -672,7 +674,7 @@ def ps():
     if not job_dirs and not ended:
         say('no live seats')
     for job_dir in job_dirs + ended:
-        handle = wires.read_json(os.path.join(job_dir, 'session')) or {}
+        handle = jobfiles.read_json(os.path.join(job_dir, 'session')) or {}
         state = seat.SeatState(job_dir).read()
         name = ':'.join(part for part in (handle.get('provider'), handle.get('model')) if part)
         what = 'ended after turn %d' % state.ended if job_dir in ended else doing(job_dir, state)
@@ -690,7 +692,7 @@ def doing(job_dir, state):
         return 'running turn %d%s' % (state.turn, ' (%d queued)' % queued if queued > 0 else '')
     if state.expected > state.ended or not state.ended:
         return 'starting turn %d' % max(state.expected, 1)
-    envelope = wires.read_json(os.path.join(job_dir, 'envelope.json')) or {}
+    envelope = jobfiles.read_json(os.path.join(job_dir, 'envelope.json')) or {}
     return 'idle after turn %d %s' % (state.ended, envelope.get('status') or '')
 
 
@@ -732,7 +734,7 @@ def sweep():
             shutil.rmtree(path, ignore_errors=True)
             continue
         try:
-            fd = seat.open_regular(os.path.join(path, 'job.log'), os.O_WRONLY | os.O_APPEND)
+            fd = jobfiles.open_regular(os.path.join(path, 'job.log'), os.O_WRONLY | os.O_APPEND)
         except FileNotFoundError:   # no wrapper ever ran there
             fd = None
         except OSError:

@@ -533,9 +533,6 @@ class SeatChecks(unittest.TestCase):
 # Running a test file
 
 
-def main(name):
-    """Run this module's tests; print 'name: N passed, M failed'; exit 1 on any failure."""
-    result = unittest.main(module='__main__', exit=False, verbosity=2).result
-    bad = len(result.failures) + len(result.errors)
-    print('%s: %d passed, %d failed' % (name, result.testsRun - bad, bad))
-    sys.exit(1 if bad else 0)
+def main(_name):
+    """Run a test file with unittest's summary and exit status."""
+    unittest.main(verbosity=2)

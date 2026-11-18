@@ -10,8 +10,8 @@ import subprocess
 import time
 import urllib.parse
 
-from wires import (DEADLINE_RC, append_json, clip, event, open_regular, parse_json, read_json,
-                   read_lines, reaper_argv, write_atomic)
+from jobfiles import append_json, open_regular, read_json, read_lines, write_atomic
+from wires import DEADLINE_RC, clip, event, parse_json, reaper_argv
 
 # Pushes to the driver: the session that started the seat. Each turn's end and each line the
 # seat mails is pushed there, through the way in that the driver's host offers.

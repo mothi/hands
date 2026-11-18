@@ -84,8 +84,8 @@ the answer on success followed by the envelope. Check `status` before using the 
    runs a billable test turn.
 2. Ask for the task and seat in one compact message or through the host's question UI. Offer
    an available provider and model. Resolve `--cwd` if the task's working directory is
-   unclear. For Codex, ask about effort if relevant. For OpenCode, the model and effort are
-   required.
+   unclear. For Codex, ask about effort if relevant. For OpenCode, ask for `provider/model`
+   and one of the model's advertised effort choices. Omit `--effort` if it offers none.
 3. Show the exact command before running it, and mention the default unlimited timeout and
    automatic job dir if you're using them.
 

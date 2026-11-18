@@ -205,6 +205,40 @@ class Quota(unittest.TestCase):
         self.assertEqual(pools['opencode']['why'], 'the reply has an unexpected shape')
         self.assertEqual([pools[p]['status'] for p in ('claude', 'codex')], ['ok'] * 2)
 
+    def test_a_bad_percentage_makes_only_its_pool_unknown_in_both_modes(self):
+        codex = self.path('codex-bad-percent.json')
+        write(codex, json.dumps({'result': {'rateLimits': {'primary': {'usedPercent': '40'}}}}))
+        state = self.path('bad-model-utilization')
+        event = json.loads(rate_event(0.26, 0.43))
+        event['rate_limit_info']['unifiedWindows']['model_limit'] = {'utilization': True}
+        stream(os.path.join(state, 'hands', 'j', 'stream.jsonl'), 0, json.dumps(event))
+
+        cases = [
+            ('codex', {'QUOTA_STUB_CODEX': codex}),
+            ('claude', {'XDG_STATE_HOME': state}),
+        ]
+        for name, value in (('nonfinite', float('nan')), ('oversized', 10 ** 400)):
+            path = self.path('opencode-%s-percent.json' % name)
+            write(path, json.dumps({'usage': {'weekly': {'percent': value}}}))
+            cases.append(('opencode', {'QUOTA_STUB_OPENCODE': path}))
+
+        for bad, env in cases:
+            with self.subTest(pool=bad, env=env, mode='json'):
+                doc = json.loads(self.run_quota('--json', **env), parse_constant=self.fail)
+                self.assertEqual([p['pool'] for p in doc['pools']], list(POOLS))
+                for reading in doc['pools']:
+                    if reading['pool'] == bad:
+                        self.assertEqual(reading, {'pool': bad, 'status': 'unknown',
+                                                   'why': 'the reply has an unexpected shape',
+                                                   'windows': []})
+                    else:
+                        self.assertEqual(reading['status'], 'ok')
+            with self.subTest(pool=bad, env=env, mode='text'):
+                lines = self.run_quota(**env).splitlines()
+                self.assertEqual([line.split()[0] for line in lines], list(POOLS))
+                self.assertEqual([line for line in lines if 'unknown:' in line],
+                                 ['%-9s unknown: the reply has an unexpected shape' % bad])
+
     def test_a_claude_utilization_that_is_text_is_unknown(self):
         state = self.path('text-utilization')
         stream(os.path.join(state, 'hands', 'j', 'stream.jsonl'), 0,

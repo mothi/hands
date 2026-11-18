@@ -36,9 +36,9 @@ import traceback
 
 import push
 import wires
-from wires import (DEADLINE_RC, NO_LIMIT, append_json, classify, clip, closed_turn, event,
-                   exit_code, file_size, open_regular, parse_json, read_json, read_lines,
-                   read_tail, reaper_argv, write_atomic)
+from jobfiles import append_json, file_size, open_regular, read_json, read_lines, read_tail, write_atomic
+from wires import (DEADLINE_RC, NO_LIMIT, classify, clip, closed_turn, event, exit_code,
+                   parse_json, reaper_argv)
 
 # Where hands.py makes the job dirs it names itself (a start without --out, a probe). They are
 # state that should outlive a reboot, so not in $TMPDIR, which macOS clears at boot.
@@ -204,6 +204,63 @@ def send(job_dir, handle, message_file):
 
 # ---------------------------------------------------------------------------------------------
 # The wrapper
+
+
+class SeatState:
+    """Turn counters and other delivery state, read incrementally from events.jsonl.
+
+    For example, after turn 1 starts, turn and expected are 1 and ended is 0. A queued
+    message raises expected to 2. When turn 1 ends, ended becomes 1. When turn 2 starts,
+    turn becomes 2. Ending turn 2 brings all three to 2. Deliveries record expected as
+    the expect field.
+    """
+
+    def __init__(self, job_dir):
+        self.path = os.path.join(job_dir, 'events.jsonl')
+        self.offset = 0
+        self.turn = 0              # the latest turn that started
+        self.ended = 0             # the latest turn that ended
+        self.expected = 0          # the latest turn a delivery expects
+        self.last_event = None     # the time of the latest event
+        self.open_calls = set()
+        self.mailed = 0            # the latest inbox line delivered: a restart skips it
+
+    def read(self):
+        text, self.offset = read_lines(self.path, self.offset)
+        for line in map(parse_json, text.split('\n')):   # not splitlines(): it splits at U+2028
+            if not isinstance(line, dict):
+                continue
+            kind = line.get('kind')
+            number = line.get('turn') or 0
+            self.last_event = line.get('t') or self.last_event
+            self.expected = max(self.expected, line.get('expect') or 0)
+            self.mailed = max(self.mailed, line.get('inbox') or 0)
+            if kind == 'turn_start':   # a turn opens for an input, so it is expected too
+                self.turn = max(self.turn, number)
+                self.expected = max(self.expected, number)
+            elif kind == 'turn_end':
+                self.ended = max(self.ended, number)
+                self.open_calls = set()
+            elif kind == 'tool_call':
+                self.open_calls.add(line.get('call'))
+            elif kind == 'tool_result':
+                self.open_calls.discard(line.get('call'))
+        return self
+
+    def next_turn(self, delivery, alive):
+        """Predict the turn that will answer a message delivered now.
+
+        Seat          Delivery   Turn
+        Relaunch      either     One after the latest started or ended.
+        Live          queue      One after the latest started, ended, or expected.
+        Live          steer      The latest started or expected if it has yet to end,
+                                 otherwise one after the latest ended.
+        """
+        latest = max(self.turn, self.ended)
+        if not alive or delivery == 'queue':
+            return max(self.expected if alive else 0, latest) + 1
+        running = max(self.expected, self.turn)   # steer: a running turn takes the message
+        return running if running > self.ended else self.ended + 1
 
 
 class Wrapper:
@@ -623,63 +680,6 @@ class Wrapper:
 # ---------------------------------------------------------------------------------------------
 # Deliveries. Each message into a seat is marked in events.jsonl before it is sent, under the
 # delivery lock, with the turn expected to answer it.
-
-
-class SeatState:
-    """Turn counters and other delivery state, read incrementally from events.jsonl.
-
-    For example, after turn 1 starts, turn and expected are 1 and ended is 0. A queued
-    message raises expected to 2. When turn 1 ends, ended becomes 1. When turn 2 starts,
-    turn becomes 2. Ending turn 2 brings all three to 2. Deliveries record expected as
-    the expect field.
-    """
-
-    def __init__(self, job_dir):
-        self.path = os.path.join(job_dir, 'events.jsonl')
-        self.offset = 0
-        self.turn = 0              # the latest turn that started
-        self.ended = 0             # the latest turn that ended
-        self.expected = 0          # the latest turn a delivery expects
-        self.last_event = None     # the time of the latest event
-        self.open_calls = set()
-        self.mailed = 0            # the latest inbox line delivered: a restart skips it
-
-    def read(self):
-        text, self.offset = read_lines(self.path, self.offset)
-        for line in map(parse_json, text.split('\n')):   # not splitlines(): it splits at U+2028
-            if not isinstance(line, dict):
-                continue
-            kind = line.get('kind')
-            number = line.get('turn') or 0
-            self.last_event = line.get('t') or self.last_event
-            self.expected = max(self.expected, line.get('expect') or 0)
-            self.mailed = max(self.mailed, line.get('inbox') or 0)
-            if kind == 'turn_start':   # a turn opens for an input, so it is expected too
-                self.turn = max(self.turn, number)
-                self.expected = max(self.expected, number)
-            elif kind == 'turn_end':
-                self.ended = max(self.ended, number)
-                self.open_calls = set()
-            elif kind == 'tool_call':
-                self.open_calls.add(line.get('call'))
-            elif kind == 'tool_result':
-                self.open_calls.discard(line.get('call'))
-        return self
-
-    def next_turn(self, delivery, alive):
-        """The turn that will answer a message delivered now.
-
-        Seat          Delivery   Turn
-        Relaunch      either     One after the latest started or ended.
-        Live          queue      One after the latest started, ended, or expected.
-        Live          steer      The latest started or expected if it has yet to end,
-                                 otherwise one after the latest ended.
-        """
-        latest = max(self.turn, self.ended)
-        if not alive or delivery == 'queue':
-            return max(self.expected if alive else 0, latest) + 1
-        running = max(self.expected, self.turn)   # steer: a running turn takes the message
-        return running if running > self.ended else self.ended + 1
 
 
 def delivery_lock(job_dir):

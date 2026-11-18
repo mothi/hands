@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import harness
 
@@ -143,6 +144,32 @@ class AcpClient(unittest.TestCase):
             client.on_ready(readable, [])   # what it sends right after the answer is this turn's
             readable = client.fds()[0]
         return answers[0], found + wires.acp_events(answers[0], number, None, provider)
+
+    def test_handshake_uses_only_the_models_effort_choices(self):
+        model = 'opencode-go/deepseek-v4.1-flash'
+        for choices, effort, accepted in (
+            (None, None, True),
+            ([], None, True),
+            (None, 'default', False),
+            ([], 'low', False),
+            (['default', 'low'], None, False),
+            (['default', 'low'], 'default', True),
+            (['low'], 'default', False),
+        ):
+            with self.subTest(choices=choices, effort=effort):
+                agent = mock.Mock(spec=wires.AcpAgent)
+                agent.current_value.return_value = model
+                agent.listed_values.return_value = choices
+                result = wires.acp_handshake(agent, {'model': model, 'effort': effort})
+                agent.listed_values.assert_called_once_with('thought_level')
+                if accepted:
+                    self.assertIsNone(result)
+                else:
+                    self.assertEqual(result[:2], ('refused', 'effort-unsupported'))
+                if accepted and effort is not None:
+                    agent.set_option.assert_called_once_with('thought_level', effort)
+                else:
+                    agent.set_option.assert_not_called()
 
     def test_a_recorded_opencode_seat_round_trips(self):
         client = self.agent(os.path.join(harness.FIXTURES, 'opencode-acp-sample.jsonl'))
